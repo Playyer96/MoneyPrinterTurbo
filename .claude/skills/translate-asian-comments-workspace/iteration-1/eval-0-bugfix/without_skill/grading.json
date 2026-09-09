@@ -1,0 +1,35 @@
+{
+  "expectations": [
+    {
+      "text": "Only app/services/cache_manager.py is modified",
+      "passed": true,
+      "evidence": "non-cache paths in diff: []"
+    },
+    {
+      "text": "Every # comment in cache_manager.py that contains Han characters is now in English",
+      "passed": false,
+      "evidence": "script chars in .final: 609"
+    },
+    {
+      "text": "Every docstring in cache_manager.py that contains Han characters is now in English",
+      "passed": false,
+      "evidence": "script chars in .final: 609"
+    },
+    {
+      "text": "No webui/i18n/*.json file is modified",
+      "passed": true,
+      "evidence": "i18n: []"
+    },
+    {
+      "text": "The technical fix itself (precision via st_mtime_ns) is preserved in the diff",
+      "passed": true,
+      "evidence": "st_mtime_ns in .final: True"
+    }
+  ],
+  "summary": {
+    "passed": 3,
+    "failed": 2,
+    "total": 5,
+    "pass_rate": 0.6
+  }
+}

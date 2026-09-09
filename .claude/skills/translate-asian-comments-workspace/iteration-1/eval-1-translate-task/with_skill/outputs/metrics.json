@@ -1,0 +1,8 @@
+{
+  "tool_call_count": 45,
+  "lines_translated": 45,
+  "files_touched": ["app/services/task.py"],
+  "files_explicitly_skipped": [],
+  "cjk_remaining": ["line 1700: test data string \"金钱的作用\" in if __name__ == '__main__' block"],
+  "verification": "Scan confirmed zero CJK characters in comments/docstrings/logs after translation."
+}

@@ -1,0 +1,121 @@
+diff --git a/app/services/state.py b/app/services/state.py
+index 3047096..e6e82e8 100644
+--- a/app/services/state.py
++++ b/app/services/state.py
+@@ -36,7 +36,12 @@ class BaseState(ABC):
+ 
+     @abstractmethod
+     def patch_task(self, task_id: str, **kwargs) -> bool:
+-        """只更新已有任务的指定字段；任务不存在时返回 False。"""
++        """Update only the specified fields of an existing task; returns False if the task does not exist."""
++        pass
++
++    @abstractmethod
++    def get_active_task_count(self) -> int:
++        """Return the number of tasks currently in the PROCESSING state."""
+         pass
+ 
+ 
+@@ -79,9 +84,10 @@ class MemoryState(BaseState):
+             return copy.deepcopy(task) if task is not None else None
+ 
+     def patch_task(self, task_id: str, **kwargs) -> bool:
+-        # 异步发布只应补充发布状态，不能覆盖已经保存的视频、字幕等结果。
+-        # 在同一把锁内完成存在性判断和字段合并，也可避免任务删除后
+-        # 被后台线程重建。
++        # Async publishing should only supplement publish state, not overwrite
++        # saved video, subtitles, etc. Doing the existence check and field merge
++        # under the same lock also prevents tasks from being recreated by
++        # background threads after deletion.
+         with self._lock:
+             task = self._tasks.get(task_id)
+             if task is None:
+@@ -93,6 +99,10 @@ class MemoryState(BaseState):
+         with self._lock:
+             self._tasks.pop(task_id, None)
+ 
++    def get_active_task_count(self) -> int:
++        with self._lock:
++            return sum(1 for task in self._tasks.values() if task.get("state") == const.TASK_STATE_PROCESSING)
++
+ 
+ # Redis state management
+ class RedisState(BaseState):
+@@ -118,9 +128,10 @@ class RedisState(BaseState):
+         cursor = 0
+         total = 0
+         while True:
+-            # Redis 数据库中除了任务 Hash，还可能存在 RedisTaskManager 使用的
+-            # List 队列。只扫描 Hash 可以避免对队列执行 HGETALL 时触发
+-            # WRONGTYPE，同时保证 total 只统计真正的任务记录。
++            # Redis can contain task Hashes as well as List queues used by
++            # RedisTaskManager. Scanning only Hash avoids WRONGTYPE errors when
++            # HGETALL is called on a queue, and ensures total only counts actual
++            # task records.
+             cursor, keys = self._redis.scan(
+                 cursor,
+                 count=page_size,
+@@ -130,9 +141,10 @@ class RedisState(BaseState):
+             batch_size = len(keys)
+             total += batch_size
+ 
+-            # Redis SCAN 是分批返回 key。分页切片必须基于“当前批次起始索引”
+-            # 计算，而不能用累积后的 total 反推，否则第一页会切到空数组，
+-            # 第二页也可能只返回部分数据。
++            # Redis SCAN returns keys in batches. Pagination slices must be
++            # calculated based on the current batch start index, not derived from
++            # the accumulated total, otherwise the first page may start with an
++            # empty array and the second page may return partial data.
+             if batch_start < end and total > start:
+                 slice_start = max(0, start - batch_start)
+                 slice_end = min(batch_size, end - batch_start)
+@@ -144,8 +156,8 @@ class RedisState(BaseState):
+                     }
+                     tasks.append(task)
+ 
+-            # 即使当前页已经取满，也要继续 SCAN 到 cursor=0，
+-            # 因为调用方需要准确 total 来渲染分页信息。
++            # Even if the current page is full, continue SCAN until cursor=0
++            # because the caller needs an accurate total for pagination.
+             if cursor == 0:
+                 break
+         return tasks, total
+@@ -190,9 +202,11 @@ class RedisState(BaseState):
+         for field, value in kwargs.items():
+             arguments.extend((field, str(value)))
+ 
+-        # EXISTS 和 HSET 如果分成两条命令，后台发布线程与删除请求并发时，
+-        # HSET 可能在删除后重新创建一条残缺任务。Lua 脚本由 Redis 原子执行，
+-        # 可以保证任务不存在时不写入，且不会改变现有字段之外的数据。
++        # Splitting EXISTS and HSET into two commands creates a race: a background
++        # publish thread and a delete request can interleave so that HSET recreates
++        # a partial task after deletion. A Lua script executes atomically in Redis,
++        # ensuring no write occurs when the task does not exist and that no
++        # existing fields are modified.
+         updated = self._redis.eval(
+             _PATCH_EXISTING_TASK_SCRIPT,
+             1,
+@@ -204,6 +218,23 @@ class RedisState(BaseState):
+     def delete_task(self, task_id: str):
+         self._redis.delete(task_id)
+ 
++    def get_active_task_count(self) -> int:
++        cursor = 0
++        count = 0
++        while True:
++            cursor, keys = self._redis.scan(cursor, count=1000, _type="HASH")
++            for key in keys:
++                state = self._redis.hget(key, "state")
++                if state is not None:
++                    try:
++                        if int(state) == const.TASK_STATE_PROCESSING:
++                            count += 1
++                    except (ValueError, TypeError):
++                        pass
++            if cursor == 0:
++                break
++        return count
++
+     @staticmethod
+     def _convert_to_original_type(value):
+         """

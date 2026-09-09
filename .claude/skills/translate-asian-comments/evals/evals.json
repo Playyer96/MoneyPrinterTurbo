@@ -1,0 +1,45 @@
+{
+  "skill_name": "translate-asian-comments",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Fix the bug where VideoCacheStats.newest_mtime is computed using os.path.getmtime but should use os.stat().st_mtime_ns for higher precision. Update only app/services/cache_manager.py.",
+      "expected_output": "The edit modifies cache_manager.py with the precision fix AND every Chinese comment, docstring, and Chinese log/error string in that file is translated to English. No other files are touched. i18n JSON bundles are not touched. The diff is small and only affects the touched file.",
+      "files": ["evals/files/sample_cache_manager_snippet.py"],
+      "expectations": [
+        "Only app/services/cache_manager.py is modified",
+        "Every # comment in cache_manager.py that contains Han characters is now in English",
+        "Every docstring (\"\"\"...\"\"\") in cache_manager.py that contains Han characters is now in English",
+        "No webui/i18n/*.json file is modified",
+        "The technical fix itself (precision via st_mtime_ns) is preserved in the diff"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Translate all the Chinese comments in app/services/task.py to English. Do not change any logic, just the comments.",
+      "expected_output": "Every # line comment, every docstring, and every Chinese log/error string literal in app/services/task.py is now in English. No code logic is changed. No other files are modified.",
+      "files": [],
+      "expectations": [
+        "All Chinese (Han-character) comments in app/services/task.py are translated to English",
+        "All Chinese docstrings in app/services/task.py are translated to English",
+        "All Chinese log/error message string literals in app/services/task.py are translated to English",
+        "No other files in the repo are modified",
+        "Code logic, identifiers, imports, and signatures are unchanged"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Add a new function `get_active_task_count()` to app/services/state.py that returns the number of tasks currently in the PROCESSING state. Write the function and any necessary helper.",
+      "expected_output": "A new function is added to app/services/state.py. The new function uses English-only comments and English-only log/error strings. If there were existing Chinese comments adjacent to the inserted code, they are translated to English. No other files are modified.",
+      "files": [],
+      "expectations": [
+        "A new function get_active_task_count is added to app/services/state.py",
+        "Any new # comments added by the change are written in English (no Han characters)",
+        "Any new docstrings added by the change are written in English",
+        "Any new log/error strings added by the change are written in English",
+        "Existing Chinese comments/docstrings/strings inside app/services/state.py that are within the touched region are translated to English",
+        "Files outside app/services/state.py are not modified"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "expectations": [
+    {
+      "text": "A new function get_active_task_count is added to app/services/state.py",
+      "passed": true,
+      "evidence": "function defined: True"
+    },
+    {
+      "text": "Any new # comments added by the change are written in English (no Han characters)",
+      "passed": true,
+      "evidence": "script chars in added lines: 0"
+    },
+    {
+      "text": "Any new docstrings added by the change are written in English",
+      "passed": true,
+      "evidence": "script chars in state.py.final: 0"
+    },
+    {
+      "text": "Any new log/error strings added by the change are written in English",
+      "passed": true,
+      "evidence": "script chars in added lines: 0"
+    },
+    {
+      "text": "Existing Chinese comments/docstrings/strings inside app/services/state.py that are within the touched region are translated to English",
+      "passed": true,
+      "evidence": "script chars in state.py.final: 0"
+    },
+    {
+      "text": "Files outside app/services/state.py are not modified",
+      "passed": true,
+      "evidence": "non-state paths in diff: []"
+    }
+  ],
+  "summary": {
+    "passed": 6,
+    "failed": 0,
+    "total": 6,
+    "pass_rate": 1.0
+  }
+}

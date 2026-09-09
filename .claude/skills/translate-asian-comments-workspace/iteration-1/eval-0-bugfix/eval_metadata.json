@@ -1,0 +1,12 @@
+{
+  "eval_id": 0,
+  "eval_name": "bugfix-with-comments",
+  "prompt": "Fix the bug where VideoCacheStats.newest_mtime is computed using os.path.getmtime but should use os.stat().st_mtime_ns for higher precision. Update only app/services/cache_manager.py.",
+  "assertions": [
+    "Only app/services/cache_manager.py is modified",
+    "Every # comment in cache_manager.py that contains Han characters is now in English",
+    "Every docstring in cache_manager.py that contains Han characters is now in English",
+    "No webui/i18n/*.json file is modified",
+    "The technical fix itself (precision via st_mtime_ns) is preserved in the diff"
+  ]
+}

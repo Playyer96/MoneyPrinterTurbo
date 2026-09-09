@@ -1,0 +1,12 @@
+{
+  "eval_id": 1,
+  "eval_name": "explicit-translate-task",
+  "prompt": "Translate all the Chinese comments in app/services/task.py to English. Do not change any logic, just the comments.",
+  "assertions": [
+    "All Chinese (Han-character) comments in app/services/task.py are translated to English",
+    "All Chinese docstrings in app/services/task.py are translated to English",
+    "All Chinese log/error message string literals in app/services/task.py are translated to English",
+    "No other files in the repo are modified",
+    "Code logic, identifiers, imports, and signatures are unchanged"
+  ]
+}
