@@ -259,6 +259,11 @@ anthropic_model_name = ""
 # API key: https://aistudio.google.com/app/apikey
 gemini_api_key = ""
 gemini_model_name = ""
+# Gemini TTS model used by the audio settings. Leave empty to use the
+# default (`gemini-2.5-flash-preview-tts`). The WebUI dropdown shows every
+# TTS-capable model your API key exposes, so you usually do not need to
+# set this by hand.
+gemini_tts_model_name = ""
 
 # DeepSeek
 # API key: https://platform.deepseek.com/api_keys

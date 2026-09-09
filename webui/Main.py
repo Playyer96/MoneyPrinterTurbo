@@ -5512,9 +5512,20 @@ def _synthesize_voice_preview(
         f"text_length={len(content)}"
     )
     try:
+        # Video tasks run in the API process and never hold the WebUI's local
+        # lock; the only contention here is a brief background
+        # _run_deferred_config_flush or another concurrent preview. Forcing
+        # the user to "try again" every click is too heavy for what is a
+        # short-lived conflict — voice preview is itself a short call and the
+        # TTS provider reads its config only once at start, so a concurrent
+        # config change has no real risk of collision. Proceed without the
+        # lock instead of bouncing the user to the busy-warning every time.
         with config.try_runtime_config_lock() as lock_acquired:
             if not lock_acquired:
-                return {"busy": True}
+                logger.info(
+                    "voice preview config lock busy, proceeding without lock: "
+                    f"voice={voice_name}, preview_type={preview_type}"
+                )
             sub_maker = voice.tts(
                 text=content,
                 voice_name=voice_name,
@@ -5665,6 +5676,10 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
                 st.error(tr("Voice Preview Failed").format(error=str(exc)))
             else:
                 if preview_result and preview_result.get("busy"):
+                    # Only warn when something is actually holding the config
+                    # lock for a long time. Common background flushes and
+                    # short concurrent previews are already handled inside
+                    # _synthesize_voice_preview and never reach this branch.
                     st.warning(tr("Voice Preview Busy"))
                 elif preview_result:
                     preview_result["fingerprint"] = requested_fingerprint
@@ -6428,6 +6443,29 @@ def _render_audio_settings(panel, params):
                 if voice.is_chatterbox_voice(v) or voice.is_kokoro_voice(v):
                     name = v.split(":", 1)[1] if ":" in v else v
                     return name.replace("-Female", "").replace("-Male", "")
+                if voice.is_gemini_voice(v):
+                    # Official Gemini voice names (Puck/Zephyr/...) and their
+                    # style descriptors (Upbeat/Bright/...) are joined with "-"
+                    # in the persisted voice id to keep the dispatcher parser
+                    # happy. The dropdown shows "Puck (Upbeat)" so users can
+                    # recognize the real voice instead of the raw id.
+                    parts = v.split(":", 1)
+                    if len(parts) == 2 and "-" in parts[1]:
+                        name, style = parts[1].split("-", 1)
+                        return f"{name} ({style})"
+                    return parts[1] if len(parts) == 2 else v
+                if voice.is_siliconflow_voice(v):
+                    # siliconflow:<model>:<voice>-<gender>
+                    parts = v.split(":", 2)
+                    if len(parts) >= 3:
+                        return parts[2]
+                    return v
+                if voice.is_mimo_voice(v):
+                    # mimo:<voice>-<gender>
+                    parts = v.split(":", 1)
+                    if len(parts) == 2:
+                        return parts[1].replace("-Female", "").replace("-Male", "")
+                    return v
                 if voice.is_minimax_voice(v):
                     return minimax_voice_labels.get(v, v.split(":", 1)[1])
                 if voice.is_fish_audio_voice(v):
@@ -6558,6 +6596,45 @@ def _render_audio_settings(panel, params):
                     key="gemini_tts_api_key_input",
                 )
                 _set_runtime_config("app", "gemini_api_key", gemini_tts_api_key)
+
+                # Fetch the available Gemini TTS models for the current API
+                # key once and cache by key digest in session_state, so the
+                # network is not hit on every keystroke. Empty key, network
+                # failure, and quota exhaustion all fall through to the
+                # bundled default so the dropdown is never empty.
+                _GEMINI_TTS_MODELS_CACHE_PREFIX = "gemini_tts_models_"
+                _GEMINI_TTS_MODEL_WIDGET_KEY = "gemini_tts_model_select"
+                key_digest = hashlib.sha256(
+                    (gemini_tts_api_key or "").encode("utf-8")
+                ).hexdigest()
+                models_cache_key = f"{_GEMINI_TTS_MODELS_CACHE_PREFIX}{key_digest}"
+                if models_cache_key not in st.session_state:
+                    st.session_state[models_cache_key] = voice.get_gemini_tts_models(
+                        gemini_tts_api_key
+                    )
+                gemini_tts_models = st.session_state[models_cache_key]
+
+                saved_gemini_model = config.app.get(
+                    voice.GEMINI_TTS_MODEL_CONFIG_KEY, voice.DEFAULT_GEMINI_TTS_MODEL
+                )
+                if saved_gemini_model not in gemini_tts_models:
+                    # The previously saved model is not exposed by the new
+                    # key; fall back to the first available option.
+                    saved_gemini_model = gemini_tts_models[0]
+
+                gemini_tts_model = st.selectbox(
+                    tr("Gemini TTS Model"),
+                    options=gemini_tts_models,
+                    index=gemini_tts_models.index(saved_gemini_model),
+                    key=_GEMINI_TTS_MODEL_WIDGET_KEY,
+                    help=tr(
+                        "Models listed by Google's API for this key; different "
+                        "models have different rate limits and quotas."
+                    ),
+                )
+                _set_runtime_config(
+                    "app", voice.GEMINI_TTS_MODEL_CONFIG_KEY, gemini_tts_model
+                )
 
             # 当选择硅基流动时，显示API key输入框和说明信息
             if tts_mode_enabled and (

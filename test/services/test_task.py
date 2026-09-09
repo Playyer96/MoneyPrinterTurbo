@@ -1130,6 +1130,10 @@ class TestTaskService(unittest.TestCase):
 
         该场景可能由 TTS 时间轴与原始文案无法匹配触发。自动回退会让未选择
         Whisper 的用户意外下载数 GB 模型，因此必须验证 Whisper 完全不会被调用。
+
+        The sub_maker here must be explicitly marked as real word-level
+        timestamps; otherwise it would be detected as a Gemini-style estimated
+        timeline and auto-routed to Whisper.
         """
         task_id = "test-edge-subtitle-without-output"
         task_dir = utils.task_dir(task_id)
@@ -1138,7 +1142,7 @@ class TestTaskService(unittest.TestCase):
             video_script="Hello world.",
             subtitle_enabled=True,
         )
-        sub_maker = object()
+        sub_maker = tm.voice.mark_real_word_timestamps(tm.voice.SubMaker())
 
         try:
             with (

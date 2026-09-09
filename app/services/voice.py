@@ -609,7 +609,21 @@ def _single_tts(
         # 格式: gemini:voice-Style；也继续兼容旧的 gemini:voice-Gender。
         voice = parse_gemini_voice_name(voice_name)
         if voice:
-            return gemini_tts(text, voice, voice_rate, voice_file, voice_volume)
+            # Model chosen by the user in the WebUI; fall back to flash preview
+            # when missing so old config never silently hits an unexpected model
+            # after the dropdown lands.
+            selected_model = str(
+                config.app.get(GEMINI_TTS_MODEL_CONFIG_KEY, "")
+                or DEFAULT_GEMINI_TTS_MODEL
+            ).strip() or DEFAULT_GEMINI_TTS_MODEL
+            return gemini_tts(
+                text,
+                voice,
+                voice_rate,
+                voice_file,
+                voice_volume,
+                model=selected_model,
+            )
         else:
             logger.error(f"Invalid gemini voice name format: {voice_name}")
             return None
@@ -1026,6 +1040,30 @@ def ensure_legacy_submaker_fields(sub_maker: SubMaker) -> SubMaker:
     return sub_maker
 
 
+def has_real_word_timestamps(sub_maker) -> bool:
+    """
+    Return whether the sub_maker's timeline is built from real word/phrase
+    boundaries emitted by the TTS service.
+
+    Only Edge TTS (Azure v1) and the Azure Speech SDK (Azure v2) feed real
+    boundaries via streaming WordBoundary events. Every other provider
+    (Gemini, SiliconFlow, ElevenLabs, Fish Audio, Chatterbox, Kokoro,
+    MiniMax, MiMo) routes through `populate_legacy_submaker_with_full_text`,
+    which linearly distributes the total audio duration by character count.
+    Treating those estimates as real boundaries makes the subtitle timeline
+    drift by whole segments.
+    """
+    if sub_maker is None:
+        return False
+    return bool(getattr(sub_maker, "_has_real_word_timestamps", False))
+
+
+def mark_real_word_timestamps(sub_maker: SubMaker) -> SubMaker:
+    """Tag a SubMaker whose boundaries are real so `generate_subtitle` can route on it."""
+    setattr(sub_maker, "_has_real_word_timestamps", True)
+    return sub_maker
+
+
 def populate_legacy_submaker_with_full_text(
     sub_maker: SubMaker, text: str, audio_duration_seconds: float
 ) -> SubMaker:
@@ -1036,9 +1074,9 @@ def populate_legacy_submaker_with_full_text(
     1. edge_tts 7.x 的 `SubMaker` 不再提供旧版本里的 `create_sub()`；
     2. 项目里 Gemini、SiliconFlow 等非 edge 路径依然需要返回一个
        带 `subs/offset` 的对象，供后续统一计算音频时长和生成字幕；
-    3. 对于拿不到逐词边界的 TTS 服务，需要至少按脚本断句切成多个片段，
-       这样后续 `subtitle_provider=edge` 的聚合逻辑才能继续工作，而不是
-       因为整段文本无法和脚本断句逐行匹配而回退 Whisper。
+    3. For TTS services that can't return word-level boundaries, still split
+       by sentence so the subtitle aggregator matches the script line for
+       line.
 
     Args:
         sub_maker: 需要写入兼容字段的字幕对象
@@ -1053,6 +1091,9 @@ def populate_legacy_submaker_with_full_text(
     # 清空旧值，避免调用方重复复用对象时出现脏数据叠加。
     sub_maker.subs = []
     sub_maker.offset = []
+    # Mark explicitly as an estimated timeline so it cannot be mistaken for
+    # real word-level boundaries by the edge subtitle path.
+    setattr(sub_maker, "_has_real_word_timestamps", False)
 
     normalized_text = (text or "").strip()
     if not normalized_text:
@@ -1293,7 +1334,7 @@ def azure_tts_v1(
                 continue
 
             logger.info(f"completed, output file: {voice_file}")
-            return sub_maker
+            return mark_real_word_timestamps(sub_maker)
         except Exception as e:
             logger.error(f"failed, error: {str(e)}")
             # TTS 流式写入如果在首包前超时或网络异常，会留下 0 字节音频文件。
@@ -1515,7 +1556,7 @@ def azure_tts_v2(
             result = speech_synthesizer.speak_ssml_async(ssml).get()
             if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
                 logger.success(f"azure v2 speech synthesis succeeded: {voice_file}")
-                return sub_maker
+                return mark_real_word_timestamps(sub_maker)
             elif result.reason == speechsdk.ResultReason.Canceled:
                 cancellation_details = result.cancellation_details
                 logger.error(
@@ -1531,23 +1572,78 @@ def azure_tts_v2(
     return None
 
 
+DEFAULT_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
+# Fallback list when the API key cannot be introspected (offline startup,
+# quota exhaustion on the list call, etc.). Keeps the dropdown usable
+# instead of empty so the user can still pick a known-good model.
+_GEMINI_TTS_MODEL_FALLBACK = (
+    DEFAULT_GEMINI_TTS_MODEL,
+    "gemini-2.5-pro-preview-tts",
+)
+# Config key the WebUI dropdown writes to and the dispatcher reads from.
+GEMINI_TTS_MODEL_CONFIG_KEY = "gemini_tts_model_name"
+
+
+def get_gemini_tts_models(api_key: str) -> list[str]:
+    """Return Gemini TTS-capable model ids exposed by the given API key.
+
+    Calls `client.models.list()` and filters to models whose name ends in
+    "-tts" (Google's naming convention for TTS endpoints, e.g.
+    `gemini-2.5-flash-preview-tts`, `gemini-2.5-pro-preview-tts`). Never
+    raises: any failure returns the bundled fallback list so the WebUI
+    dropdown always has something to pick.
+    """
+    if not api_key or not api_key.strip():
+        return list(_GEMINI_TTS_MODEL_FALLBACK)
+    try:
+        from google import genai
+
+        client = genai.Client(api_key=api_key)
+        models = list(client.models.list())
+    except Exception as exc:  # noqa: BLE001 — dropdown should always be populated
+        logger.warning(
+            f"gemini TTS model listing failed, using fallback: {type(exc).__name__}: {exc}"
+        )
+        return list(_GEMINI_TTS_MODEL_FALLBACK)
+
+    candidates = []
+    for model in models:
+        name = getattr(model, "name", "") or ""
+        # google-genai returns names like "models/gemini-2.5-flash-preview-tts"
+        short = name.rsplit("/", 1)[-1]
+        if short.endswith("-tts"):
+            candidates.append(short)
+
+    if not candidates:
+        return list(_GEMINI_TTS_MODEL_FALLBACK)
+
+    # Stable order: put the default first, then the rest alphabetically so the
+    # dropdown does not shuffle between calls.
+    candidates.sort(key=lambda n: (n != DEFAULT_GEMINI_TTS_MODEL, n))
+    return candidates
+
+
 def gemini_tts(
     text: str,
     voice_name: str,
     voice_rate: float,
     voice_file: str,
     voice_volume: float = 1.0,
+    model: str = DEFAULT_GEMINI_TTS_MODEL,
 ) -> Union[SubMaker, None]:
     """
     使用Google Gemini TTS生成语音
-    
+
     Args:
         text: 要转换的文本
         voice_name: 语音名称，如 "Zephyr", "Puck" 等
         voice_rate: 语音速率（当前未使用）
         voice_file: 输出音频文件路径
         voice_volume: 音频音量（当前未使用）
-        
+        model: Gemini TTS model id (e.g. `gemini-2.5-flash-preview-tts`).
+            Different models have different rate limits and quality; the
+            WebUI lets the user pick from the models their API key exposes.
+
     Returns:
         SubMaker对象或None
     """
@@ -1557,14 +1653,93 @@ def gemini_tts(
     from google import genai
     from google.genai import types
     _configure_pydub_ffmpeg(AudioSegment)
-    
+
+    # Per-call wall-clock cap. The SDK's own HttpOptions.timeout catches a
+    # slow HTTP read, but the SDK can also hang on TLS handshake, proxy
+    # connect, or its own internal retries — none of which always honor the
+    # configured timeout. Running the call in a daemon thread with a hard
+    # deadline guarantees the WebUI gets feedback inside this window no
+    # matter where the SDK gets stuck.
+    gemini_call_timeout_seconds = 60.0
+    # Inner SDK timeout fires earlier than the thread cap when Google is
+    # just slow; the thread cap is the hard safety net.
+    _gemini_sdk_timeout_ms = int(gemini_call_timeout_seconds * 1000) - 10_000
+
+    def _is_gemini_terminal_error(exc: BaseException) -> bool:
+        """True for errors that retrying will not fix (auth, quota, bad model).
+
+        The google-genai SDK raises ClientError for HTTP 4xx and ServerError
+        for HTTP 5xx; only the 4xx variants are terminal here because quota
+        exhaustion and invalid keys never recover by trying again.
+        """
+        status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+        if isinstance(status, int) and 400 <= status < 500:
+            return True
+        message = str(exc) or ""
+        # RESOURCE_EXHAUSTED and UNAUTHENTICATED show up in the message even
+        # when status_code is missing on the wrapped exception; match the
+        # status text directly so we don't keep burning quota on retries.
+        return any(
+            marker in message
+            for marker in ("RESOURCE_EXHAUSTED", "UNAUTHENTICATED", "PERMISSION_DENIED")
+        )
+
+    def _invoke_gemini_with_timeout(text, voice_name, gen_config):
+        """Run the SDK call in a worker thread and return its result or raise."""
+        result_queue: queue.Queue = queue.Queue()
+        done_marker = object()
+
+        def _worker():
+            try:
+                # Inner SDK timeout fires earlier than the thread cap when
+                # Google is just slow; the thread cap is the hard safety net.
+                client_http_options = types.HttpOptions(timeout=_gemini_sdk_timeout_ms)
+                with genai.Client(api_key=api_key, http_options=client_http_options) as client:
+                    response = client.models.generate_content(
+                        model=model,
+                        contents=text,
+                        config=gen_config,
+                    )
+                result_queue.put(("ok", response))
+            except BaseException as exc:  # noqa: BLE001 — propagate every failure
+                result_queue.put(("err", exc))
+            finally:
+                result_queue.put(("done", done_marker))
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+
+        deadline = time.monotonic() + gemini_call_timeout_seconds
+        response = None
+        captured_error = None
+        finished = False
+        while not finished:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"gemini TTS exceeded {gemini_call_timeout_seconds:.0f}s "
+                    "wall-clock budget"
+                )
+            try:
+                item_type, payload = result_queue.get(timeout=min(0.5, remaining))
+            except queue.Empty:
+                continue
+            if item_type == "ok":
+                response = payload
+            elif item_type == "err":
+                captured_error = payload
+            elif item_type == "done":
+                finished = True
+
+        if captured_error is not None:
+            raise captured_error
+        return response
+
     try:
         api_key = config.app.get("gemini_api_key", "")
         if not api_key:
             logger.error("Gemini API key is not set")
             return None
-
-        logger.info(f"start, voice name: {voice_name}, try: 1")
 
         generation_config = types.GenerateContentConfig(
             response_modalities=["AUDIO"],
@@ -1577,14 +1752,45 @@ def gemini_tts(
             ),
         )
 
-        # google-genai 使用统一 Client 调用文本和 TTS 模型。上下文管理器确保
-        # 请求结束后释放 HTTP 连接，同时保留原有 PCM 转码和字幕时间轴逻辑。
-        with genai.Client(api_key=api_key) as client:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash-preview-tts",
-                contents=text,
-                config=generation_config,
+        # Gemini's free-tier TTS quota is 10 requests/day per project
+        # (RESOURCE_EXHAUSTED). Retrying on quota errors just burns the
+        # remaining quota faster, so distinguish transient failures from
+        # terminal ones: retry on timeout and 5xx, fail fast on 4xx
+        # (invalid key, quota, bad model, etc.) with a clear log line.
+        last_error = None
+        response = None
+        for attempt in range(3):
+            try:
+                logger.info(f"start, voice name: {voice_name}, try: {attempt + 1}")
+                response = _invoke_gemini_with_timeout(text, voice_name, generation_config)
+                break
+            except TimeoutError as exc:
+                last_error = exc
+                logger.warning(
+                    f"gemini TTS timed out, retrying: voice={voice_name}, "
+                    f"try={attempt + 1}, error={exc}"
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001 — decide retry vs fail-fast
+                last_error = exc
+                if _is_gemini_terminal_error(exc):
+                    logger.error(
+                        f"gemini TTS non-retryable error, giving up: "
+                        f"voice={voice_name}, error={type(exc).__name__}: {exc}"
+                    )
+                    break
+                logger.warning(
+                    f"gemini TTS attempt failed, retrying: voice={voice_name}, "
+                    f"try={attempt + 1}, error={type(exc).__name__}: {exc}"
+                )
+                continue
+
+        if response is None:
+            logger.error(
+                f"gemini TTS failed: voice={voice_name}, "
+                f"last_error={type(last_error).__name__}: {last_error}"
             )
+            return None
 
         # 检查响应
         if not response.candidates or not response.candidates[0].content:

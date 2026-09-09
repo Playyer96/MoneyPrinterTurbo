@@ -270,14 +270,26 @@ def test_full_preview_reports_when_tts_returns_no_audio():
     assert [str(item.value) for item in app.exception] == []
 
 
-def test_full_preview_returns_immediately_when_runtime_config_is_busy():
-    """后台任务持有配置锁时，试听应提示稍后重试而不是阻塞页面。"""
+def test_full_preview_proceeds_when_runtime_config_is_busy():
+    """The WebUI's config lock may be briefly held by a background flush or
+    a concurrent preview. Voice preview must still proceed; making the user
+    click "try again" every time is too heavy.
+
+    Video tasks run in the API process and never hold the WebUI's local
+    lock. TTS providers also read their config once when the call starts,
+    so a mid-call config change has no real risk of collision.
+    """
     test_ui = dict(
         config.ui,
         voice_mode="tts",
         tts_server="azure-tts-v1",
         voice_name="zh-CN-XiaoxiaoNeural-Female",
     )
+
+    def fake_tts(**kwargs):
+        Path(kwargs["voice_file"]).write_bytes(b"fake audio bytes")
+        return object()
+
     with (
         patch.object(config, "ui", test_ui),
         patch.object(config, "save_config"),
@@ -286,20 +298,24 @@ def test_full_preview_returns_immediately_when_runtime_config_is_busy():
             "try_runtime_config_lock",
             return_value=nullcontext(False),
         ),
-        patch.object(voice, "tts") as synthesize,
+        patch.object(voice, "tts", side_effect=fake_tts) as synthesize,
+        patch.object(voice, "get_audio_duration", return_value=1.0),
     ):
         app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=30)
         app.session_state["ui_language"] = "zh"
-        app.session_state["video_script"] = "验证忙碌状态不会阻塞页面。"
+        app.session_state["video_script"] = (
+            "Verify that voice preview still synthesizes when the lock is busy."
+        )
         app.run()
         _button_by_key(
             app,
             "generate_full_voiceover_preview_button",
         ).click().run()
 
-    synthesize.assert_not_called()
+    synthesize.assert_called_once()
     warning_messages = [item.value for item in app.warning]
-    assert "当前有视频任务正在使用配音配置，请稍后重试。" in warning_messages
+    assert "A video task is currently using the voice settings." not in warning_messages
+    assert len(app.get("audio")) == 1
 
 
 def test_full_preview_warns_when_audio_duration_is_unavailable():

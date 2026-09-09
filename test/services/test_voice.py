@@ -445,6 +445,7 @@ class TestVoiceService(unittest.TestCase):
             1.0,
             "/tmp/gemini-achernar.mp3",
             1.0,
+            model=vs.DEFAULT_GEMINI_TTS_MODEL,
         )
 
     def test_gemini_tts_uses_google_genai_and_compatible_submaker_fields(self):
@@ -529,8 +530,13 @@ class TestVoiceService(unittest.TestCase):
         self.assertEqual(len(getattr(sub_maker, "offset", [])), 2)
         self.assertEqual(sub_maker.offset[0][0], 0)
         self.assertLess(sub_maker.offset[0][1], sub_maker.offset[1][1])
-        self.assertEqual(captured["client_kwargs"], {"api_key": "test-key"})
-        self.assertEqual(captured["model"], "gemini-2.5-flash-preview-tts")
+        self.assertEqual(captured["client_kwargs"].get("api_key"), "test-key")
+        # Inner SDK timeout is also passed; it must be set so the SDK fails fast
+        # on a stalled HTTP read instead of leaving the WebUI spinner running.
+        # Value is derived from DEFAULT_GEMINI_TTS_MODEL block's constants;
+        # assert via the public constants rather than hardcoding the number.
+        self.assertGreater(captured["client_kwargs"]["http_options"].timeout, 0)
+        self.assertEqual(captured["model"], vs.DEFAULT_GEMINI_TTS_MODEL)
         self.assertEqual(captured["contents"], text)
         self.assertEqual(captured["config"].response_modalities, ["AUDIO"])
         voice_config = captured["config"].speech_config.voice_config
@@ -540,10 +546,162 @@ class TestVoiceService(unittest.TestCase):
         )
         self.assertTrue(captured["closed"])
 
-        vs.create_subtitle(sub_maker=sub_maker, text=text, subtitle_file=subtitle_file)
-        subtitle_content = Path(subtitle_file).read_text(encoding="utf-8")
-        self.assertIn("Gemini subtitle generation should work now", subtitle_content)
-        self.assertIn("Testing multiple lines", subtitle_content)
+    def test_gemini_terminal_error_skips_retries(self):
+        """Quota / auth / 4xx errors must fail fast and not burn the remaining
+        free-tier quota. The previous implementation retried 3x on every
+        exception, which multiplied a single 429 into three wasted requests.
+        """
+        from google.genai import errors as genai_errors
+
+        class _QuotaError(genai_errors.ClientError):
+            code = 429
+
+            def __init__(self):
+                super().__init__(
+                    429,
+                    "RESOURCE_EXHAUSTED",
+                    "Quota exceeded for metric: generativelanguage.googleapis.com/"
+                    "generate_content_free_tier_requests, limit: 10",
+                )
+
+        # Patch the google.genai.Client used inside gemini_tts so the SDK
+        # raises our quota error on the very first call. The retry loop must
+        # bail out after that one call instead of consuming two more.
+        call_count = {"n": 0}
+
+        def _raise_quota(*args, **kwargs):
+            call_count["n"] += 1
+            raise _QuotaError()
+
+        class _FakeModels:
+            def generate_content(self, *args, **kwargs):
+                _raise_quota()
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                self.models = _FakeModels()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+        with patch.object(vs.config, "app", dict(vs.config.app, gemini_api_key="k")), \
+             patch("google.genai.Client", _FakeClient), \
+             patch("time.sleep"):
+            result = vs.gemini_tts(
+                text="hello",
+                voice_name="Zephyr",
+                voice_rate=1.0,
+                voice_file="/tmp/x.mp3",
+            )
+
+        self.assertIsNone(result)
+        # Exactly one attempt — the retry loop must not call the SDK three
+        # times for an error that we know is non-retryable.
+        self.assertEqual(call_count["n"], 1)
+
+    def test_get_gemini_tts_models_filters_and_falls_back(self):
+        """Models listing should:
+        - drop the `models/` prefix and keep only names ending in `-tts`
+        - put the default model first, the rest alphabetically
+        - fall back to the bundled list when the API key is missing or the
+          SDK raises (so the WebUI dropdown is never empty)
+        """
+        from types import SimpleNamespace
+
+        # Empty API key -> bundled fallback (no network call)
+        self.assertEqual(
+            vs.get_gemini_tts_models(""),
+            [vs.DEFAULT_GEMINI_TTS_MODEL, "gemini-2.5-pro-preview-tts"],
+        )
+
+        # Mocked SDK returning a mix of TTS and non-TTS models: the dropdown
+        # should see only the two TTS ones, default first.
+        class _FakeModels:
+            def list(self):
+                return [
+                    SimpleNamespace(name="models/gemini-2.5-flash"),
+                    SimpleNamespace(name="models/gemini-2.5-flash-preview-tts"),
+                    SimpleNamespace(name="models/text-embedding-004"),
+                    SimpleNamespace(name="models/gemini-2.5-pro-preview-tts"),
+                    SimpleNamespace(name="models/gemini-2.5-pro"),
+                ]
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                self.models = _FakeModels()
+
+        with patch("google.genai.Client", _FakeClient):
+            models = vs.get_gemini_tts_models("any-key")
+
+        self.assertEqual(
+            models,
+            [
+                vs.DEFAULT_GEMINI_TTS_MODEL,
+                "gemini-2.5-pro-preview-tts",
+            ],
+        )
+
+        # SDK error -> fallback list, no exception leaks to the caller.
+        class _Boom:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError("network down")
+
+        with patch("google.genai.Client", _Boom):
+            models = vs.get_gemini_tts_models("any-key")
+
+        self.assertEqual(models[0], vs.DEFAULT_GEMINI_TTS_MODEL)
+
+    def test_gemini_tts_uses_configured_model(self):
+        """The dispatcher must read `gemini_tts_model_name` from config.app
+        and forward it to the SDK call so the WebUI dropdown is honored.
+        """
+        from types import SimpleNamespace
+
+        captured = {}
+
+        class _FakeModels:
+            def generate_content(self, **kwargs):
+                captured.update(kwargs)
+                tone = (
+                    AudioSegment.silent(duration=600)
+                    .set_frame_rate(24000)
+                    .set_channels(1)
+                    .set_sample_width(2)
+                )
+                return SimpleNamespace(
+                    candidates=[SimpleNamespace(content=SimpleNamespace(parts=[]))]
+                )
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                self.models = _FakeModels()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+        with patch.object(
+            vs.config,
+            "app",
+            dict(
+                vs.config.app,
+                gemini_api_key="k",
+                gemini_tts_model_name="gemini-2.5-pro-preview-tts",
+            ),
+        ), patch("google.genai.Client", _FakeClient):
+            vs.tts(
+                text="hi",
+                voice_name="gemini:Zephyr-Bright",
+                voice_rate=1.0,
+                voice_file="/tmp/gemini-pro.wav",
+            )
+
+        self.assertEqual(captured.get("model"), "gemini-2.5-pro-preview-tts")
 
     def test_mimo_tts_uses_openai_compatible_audio_response(self):
         """
@@ -1058,8 +1216,10 @@ class TestVoiceService(unittest.TestCase):
 
     def test_generate_subtitle_keeps_edge_provider_for_gemini_legacy_submaker(self):
         """
-        验证 Gemini TTS 返回的 legacy 字幕结构在 edge provider 下可以直接产出
-        SRT，不会因为匹配失败而回退到 Whisper。
+        Gemini TTS returns a legacy sub_maker built by character-count
+        estimation; once it is marked, generate_subtitle auto-routes to
+        whisper instead of producing an edge timeline that does not match
+        the actual audio.
         """
         script = "Gemini subtitle generation should work now. Testing multiple lines."
         sub_maker = vs.populate_legacy_submaker_with_full_text(
@@ -1068,11 +1228,22 @@ class TestVoiceService(unittest.TestCase):
             2.4,
         )
 
+        def fake_whisper_create(audio_file, subtitle_file, word_level=False):
+            self.assertFalse(word_level)
+            Path(subtitle_file).write_text(
+                f"1\n00:00:00,000 --> 00:00:02,400\n{script}\n\n",
+                encoding="utf-8",
+            )
+
         with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
             task_service.config,
             "app",
             dict(task_service.config.app, subtitle_provider="edge"),
-        ), patch("app.services.subtitle.create") as whisper_create, patch(
+        ), patch(
+            "app.services.subtitle.create", side_effect=fake_whisper_create
+        ) as whisper_create, patch.object(
+            task_service.voice, "create_subtitle"
+        ) as voice_create_subtitle, patch(
             "app.utils.utils.task_dir",
             lambda tid="": str(Path(tmp_dir) / tid) if tid else str(Path(tmp_dir)),
         ):
@@ -1083,12 +1254,13 @@ class TestVoiceService(unittest.TestCase):
                 params=type("Params", (), {"subtitle_enabled": True})(),
                 video_script=script,
                 sub_maker=sub_maker,
-                audio_file="",
+                audio_file=str(Path(tmp_dir) / "audio.mp3"),
             )
 
             self.assertTrue(subtitle_path.endswith("subtitle.srt"))
             self.assertTrue(Path(subtitle_path).exists())
-            self.assertFalse(whisper_create.called)
+            self.assertTrue(whisper_create.called)
+            voice_create_subtitle.assert_not_called()
             subtitle_content = Path(subtitle_path).read_text(encoding="utf-8")
             self.assertIn("Gemini subtitle generation should work now", subtitle_content)
             self.assertIn("Testing multiple lines", subtitle_content)
