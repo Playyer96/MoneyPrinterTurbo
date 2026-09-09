@@ -1,0 +1,13 @@
+diff --git a/app/services/cache_manager.py b/app/services/cache_manager.py
+index 6247589..01b702c 100644
+--- a/app/services/cache_manager.py
++++ b/app/services/cache_manager.py
+@@ -94,7 +94,7 @@ def _iter_video_cache_entries() -> Iterator[_VideoCacheEntry]:
+                 path=entry.path,
+                 name=entry.name,
+                 size=stat_result.st_size,
+-                mtime=stat_result.st_mtime,
++                mtime=stat_result.st_mtime_ns / 1e9,
+             )
+ 
+ 

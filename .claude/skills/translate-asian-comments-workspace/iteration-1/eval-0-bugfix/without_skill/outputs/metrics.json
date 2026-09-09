@@ -1,0 +1,10 @@
+{
+  "tool_calls": {
+    "Read": 1,
+    "Edit": 1,
+    "Bash": 2,
+    "Write": 2
+  },
+  "files_modified": ["app/services/cache_manager.py"],
+  "lines_changed": 1
+}

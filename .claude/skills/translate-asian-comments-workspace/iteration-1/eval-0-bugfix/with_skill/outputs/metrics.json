@@ -1,0 +1,12 @@
+{
+  "tool_calls": {
+    "Read": 3,
+    "Edit": 5,
+    "Bash": 5,
+    "Write": 2
+  },
+  "lines_translated": 18,
+  "asian_chars_remaining": 0,
+  "bug_fix": "VideoCacheStats.newest_mtime_ns uses st_mtime_ns (int, nanoseconds) instead of st_mtime (float, seconds). Fields renamed: oldest_mtime->oldest_mtime_ns, newest_mtime->newest_mtime_ns (both int|None). _is_cleanup_candidate now takes now_ns:int and compares in nanoseconds. get_video_cache_stats and clean_video_cache use time.time_ns().",
+  "files_touched": ["app/services/cache_manager.py"]
+}

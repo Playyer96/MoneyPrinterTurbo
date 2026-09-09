@@ -1,0 +1,129 @@
+{
+  "metadata": {
+    "skill_name": "translate-asian-comments",
+    "skill_path": "/Users/dani/Developer/Dev/MoneyPrinterTurbo/.claude/skills/translate-asian-comments",
+    "timestamp": "2026-09-09T16:30:00Z",
+    "evals_run": [
+      "bugfix-with-comments",
+      "explicit-translate-task",
+      "new-function-english-only"
+    ],
+    "runs_per_configuration": 1
+  },
+  "runs": [
+    {
+      "eval_id": 0,
+      "eval_name": "bugfix-with-comments",
+      "configuration": "with_skill",
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 0,
+        "tokens": 0,
+        "tool_calls": 0,
+        "errors": 0
+      }
+    },
+    {
+      "eval_id": 0,
+      "eval_name": "bugfix-with-comments",
+      "configuration": "without_skill",
+      "result": {
+        "pass_rate": 0.6,
+        "passed": 3,
+        "failed": 2,
+        "total": 5,
+        "time_seconds": 0,
+        "tokens": 0,
+        "tool_calls": 0,
+        "errors": 0
+      }
+    },
+    {
+      "eval_id": 1,
+      "eval_name": "explicit-translate-task",
+      "configuration": "with_skill",
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 0,
+        "tokens": 0,
+        "tool_calls": 0,
+        "errors": 0
+      }
+    },
+    {
+      "eval_id": 1,
+      "eval_name": "explicit-translate-task",
+      "configuration": "without_skill",
+      "result": {
+        "pass_rate": 0.4,
+        "passed": 2,
+        "failed": 3,
+        "total": 5,
+        "time_seconds": 0,
+        "tokens": 0,
+        "tool_calls": 0,
+        "errors": 0
+      }
+    },
+    {
+      "eval_id": 2,
+      "eval_name": "new-function-english-only",
+      "configuration": "with_skill",
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 6,
+        "failed": 0,
+        "total": 6,
+        "time_seconds": 0,
+        "tokens": 0,
+        "tool_calls": 0,
+        "errors": 0
+      }
+    },
+    {
+      "eval_id": 2,
+      "eval_name": "new-function-english-only",
+      "configuration": "without_skill",
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 6,
+        "failed": 0,
+        "total": 6,
+        "time_seconds": 0,
+        "tokens": 0,
+        "tool_calls": 0,
+        "errors": 0
+      }
+    }
+  ],
+  "run_summary": {
+    "with_skill": {
+      "pass_rate": {
+        "mean": 1.0,
+        "min": 1.0,
+        "max": 1.0
+      }
+    },
+    "without_skill": {
+      "pass_rate": {
+        "mean": 0.6666666666666666,
+        "min": 0.4,
+        "max": 1.0
+      }
+    },
+    "delta": {
+      "pass_rate": "+0.33"
+    }
+  },
+  "notes": [
+    "The skill provides a clear lift on bug-fix (eval-0) and explicit-translation (eval-1) prompts.",
+    "eval-2 (new function) shows no differentiation because the user's prompt did not request translation, and both versions happened to leave state.py CJK-clean by virtue of the agent's own restraint.",
+    "The cross-LLM canonical source for this rule lives at /AGENTS.md (read by Claude Code, Codex, ChatGPT, OpenCode, Antigravity, Cursor). The .claude/skills/translate-asian-comments/ skill is the Claude-Code-native deep reference."
+  ]
+}

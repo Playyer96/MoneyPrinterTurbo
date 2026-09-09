@@ -1,0 +1,13 @@
+{
+  "eval_id": 2,
+  "eval_name": "new-function-english-only",
+  "prompt": "Add a new function `get_active_task_count()` to app/services/state.py that returns the number of tasks currently in the PROCESSING state. Write the function and any necessary helper.",
+  "assertions": [
+    "A new function get_active_task_count is added to app/services/state.py",
+    "Any new # comments added by the change are written in English (no Han characters)",
+    "Any new docstrings added by the change are written in English",
+    "Any new log/error strings added by the change are written in English",
+    "Existing Chinese comments/docstrings/strings inside app/services/state.py that are within the touched region are translated to English",
+    "Files outside app/services/state.py are not modified"
+  ]
+}

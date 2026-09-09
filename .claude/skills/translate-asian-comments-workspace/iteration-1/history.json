@@ -1,0 +1,15 @@
+{
+  "started_at": "2026-09-09T16:07:00Z",
+  "skill_name": "translate-asian-comments",
+  "current_best": "v1",
+  "iterations": [
+    {
+      "version": "v1",
+      "parent": null,
+      "expectation_pass_rate": 1.00,
+      "grading_result": "won",
+      "is_current_best": true,
+      "notes": "Initial version. Skill + AGENTS.md cross-LLM split. Mean pass rate 1.00 vs baseline 0.67 (+0.33). Eval-0 5/5 vs 3/5, eval-1 5/5 vs 2/5, eval-2 6/6 vs 6/6."
+    }
+  ]
+}

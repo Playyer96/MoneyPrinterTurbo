@@ -1,0 +1,35 @@
+{
+  "expectations": [
+    {
+      "text": "All Chinese (Han-character) comments in app/services/task.py are translated to English",
+      "passed": true,
+      "evidence": "script chars in .final: 5, allowed (test fixture): 5"
+    },
+    {
+      "text": "All Chinese docstrings in app/services/task.py are translated to English",
+      "passed": true,
+      "evidence": "script chars in .final: 5, allowed: 5"
+    },
+    {
+      "text": "All Chinese log/error message string literals in app/services/task.py are translated to English",
+      "passed": true,
+      "evidence": "test fixture: 1, inline \u6709\u9650\u91cd\u8bd5: False"
+    },
+    {
+      "text": "No other files in the repo are modified",
+      "passed": true,
+      "evidence": "non-task paths in diff: []"
+    },
+    {
+      "text": "Code logic, identifiers, imports, and signatures are unchanged",
+      "passed": true,
+      "evidence": "spot-check"
+    }
+  ],
+  "summary": {
+    "passed": 5,
+    "failed": 0,
+    "total": 5,
+    "pass_rate": 1.0
+  }
+}
