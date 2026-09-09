@@ -1,0 +1,12 @@
+torch>=2.4
+torchaudio>=2.4
+transformers>=4.45.0
+accelerate
+numpy
+soundfile
+mcp>=1.2.0
+pydub
+scipy
+huggingface_hub
+fastapi
+uvicorn

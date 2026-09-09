@@ -28,3 +28,7 @@ logs/
 
 storage/
 config.toml
+
+# VoiceStudio is a separate self-hosted service; keep it (and its venv/model
+# weights) out of the MoneyPrinterTurbo image build context.
+vendor/
