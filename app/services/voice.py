@@ -312,6 +312,79 @@ def get_fish_audio_voices() -> list[str]:
     return result
 
 
+VOICESTUDIO_DEFAULT_BASE_URL = "http://127.0.0.1:8780"
+
+
+def get_voicestudio_base_url() -> str:
+    """Return the base URL of the self-hosted VoiceStudio server.
+
+    An explicit ``VOICESTUDIO_BASE_URL`` environment variable wins (used by
+    the Docker deployment to reach a host-side VoiceStudio via
+    ``host.docker.internal``), then the configured value, then the default.
+    """
+    env = os.environ.get("VOICESTUDIO_BASE_URL", "")
+    if env.strip():
+        return env.strip().rstrip("/")
+    configured = config.voicestudio.get("base_url", "") if hasattr(config, "voicestudio") else ""
+    return str(configured or VOICESTUDIO_DEFAULT_BASE_URL).strip().rstrip("/")
+
+
+def get_voicestudio_voices() -> list[str]:
+    """Read voice profiles from the local VoiceStudio server.
+
+    Each profile is returned as ``voicestudio:<profile_name>`` so it can be
+    selected in the WebUI and dispatched by :func:`_single_tts`.
+    """
+    base_url = get_voicestudio_base_url()
+    try:
+        response = requests.get(f"{base_url}/profiles", timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            profiles = data.get("profiles", []) if isinstance(data, dict) else []
+            return [f"voicestudio:{name}" for name in profiles if name]
+        logger.warning(
+            f"voicestudio voices request failed with status {response.status_code}"
+        )
+    except Exception as e:
+        # 不输出 URL/异常正文，避免自托管地址的查询参数或认证信息进入日志。
+        logger.warning(f"voicestudio voice list unavailable ({type(e).__name__})")
+    return []
+
+
+def create_voicestudio_profile(
+    profile_name: str, audio_bytes: bytes, original_filename: str
+) -> tuple[bool, str]:
+    """Create a new VoiceStudio voice profile from an uploaded audio sample.
+
+    Returns ``(ok, message)``; ``message`` is a non-sensitive status text.
+    """
+    name = (profile_name or "").strip()
+    if not name:
+        return False, "profile name cannot be empty"
+    if not audio_bytes:
+        return False, "uploaded audio is empty"
+
+    base_url = get_voicestudio_base_url()
+    files = {"file": (os.path.basename(original_filename or "voice.wav"), audio_bytes)}
+    try:
+        response = requests.post(
+            f"{base_url}/profiles", data={"profile_name": name}, files=files, timeout=600
+        )
+    except Exception as e:
+        logger.warning(f"voicestudio profile creation unavailable ({type(e).__name__})")
+        return False, "voice studio server unavailable"
+    if response.status_code == 409:
+        return False, "profile already exists"
+    if response.status_code != 200:
+        logger.error(
+            f"voicestudio profile creation failed with status "
+            f"{response.status_code}: {response.text[:200]}"
+        )
+        return False, "profile creation failed"
+    logger.success(f"voicestudio profile created: {name}")
+    return True, f"profile created: {name}"
+
+
 _AZURE_VOICES_DATA_FILE = os.path.join(
     os.path.dirname(__file__), "data", "azure_voices.json"
 )
@@ -412,6 +485,10 @@ def is_fish_audio_voice(voice_name: str) -> bool:
     return (voice_name or "").startswith("fish_audio:")
 
 
+def is_voicestudio_voice(voice_name: str) -> bool:
+    return (voice_name or "").startswith("voicestudio:")
+
+
 def get_fish_audio_api_key() -> str:
     configured_key = str(config.fish_audio.get("api_key", "") if hasattr(config, "fish_audio") and isinstance(config.fish_audio, dict) else "").strip()
     return configured_key or os.getenv("FISH_API_KEY", "").strip()
@@ -457,6 +534,8 @@ def is_azure_v1_voice(voice_name: str | None) -> bool:
     if is_kokoro_voice(name):
         return False
     if is_fish_audio_voice(name):
+        return False
+    if is_voicestudio_voice(name):
         return False
     return True
 
@@ -686,6 +765,16 @@ def _single_tts(
         if reference_id == "default":
             reference_id = None
         return fish_audio_tts(text, voice_file, voice_rate, voice_volume, reference_id=reference_id)
+    elif is_voicestudio_voice(voice_name):
+        # 格式: voicestudio:<profile_name>
+        parts = voice_name.split(":", 1)
+        if len(parts) >= 2 and parts[1].strip():
+            return voicestudio_tts(
+                text, parts[1].strip(), voice_file, voice_rate, voice_volume
+            )
+        else:
+            logger.error(f"Invalid voicestudio voice name format: {voice_name}")
+            return None
     return azure_tts_v1(text, voice_name, voice_rate, voice_file)
 
 
@@ -2603,6 +2692,84 @@ def fish_audio_tts(
             )
         except Exception as e:
             logger.error(f"fish audio tts failed: {str(e)}")
+
+    return None
+
+
+def voicestudio_tts(
+    text: str,
+    profile_name: str,
+    voice_file: str,
+    voice_rate: float = 1.0,
+    voice_volume: float = 1.0,
+) -> Union[SubMaker, None]:
+    """Synthesize speech with the self-hosted VoiceStudio server.
+
+    VoiceStudio is a headless OmniVoice-based voice-cloning TTS service (kept
+    under ``vendor/voice_studio``).  ``profile_name`` selects one of the cloned
+    voice profiles (e.g. "goku").  The server is started separately with
+    ``python server.py`` and defaults to ``http://127.0.0.1:8780``, overridable
+    via ``[voicestudio] base_url`` in the config file.
+
+    ``voice_rate``/``voice_volume`` are applied afterwards by the caller
+    (MoviePy), because OmniVoice exposes no native prosody control.  The
+    endpoint returns raw WAV audio with no word-level timestamps, so subtitles
+    fall back to the full-text SubMaker; set ``subtitle_provider = "whisper"``
+    for tighter sync.
+    """
+    text = (text or "").strip()
+    if not text:
+        logger.error("VoiceStudio TTS text is empty")
+        return None
+    # 纯标点/表情没有可发音文字；提前终止可避免无效请求。
+    if not any(character.isalnum() for character in text):
+        logger.error("VoiceStudio TTS text contains no speakable characters")
+        return None
+    base_url = get_voicestudio_base_url()
+
+    payload = {"text": text, "profile_name": profile_name}
+    for i in range(3):
+        try:
+            logger.info(f"start voicestudio tts, profile: {profile_name}, try: {i + 1}")
+            ensure_file_path_exists(voice_file)
+            # 首次合成会下载并加载 OmniVoice 权重（几 GB），允许长时间等待。
+            response = requests.post(f"{base_url}/tts", json=payload, timeout=1800)
+            if response.status_code == 404:
+                logger.error(f"VoiceStudio voice profile not found: {profile_name}")
+                return None
+            if response.status_code == 409:
+                logger.error("VoiceStudio TTS rejected the request (409)")
+                continue
+            if response.status_code != 200:
+                logger.error(
+                    f"voicestudio tts failed with status "
+                    f"{response.status_code}: {response.text[:200]}"
+                )
+                continue
+
+            # Validate response contains audio data
+            if not response.content or len(response.content) < 100:
+                logger.error("VoiceStudio TTS returned empty or invalid audio data")
+                continue
+
+            with open(voice_file, "wb") as f:
+                f.write(response.content)
+
+            audio_clip = AudioFileClip(voice_file)
+            try:
+                audio_duration = audio_clip.duration
+            finally:
+                audio_clip.close()
+
+            sub_maker = ensure_legacy_submaker_fields(SubMaker())
+            logger.success(f"voicestudio tts succeeded: {voice_file}")
+            return populate_legacy_submaker_with_full_text(
+                sub_maker=sub_maker,
+                text=text,
+                audio_duration_seconds=audio_duration,
+            )
+        except Exception as e:
+            logger.error(f"voicestudio tts failed: {str(e)}")
 
     return None
 

@@ -1540,6 +1540,266 @@ def _write_test_wav(filepath: str, duration_seconds: float = 1.0, sample_rate: i
     return filepath
 
 
+class TestVoiceStudioVoice(unittest.TestCase):
+    """VoiceStudio (self-hosted OmniVoice) provider helpers and dispatch."""
+
+    def test_is_voicestudio_voice_true(self):
+        self.assertTrue(vs.is_voicestudio_voice("voicestudio:goku"))
+
+    def test_is_voicestudio_voice_false_azure(self):
+        self.assertFalse(vs.is_voicestudio_voice("zh-CN-XiaoxiaoNeural-Female"))
+
+    def test_is_voicestudio_voice_false_other_values(self):
+        for value in (
+            "fish_audio:default:Default Voice",
+            "kokoro:af_heart",
+            "voicestudio",
+            "",
+            None,
+        ):
+            self.assertFalse(vs.is_voicestudio_voice(value))
+
+    def test_voicestudio_voice_is_excluded_from_azure_v1(self):
+        """voicestudio voices must not go through the Edge TTS segmentation path."""
+        self.assertFalse(vs.is_azure_v1_voice("voicestudio:goku"))
+        self.assertTrue(vs.is_azure_v1_voice("zh-CN-XiaoxiaoNeural-Female"))
+
+    def test_get_voicestudio_base_url_defaults_when_unconfigured(self):
+        with patch.dict(os.environ, {"VOICESTUDIO_BASE_URL": ""}):
+            with patch.object(vs.config, "voicestudio", {}):
+                self.assertEqual(
+                    vs.get_voicestudio_base_url(), vs.VOICESTUDIO_DEFAULT_BASE_URL
+                )
+
+    def test_get_voicestudio_base_url_strips_trailing_slash(self):
+        with patch.dict(os.environ, {"VOICESTUDIO_BASE_URL": ""}):
+            with patch.object(vs.config, "voicestudio", {"base_url": "http://localhost:9999/"}):
+                self.assertEqual(vs.get_voicestudio_base_url(), "http://localhost:9999")
+
+    def test_get_voicestudio_base_url_env_var_wins(self):
+        with patch.dict(os.environ, {"VOICESTUDIO_BASE_URL": "http://host.docker.internal:8780/"}):
+            with patch.object(vs.config, "voicestudio", {"base_url": "http://bad:1"}):
+                self.assertEqual(
+                    vs.get_voicestudio_base_url(), "http://host.docker.internal:8780"
+                )
+
+    def test_get_voicestudio_base_url_blank_env_uses_config(self):
+        with patch.dict(os.environ, {"VOICESTUDIO_BASE_URL": ""}):
+            with patch.object(vs.config, "voicestudio", {"base_url": "http://localhost:9999/"}):
+                self.assertEqual(vs.get_voicestudio_base_url(), "http://localhost:9999")
+
+    def test_get_voicestudio_voices_reads_server_profiles(self):
+        class _FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"profiles": ["cr7_profile", "goku", "homero"]}
+
+        with (
+            patch.dict(os.environ, {"VOICESTUDIO_BASE_URL": ""}),
+            patch.object(vs.config, "voicestudio", {"base_url": "http://localhost:9999"}),
+            patch.object(vs.requests, "get", return_value=_FakeResponse()) as mock_get,
+        ):
+            result = vs.get_voicestudio_voices()
+
+        mock_get.assert_called_once_with("http://localhost:9999/profiles", timeout=5)
+        self.assertEqual(
+            result,
+            ["voicestudio:cr7_profile", "voicestudio:goku", "voicestudio:homero"],
+        )
+
+    def test_get_voicestudio_voices_offline_returns_empty(self):
+        import requests as req_lib
+
+        with (
+            patch.object(vs.config, "voicestudio", {"base_url": "http://localhost:9999"}),
+            patch.object(
+                vs.requests,
+                "get",
+                side_effect=req_lib.exceptions.ConnectionError("down"),
+            ),
+        ):
+            result = vs.get_voicestudio_voices()
+        self.assertEqual(result, [])
+
+    def test_voicestudio_tts_success(self):
+        class _FakeResponse:
+            status_code = 200
+            content = b"S" * 200
+            text = ""
+
+        class _FakeClip:
+            duration = 3.0
+
+            def close(self):
+                pass
+
+        captured = {}
+
+        def _fake_post(url, json=None, timeout=None):
+            captured["url"] = url
+            captured["json"] = json
+            return _FakeResponse()
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.dict(
+            os.environ, {"VOICESTUDIO_BASE_URL": ""}
+        ), patch.object(
+            vs.config,
+            "voicestudio",
+            {"base_url": "http://localhost:8780"},
+        ), patch.object(
+            vs.requests, "post", side_effect=_fake_post
+        ) as post, patch.object(
+            vs, "AudioFileClip", return_value=_FakeClip()
+        ):
+            voice_file = str(Path(tmp_dir) / "vaudio.wav")
+            sub_maker = vs.voicestudio_tts(
+                text="Hello world. Second sentence.",
+                profile_name="goku",
+                voice_file=voice_file,
+            )
+            generated_audio = Path(voice_file).read_bytes()
+
+        post.assert_called_once_with(
+            "http://localhost:8780/tts",
+            json={"text": "Hello world. Second sentence.", "profile_name": "goku"},
+            timeout=1800,
+        )
+        self.assertEqual(generated_audio, b"S" * 200)
+        self.assertIsNotNone(sub_maker)
+        self.assertTrue(getattr(sub_maker, "subs", []))
+
+    def test_voicestudio_tts_profile_not_found_returns_none(self):
+        class _FakeResponse:
+            status_code = 404
+            text = "not found"
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            out = f.name
+        try:
+            with (
+                patch.object(vs.config, "voicestudio", {"base_url": "http://localhost:8780"}),
+                patch.object(vs.requests, "post", return_value=_FakeResponse()),
+                patch.object(vs, "AudioFileClip"),
+            ):
+                result = vs.voicestudio_tts(
+                    text="hello", profile_name="missing", voice_file=out
+                )
+        finally:
+            if os.path.exists(out):
+                os.remove(out)
+        self.assertIsNone(result)
+
+    def test_voicestudio_tts_empty_text_returns_none(self):
+        with patch.object(vs.config, "voicestudio", {"base_url": "http://localhost:8780"}), patch.object(
+            vs.requests, "post"
+        ) as post:
+            result = vs.voicestudio_tts(
+                text="   ", profile_name="goku", voice_file="unused.wav"
+            )
+        self.assertIsNone(result)
+        post.assert_not_called()
+
+    def test_voicestudio_tts_no_speakable_text_returns_none(self):
+        with patch.object(
+            vs.config, "voicestudio", {"base_url": "http://localhost:8780"}
+        ), patch.object(vs.requests, "post") as post:
+            result = vs.voicestudio_tts(
+                text="---", profile_name="goku", voice_file="unused.wav"
+            )
+        self.assertIsNone(result)
+        post.assert_not_called()
+
+    def test_voicestudio_dispatch_in_single_tts(self):
+        sentinel = object()
+        with patch.object(vs, "voicestudio_tts", return_value=sentinel) as mock_tts:
+            result = vs._single_tts(
+                text="hello", voice_name="voicestudio:goku", voice_rate=1.0, voice_file="out.wav"
+            )
+        self.assertIs(result, sentinel)
+        mock_tts.assert_called_once_with(
+            "hello", "goku", "out.wav", 1.0, 1.0
+        )
+
+    def test_voicestudio_dispatch_rejects_malformed_voice_name(self):
+        with patch.object(vs, "voicestudio_tts") as mock_tts:
+            result = vs._single_tts(
+                text="hello", voice_name="voicestudio:", voice_rate=1.0, voice_file="out.wav"
+            )
+        self.assertIsNone(result)
+        mock_tts.assert_not_called()
+
+    def test_create_voicestudio_profile_success(self):
+        class _FakeResponse:
+            status_code = 200
+            text = ""
+
+        captured = {}
+
+        def _fake_post(url, data=None, files=None, timeout=None):
+            captured["url"] = url
+            captured["data"] = data
+            captured["files"] = files
+            return _FakeResponse()
+
+        with patch.dict(
+            os.environ, {"VOICESTUDIO_BASE_URL": ""}
+        ), patch.object(
+            vs.config, "voicestudio", {"base_url": "http://localhost:8780/"}
+        ), patch.object(vs.requests, "post", side_effect=_fake_post) as post:
+            ok, message = vs.create_voicestudio_profile(
+                profile_name="newvo",
+                audio_bytes=b"RIFF-audio",
+                original_filename="sample.wav",
+            )
+        self.assertTrue(ok)
+        self.assertIn("newvo", message)
+        post.assert_called_once()
+        self.assertEqual(captured["url"], "http://localhost:8780/profiles")
+        self.assertEqual(captured["data"], {"profile_name": "newvo"})
+        self.assertIn("file", captured["files"])
+
+    def test_create_voicestudio_profile_conflict_returns_failure(self):
+        class _FakeResponse:
+            status_code = 409
+            text = "already exists"
+
+        with patch.object(
+            vs.config, "voicestudio", {"base_url": "http://localhost:8780"}
+        ), patch.object(vs.requests, "post", return_value=_FakeResponse()):
+            ok, message = vs.create_voicestudio_profile(
+                profile_name="goku",
+                audio_bytes=b"RIFF-audio",
+                original_filename="sample.wav",
+            )
+        self.assertFalse(ok)
+        self.assertEqual(message, "profile already exists")
+
+    def test_create_voicestudio_profile_offline_returns_failure(self):
+        import requests as req_lib
+
+        with patch.object(
+            vs.config, "voicestudio", {"base_url": "http://localhost:8780"}
+        ), patch.object(
+            vs.requests,
+            "post",
+            side_effect=req_lib.exceptions.ConnectionError("down"),
+        ):
+            ok, message = vs.create_voicestudio_profile(
+                profile_name="x",
+                audio_bytes=b"RIFF-audio",
+                original_filename="sample.wav",
+            )
+        self.assertFalse(ok)
+        self.assertEqual(message, "voice studio server unavailable")
+
+    def test_create_voicestudio_profile_empty_input_is_rejected(self):
+        ok, message = vs.create_voicestudio_profile(
+            profile_name="  ", audio_bytes=b"", original_filename="sample.wav"
+        )
+        self.assertFalse(ok)
+
+
 class TestElevenLabsVoice(unittest.TestCase):
 
     def test_is_elevenlabs_voice_true(self):

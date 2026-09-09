@@ -101,6 +101,7 @@ DEFAULT_KOKORO_BASE_URL = "http://127.0.0.1:8880/v1"
 DEFAULT_KOKORO_MODEL = "kokoro"
 # empty = ask the server for its voice list (GET {base_url}/audio/voices)
 DEFAULT_KOKORO_VOICES: list[str] = []
+DEFAULT_VOICESTUDIO_BASE_URL = "http://127.0.0.1:8780"
 ONBOARDING_TOUR_KEY = "mpt-onboarding-v1"
 CUSTOM_LLM_ENDPOINT_ID = "custom"
 VOICE_MODE_TTS = "tts"
@@ -224,6 +225,7 @@ _RUNTIME_CONFIG_SECTIONS = {
     "minimax_tts": config.minimax_tts,
     "siliconflow": config.siliconflow,
     "fish_audio": config.fish_audio,
+    "voicestudio": config.voicestudio,
     "ui": config.ui,
 }
 # 设置预设与密钥备份使用各自的文件标识。导入时先校验 schema 和版本，
@@ -544,6 +546,50 @@ def _get_kokoro_voice_options(saved_voice_name: str) -> list[str]:
         if voice.is_kokoro_voice(saved_voice_name) and saved_voice_name not in options:
             options.insert(0, saved_voice_name)
     return options or [f"kokoro:{voice.KOKORO_DEFAULT_VOICE}"]
+
+
+def _sync_voicestudio_config_from_session_state():
+    # 音色目录先于设置输入框渲染，先同步浏览器状态，确保本次 rerun 就使用
+    # 新端点，不必再操作一次控件。
+    _set_runtime_config(
+        "voicestudio",
+        "base_url",
+        (
+            st.session_state.get(
+                "voicestudio_base_url_input",
+                config.voicestudio.get("base_url")
+                or DEFAULT_VOICESTUDIO_BASE_URL,
+            )
+            or ""
+        ).strip(),
+    )
+
+
+def _get_voicestudio_voice_options(saved_voice_name: str) -> list[str]:
+    """会话内短缓存远端目录，断线时保留上次选择，不把故障当成用户改音色。"""
+    signature = (config.voicestudio.get("base_url") or "").strip().rstrip("/")
+    catalog = st.session_state.get("voicestudio_voice_catalog", {})
+    if catalog.get("signature") != signature:
+        catalog = {"signature": signature, "voices": [], "checked_at": None}
+    now = time.monotonic()
+    if catalog["checked_at"] is None or now - catalog["checked_at"] >= 30:
+        fetched = voice.get_voicestudio_voices()
+        catalog.update(checked_at=now, available=bool(fetched))
+        if fetched:
+            catalog["voices"] = fetched
+        st.session_state["voicestudio_voice_catalog"] = catalog
+
+    options = list(catalog["voices"])
+    if not catalog["available"]:
+        st.warning(tr("VoiceStudio Voices Unavailable"))
+        # 首次打开时可能没有缓存，仍保留配置中的真实选择；恢复连接后
+        # 只有成功返回的新目录才能判定某个旧音色确实已被服务器删除。
+        if (
+            voice.is_voicestudio_voice(saved_voice_name)
+            and saved_voice_name not in options
+        ):
+            options.insert(0, saved_voice_name)
+    return options
 
 
 def _detect_audio_mime(audio_file: str, audio_bytes: bytes) -> str:
@@ -1402,6 +1448,8 @@ def _infer_tts_server_from_voice(voice_name):
         return "kokoro"
     if voice.is_fish_audio_voice(voice_name):
         return "fish_audio"
+    if voice.is_voicestudio_voice(voice_name):
+        return "voicestudio"
     if voice.is_azure_v2_voice(voice_name):
         return "azure-tts-v2"
     return "azure-tts-v1"
@@ -5486,6 +5534,8 @@ def _get_voice_preview_provider_signature(tts_server: str) -> dict:
             "model_id": config.kokoro.get("model_id", ""),
             "credential": _credential_signature(config.kokoro.get("api_key", "")),
         }
+    if tts_server == "voicestudio":
+        return {"base_url": config.voicestudio.get("base_url", "")}
     return {}
 
 
@@ -5503,6 +5553,8 @@ def _synthesize_voice_preview(
         _sync_chatterbox_config_from_session_state()
     if selected_tts_server == "kokoro":
         _sync_kokoro_config_from_session_state()
+    if selected_tts_server == "voicestudio":
+        _sync_voicestudio_config_from_session_state()
 
     temp_dir = utils.storage_dir("temp", create=True)
     audio_file = os.path.join(temp_dir, f"tmp-voice-{str(uuid4())}.mp3")
@@ -6344,6 +6396,7 @@ def _render_audio_settings(panel, params):
                 ("chatterbox", "Chatterbox TTS"),
                 ("kokoro", "Kokoro TTS"),
                 ("fish_audio", "Fish Audio TTS"),
+                ("voicestudio", "VoiceStudio TTS"),
             ]
 
             tts_server_values = [server_value for server_value, _ in tts_servers]
@@ -6419,6 +6472,10 @@ def _render_audio_settings(panel, params):
                 filtered_voices = _get_kokoro_voice_options(saved_voice_name)
             elif selected_tts_server == "fish_audio":
                 filtered_voices = voice.get_fish_audio_voices()
+            elif selected_tts_server == "voicestudio":
+                # 自托管 VoiceStudio 服务的本地克隆音色目录
+                _sync_voicestudio_config_from_session_state()
+                filtered_voices = _get_voicestudio_voice_options(saved_voice_name)
             else:
                 # 获取Azure的声音列表
                 all_voices = voice.get_all_azure_voices(filter_locals=None)
@@ -6475,6 +6532,8 @@ def _render_audio_settings(panel, params):
                         display_name.replace("Female", tr("Female"))
                         .replace("Male", tr("Male"))
                     )
+                if voice.is_voicestudio_voice(v):
+                    return v.split(":", 1)[1] if ":" in v else v
                 return (
                     v.replace("Female", tr("Female"))
                     .replace("Male", tr("Male"))
@@ -6840,6 +6899,56 @@ def _render_audio_settings(panel, params):
                     "voices",
                     _parse_chatterbox_voices(kokoro_voices),
                 )
+
+            # VoiceStudio API settings section (self-hosted OmniVoice cloning server)
+            if tts_mode_enabled and (
+                selected_tts_server == "voicestudio"
+                or (voice_name and voice.is_voicestudio_voice(voice_name))
+            ):
+                voicestudio_base_url = st.text_input(
+                    tr("VoiceStudio Base URL"),
+                    value=config.voicestudio.get("base_url")
+                    or DEFAULT_VOICESTUDIO_BASE_URL,
+                    key="voicestudio_base_url_input",
+                    placeholder=tr("VoiceStudio Base URL Placeholder"),
+                )
+                _set_runtime_config(
+                    "voicestudio",
+                    "base_url",
+                    (voicestudio_base_url or "").strip(),
+                )
+
+                profile_sample = st.file_uploader(
+                    tr("VoiceStudio Voice Sample"),
+                    type=["wav", "mp3", "flac", "ogg", "m4a"],
+                    key="voicestudio_profile_sample_upload",
+                )
+                profile_name_input = st.text_input(
+                    tr("VoiceStudio Profile Name"),
+                    value="",
+                    key="voicestudio_profile_name_input",
+                )
+                if st.button(
+                    tr("Create VoiceStudio Profile"),
+                    key="voicestudio_create_profile_button",
+                ):
+                    sample_bytes = profile_sample.getvalue() if profile_sample else b""
+                    ok, message = voice.create_voicestudio_profile(
+                        profile_name=profile_name_input or "",
+                        audio_bytes=sample_bytes,
+                        original_filename=(
+                            profile_sample.name if profile_sample else ""
+                        ),
+                    )
+                    if ok:
+                        st.success(
+                            f"{tr('VoiceStudio Profile Created')}: "
+                            f"{(profile_name_input or '').strip()}"
+                        )
+                        # 让音色目录下次 rerun 时重新拉取，包含新建的音色。
+                        st.session_state.pop("voicestudio_voice_catalog", None)
+                    else:
+                        st.error(f"{tr('VoiceStudio Profile Create Failed')}: {message}")
 
             # 三种模式只渲染当前任务真正需要的控件。自动配音可调音量和语速；
             # 上传音频只需要文件和音量；无配音不再展示无效设置。
