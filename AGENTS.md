@@ -99,3 +99,38 @@ Before you finish:
   covers it.
 - Don't refactor unrelated code in the same edit — keep the diff to the
   smallest working change.
+
+## 3. Per-tool setup
+
+Most modern AI coding tools read this file automatically. A few don't —
+they need a one-time manual setup.
+
+### Auto-reads `AGENTS.md` (no setup needed)
+
+- **Claude Code** — reads `AGENTS.md` and also `.claude/skills/translate-asian-comments/SKILL.md`
+- **Cursor** — reads `AGENTS.md` (and `CLAUDE.md`, `.cursorrules`)
+- **Codex CLI** (OpenAI) — reads `AGENTS.md`
+- **OpenCode** — reads `AGENTS.md`
+- **Antigravity** (Google) — reads `AGENTS.md`
+- **Continue.dev, Cody (Sourcegraph), Windsurf, aider, JetBrains AI Assistant, Sourcegraph Amp** — all read `AGENTS.md`
+
+### Needs manual setup (one-time, per project)
+
+These tools don't have a way to read repo files automatically. Set them
+up once per project; the rules then apply for every conversation in
+that project.
+
+- **ChatGPT (web and desktop)** — open or create a Project for this repo,
+  click **Add files** in Project knowledge, and upload `AGENTS.md`.
+  ChatGPT reads the file on every conversation in that Project. For
+  the best result also add `AGENTS.md` content into the Project's
+  custom instructions so it survives even if file retrieval fails.
+- **Claude Desktop** — same as ChatGPT. Open a Project for this repo,
+  add `AGENTS.md` to Project knowledge. Claude Desktop reads uploaded
+  files automatically per conversation.
+
+### Tools that don't apply
+
+- Browser tab chat (ChatGPT without Projects, plain claude.ai, plain
+  ChatGPT in a fresh tab) — no filesystem access. There's nothing to
+  set up in the repo; you have to paste the rule into the conversation.
