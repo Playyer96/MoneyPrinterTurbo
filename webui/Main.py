@@ -1940,7 +1940,7 @@ def render_onboarding_tour():
 
 
 def _render_generation_logs(task_id):
-    """渲染后台任务日志快照，不从工作线程访问 Streamlit 会话状态。"""
+    """Render a snapshot of the background task log without touching Streamlit session state from the worker thread."""
     if config.ui.get("hide_log", False):
         return
 
@@ -1948,7 +1948,7 @@ def _render_generation_logs(task_id):
     if not log_records:
         return
 
-    st.code("\n".join(log_records))
+    st.code("\n".join(log_records), height=320)
 
 
 def _render_generation_task_snapshot(task_id, task):
@@ -2071,9 +2071,44 @@ def _render_running_generation_task(task_id):
     _render_generation_task_snapshot(task_id, task)
 
 
+def _recover_generation_task_id():
+    """
+    Restore the running task after the browser session was replaced.
+
+    The long final render keeps the server thread busy, so Streamlit's
+    WebSocket can drop and reconnect with a brand new session. session_state is
+    empty then, which used to make the whole task panel -- progress, logs and
+    the finished video -- vanish while the task was still running.
+    """
+    task_id = webui_task.get_last_submitted_task_id()
+    if not task_id:
+        return ""
+
+    try:
+        task = sm.state.get_task(task_id)
+    except Exception as exc:
+        logger.exception(
+            f"failed to recover WebUI generation task: task_id={task_id}, error={exc}"
+        )
+        return ""
+    if not task:
+        return ""
+
+    st.session_state["current_generation_task_id"] = task_id
+    if _normalize_task_state(task.get("state")) != const.TASK_STATE_PROCESSING:
+        # The task already finished before this session existed: show the
+        # result, but do not replay the completion side effects (opening the
+        # task folder, the completion log line).
+        st.session_state["handled_generation_task_id"] = task_id
+    return task_id
+
+
 def _render_current_generation_task():
     """在生成按钮下方恢复当前页面最近提交任务的可查询 UI。"""
-    task_id = st.session_state.get("current_generation_task_id", "")
+    task_id = (
+        st.session_state.get("current_generation_task_id", "")
+        or _recover_generation_task_id()
+    )
     if not task_id:
         return
 

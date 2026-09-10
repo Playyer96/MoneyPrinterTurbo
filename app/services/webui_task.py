@@ -21,6 +21,10 @@ _task_manager = InMemoryTaskManager(
     max_queued_tasks=max(1, int(config.app.get("max_queued_tasks", 100))),
 )
 _task_logs: dict[str, deque[str]] = {}
+# ponytail: single WebUI task at a time, so one id is enough to recover the
+# running task after a browser reconnect. Track a per-session mapping if
+# concurrency ever goes above 1.
+_last_submitted_task_id = ""
 _task_logs_lock = threading.RLock()
 _MAX_LOG_TASKS = 20
 _MAX_LOG_RECORDS_PER_TASK = 1000
@@ -42,6 +46,11 @@ def _append_task_log(task_id: str, message: str) -> None:
             records = deque(maxlen=_MAX_LOG_RECORDS_PER_TASK)
             _task_logs[task_id] = records
         records.append(message.rstrip())
+
+
+def get_last_submitted_task_id() -> str:
+    """Last task submitted from the WebUI, used to restore the task panel."""
+    return _last_submitted_task_id
 
 
 def get_task_logs(task_id: str) -> list[str]:
@@ -132,6 +141,8 @@ def submit_generation(
     任务状态必须在线程启动前写入。这样页面本次脚本执行结束时即可查询到任务，
     浏览器刷新或 WebSocket 重连也不依赖旧页面内存中的占位符。
     """
+    global _last_submitted_task_id
+
     task_params = params.model_copy(deep=True)
     # 预览载荷只包含不可变音频路径、参数快照和只读字幕时间轴。复制外层字典，
     # 避免页面后续 rerun 替换缓存字段时影响已经提交到后台队列的任务。
@@ -154,6 +165,7 @@ def submit_generation(
             voice_preview=voice_preview_snapshot,
             loomloom_video_request=loomloom_request_snapshot,
         )
+        _last_submitted_task_id = task_id
     except Exception as exc:
         # 调度失败与流水线失败一样必须成为可查询状态，避免任务管理器永久显示
         # “生成中”。保留异常类型便于从 Docker 或本机日志快速定位队列问题。

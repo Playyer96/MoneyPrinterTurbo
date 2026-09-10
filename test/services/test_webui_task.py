@@ -527,3 +527,49 @@ def test_worker_wrapper_failure_is_saved_instead_of_leaving_processing_state():
     assert task["state"] == const.TASK_STATE_FAILED
     assert task["error"] == "RuntimeError: lock failed"
     webui_task.sm.state.delete_task(task_id)
+
+
+def test_submit_generation_remembers_task_for_session_recovery():
+    """
+    A reconnecting browser gets a fresh Streamlit session, so the running task
+    has to be recoverable from the process instead of session_state.
+    """
+    previous = webui_task._last_submitted_task_id
+    try:
+        with patch.object(webui_task._task_manager, "add_task"):
+            webui_task.submit_generation(
+                "recovery-test", VideoParams(video_subject="recovery"), capture_logs=False
+            )
+        assert webui_task.get_last_submitted_task_id() == "recovery-test"
+
+        with patch.object(
+            webui_task._task_manager, "add_task", side_effect=RuntimeError("queue full")
+        ):
+            with pytest.raises(RuntimeError):
+                webui_task.submit_generation(
+                    "rejected-test",
+                    VideoParams(video_subject="rejected"),
+                    capture_logs=False,
+                )
+        assert webui_task.get_last_submitted_task_id() == "recovery-test"
+    finally:
+        webui_task._last_submitted_task_id = previous
+        webui_task.sm.state.delete_task("recovery-test")
+        webui_task.sm.state.delete_task("rejected-test")
+
+
+def test_current_task_panel_falls_back_to_process_task_id():
+    """The task panel must not depend on session_state alone to stay on screen."""
+    tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_render_current_generation_task"
+    )
+    calls = {
+        _attribute_name(node.func)
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+    }
+    assert "_recover_generation_task_id" in calls
