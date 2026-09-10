@@ -50,6 +50,39 @@ loomloom_poll_interval_seconds = 2
 loomloom_run_timeout_seconds = 600
 loomloom_video_run_timeout_seconds = 1800
 
+# -----------------------------------------------------------------------------
+# Web Research / 联网检索
+# -----------------------------------------------------------------------------
+
+# Research the video subject on the web before the script is written and pass
+# the findings to the model as reference facts. Works with every provider,
+# including local models without tool calling, because the pages are fetched
+# here and appended to the prompt.
+# 生成脚本前先联网检索主题，并把检索结果作为参考资料附加到提示词中。
+enable_web_research = false
+
+# Both options are free and keyless. "searxng" is the meta-search container in
+# docker-compose.yml and is the default inside Docker (the compose file sets
+# WEB_SEARCH_PROVIDER and SEARXNG_URL); "duckduckgo" scrapes the HTML endpoint
+# directly and is the fallback whenever the search engine returns nothing.
+# 两种方式都免费且无需 Key。Docker 部署默认使用 compose 中的 searxng 容器。
+web_search_provider = "duckduckgo"
+# Only used by "searxng" outside Docker, e.g. "http://127.0.0.1:8080".
+web_search_base_url = ""
+
+# Pages are read by the Lightpanda headless browser container so that
+# JavaScript-rendered articles produce real text. docker-compose.yml sets
+# LIGHTPANDA_URL; set this only when running the browser somewhere else.
+# Leave empty and plain HTTP is used whenever the browser is unreachable.
+lightpanda_url = ""
+
+# How many search results to collect, and how many of them to open and read in
+# full. Reading pages costs time and prompt tokens; set pages to 0 to keep the
+# search snippets only. Results are de-duplicated by site and pages with no
+# real prose are dropped, so fewer sources survive than are requested.
+web_research_results = 6
+web_research_pages = 3
+
 # Timeout in seconds for a single Edge TTS streaming request.
 # 单次 Edge TTS 流式请求超时时间。慢网络可适当调大，设置为 0 表示禁用超时。
 edge_tts_timeout = 30
@@ -600,6 +633,9 @@ open_task_folder_on_completion = true
 # language = "zh"
 # video_language = ""
 # paragraph_number = 1
+# series_enabled = false             # Split one subject into a video series.
+# series_parts = 0                   # 0 lets the model choose the part count.
+# series_continuity = true
 # video_script_prompt = ""
 # custom_system_prompt = ""
 # loomloom_candidate_count = 3

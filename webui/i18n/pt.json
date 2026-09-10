@@ -1,6 +1,22 @@
 {
   "Language": "Português",
   "Translation": {
+    "Series Mode": "Dividir em uma série de vídeos",
+    "Series Mode Help": "Gera um vídeo por capítulo em vez de um único vídeo. Cada parte tem o próprio roteiro, narração, material e arquivo.",
+    "Series Parts": "Número de partes",
+    "Series Parts Help": "Quantos vídeos gerar. Com 0, o modelo decide quantas partes o tema realmente precisa.",
+    "Series Parts Auto Caption": "Automático: o modelo decide quantas partes o tema precisa.",
+    "Series Parts Fixed Caption": "Fixo: {parts} partes.",
+    "Series Continuity": "Manter a ordem das partes",
+    "Series Continuity Help": "Informa a cada parte quais capítulos vêm antes e depois, para a série ter um fio condutor em vez de vídeos sem relação.",
+    "Plan Series Chapters": "Planejar capítulos",
+    "Planning Series Chapters": "Planejando capítulos",
+    "Series Planning Failed": "Falha ao planejar a série. Verifique as configurações do LLM e tente novamente.",
+    "Series Outline": "Capítulos",
+    "Series Outline Help": "Um capítulo por linha, em ordem. Deixe vazio para planejar os capítulos quando a tarefa começar.",
+    "Series Outline Placeholder": "Um capítulo por linha",
+    "Series Outline Count": "Serão gerados {count} capítulos.",
+    "Series Part Failed Warning": "A parte {part} falhou e foi ignorada: {subject}",
     "Kokoro Base URL": "URL base do Kokoro",
     "Kokoro API Key": "Chave de API do Kokoro (opcional; [Configuração](https://github.com/remsky/Kokoro-FastAPI))",
     "Kokoro Model": "Modelo do Kokoro",
@@ -417,6 +433,12 @@
     "OFox Upstream Vendor Help": "Qual fornecedor upstream atende a geração de vídeo do OFox. BytePlus (internacional) é o padrão, com política de conteúdo consistente; Volcano Engine é o fornecedor da China continental; Auto deixa o gateway OFox balancear a carga entre fornecedores.",
     "OFox Vendor BytePlus": "BytePlus (internacional, padrão)",
     "OFox Vendor Volcengine": "Volcano Engine (China continental)",
-    "OFox Vendor Auto": "Automático (balanceamento do gateway)"
+    "OFox Vendor Auto": "Automático (balanceamento do gateway)",
+    "Research Subject on the Web": "Pesquisar o tema na web",
+    "Research Subject on the Web Help": "Pesquisa o tema do vídeo na web (e na Wikipédia) antes de escrever o roteiro e entrega os resultados ao modelo como fatos de referência. Funciona com qualquer provedor, incluindo modelos locais sem chamada de ferramentas. Acrescenta alguns segundos e tokens extras por roteiro.",
+    "Web Search Provider": "Provedor de busca",
+    "Web Search Provider Help": "Ambos são gratuitos e sem chave. searxng é o contêiner de metabusca do docker-compose.yml: sem limite de requisições e usado automaticamente no Docker. duckduckgo consulta o endpoint HTML público e serve de alternativa automática.",
+    "SearXNG Base URL": "Endereço do SearXNG",
+    "Web Research Guardrails Note": "As páginas são lidas pelo contêiner do navegador headless Lightpanda, de modo que artigos renderizados só em JavaScript também produzem texto. As fontes são deduplicadas por site e páginas sem texto real são descartadas."
   }
 }

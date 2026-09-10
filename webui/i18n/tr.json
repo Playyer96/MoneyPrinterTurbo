@@ -1,6 +1,22 @@
 {
   "Language": "Türkçe",
   "Translation": {
+    "Series Mode": "Video serisine böl",
+    "Series Mode Help": "Tek video yerine her bölüm için bir video üretir. Her parçanın kendi metni, seslendirmesi, görsel malzemesi ve dosyası olur.",
+    "Series Parts": "Parça sayısı",
+    "Series Parts Help": "Kaç video üretileceği. 0 girilirse konunun gerçekte kaç parçaya ihtiyacı olduğuna model karar verir.",
+    "Series Parts Auto Caption": "Otomatik: konunun kaç parça gerektirdiğine model karar verir.",
+    "Series Parts Fixed Caption": "Sabit: {parts} parça.",
+    "Series Continuity": "Parça sırasını koru",
+    "Series Continuity Help": "Her parçaya kendinden önceki ve sonraki bölümleri bildirir; böylece seri, birbirinden kopuk videolar yerine tek bir akış olur.",
+    "Plan Series Chapters": "Bölümleri planla",
+    "Planning Series Chapters": "Bölümler planlanıyor",
+    "Series Planning Failed": "Seri planlanamadı. LLM ayarlarını kontrol edip yeniden deneyin.",
+    "Series Outline": "Bölümler",
+    "Series Outline Help": "Her satıra bir bölüm, sırasıyla. Bölümlerin görev başlarken planlanması için boş bırakın.",
+    "Series Outline Placeholder": "Her satıra bir bölüm",
+    "Series Outline Count": "{count} bölüm üretilecek.",
+    "Series Part Failed Warning": "{part}. parça başarısız oldu ve atlandı: {subject}",
     "Kokoro Base URL": "Kokoro Temel URL",
     "Kokoro API Key": "Kokoro API Anahtarı (isteğe bağlı; [Kurulum](https://github.com/remsky/Kokoro-FastAPI))",
     "Kokoro Model": "Kokoro Modeli",
@@ -417,6 +433,12 @@
     "OFox Upstream Vendor Help": "OFox video üretimini hangi üst akış sağlayıcısının sunacağı. BytePlus (uluslararası) tutarlı içerik politikasıyla varsayılandır; Volcano Engine Çin anakarası sağlayıcısıdır; Otomatik, OFox ağ geçidinin yükü sağlayıcılar arasında dengelemesine izin verir.",
     "OFox Vendor BytePlus": "BytePlus (uluslararası, varsayılan)",
     "OFox Vendor Volcengine": "Volcano Engine (Çin anakarası)",
-    "OFox Vendor Auto": "Otomatik (ağ geçidi yük dengeleme)"
+    "OFox Vendor Auto": "Otomatik (ağ geçidi yük dengeleme)",
+    "Research Subject on the Web": "Konuyu web'de araştır",
+    "Research Subject on the Web Help": "Senaryo yazılmadan önce video konusunu web'de (ve Wikipedia'da) araştırır ve bulguları referans bilgi olarak modele verir. Araç çağrısı desteklemeyen yerel modeller dahil her sağlayıcıyla çalışır. Senaryo başına birkaç saniye ve fazladan istem jetonu ekler.",
+    "Web Search Provider": "Arama sağlayıcısı",
+    "Web Search Provider Help": "İkisi de ücretsizdir ve anahtar istemez. searxng, docker-compose.yml içindeki meta arama kapsayıcısıdır: hız sınırı yoktur ve Docker'da otomatik olarak kullanılır. duckduckgo herkese açık HTML uç noktasını okur ve otomatik yedek seçenektir.",
+    "SearXNG Base URL": "SearXNG adresi",
+    "Web Research Guardrails Note": "Sayfalar Lightpanda başsız tarayıcı kapsayıcısı tarafından okunur; böylece yalnızca JavaScript ile oluşturulan makaleler de metin verir. Kaynaklar site başına tekilleştirilir, gerçek metni olmayan sayfalar atılır."
   }
 }

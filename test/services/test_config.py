@@ -63,7 +63,9 @@ class TestConfigPersistence:
         assert "loomloom_market_listing_id" not in app_config
         assert "loomloom_video_market_listing_id" not in app_config
         assert app_config["shengsuanyun_api_key"] == ""
-        assert example_config["whisper"]["device"] == "cpu"
+        # "auto" is the shipped default: CTranslate2 takes an attached NVIDIA
+        # GPU and falls back to the CPU, so one config covers CUDA and CPU hosts.
+        assert example_config["whisper"]["device"] == "auto"
 
     def test_example_config_covers_llm_provider_registry(self):
         """Registry 中可配置的 Provider 字段必须能在示例文件中被发现。"""

@@ -1,6 +1,22 @@
 {
   "Language": "한국어",
   "Translation": {
+    "Series Mode": "여러 편의 시리즈로 나누기",
+    "Series Mode Help": "영상 한 편 대신 챕터마다 한 편씩 생성합니다. 각 편은 자체 대본, 내레이션, 소재, 파일을 갖습니다.",
+    "Series Parts": "편 수",
+    "Series Parts Help": "생성할 영상 수입니다. 0으로 두면 주제에 실제로 필요한 편 수를 모델이 정합니다.",
+    "Series Parts Auto Caption": "자동: 주제에 필요한 편 수를 모델이 정합니다.",
+    "Series Parts Fixed Caption": "고정: {parts}편.",
+    "Series Continuity": "편 순서 유지",
+    "Series Continuity Help": "각 편에 앞뒤 챕터가 무엇인지 알려 주어, 서로 무관한 영상이 아니라 하나의 흐름으로 이어지게 합니다.",
+    "Plan Series Chapters": "챕터 구성",
+    "Planning Series Chapters": "챕터를 구성하는 중",
+    "Series Planning Failed": "시리즈 구성에 실패했습니다. LLM 설정을 확인한 뒤 다시 시도하세요.",
+    "Series Outline": "챕터",
+    "Series Outline Help": "한 줄에 챕터 하나씩 순서대로 입력합니다. 비워 두면 작업 시작 시 자동으로 구성합니다.",
+    "Series Outline Placeholder": "한 줄에 챕터 하나",
+    "Series Outline Count": "{count}편이 생성됩니다.",
+    "Series Part Failed Warning": "{part}편 생성에 실패하여 건너뛰었습니다: {subject}",
     "Kokoro Base URL": "Kokoro 기본 URL",
     "Kokoro API Key": "Kokoro API 키 (선택 사항; [설정 안내](https://github.com/remsky/Kokoro-FastAPI))",
     "Kokoro Model": "Kokoro 모델",
@@ -417,6 +433,12 @@
     "OFox Upstream Vendor Help": "OFox 영상 생성에 사용할 업스트림 공급사입니다. BytePlus(국제)가 기본값으로 콘텐츠 정책이 일관됩니다. Volcano Engine은 중국 본토 공급사이며, 자동은 OFox 게이트웨이가 공급사 간 부하를 분산합니다.",
     "OFox Vendor BytePlus": "BytePlus (국제, 기본값)",
     "OFox Vendor Volcengine": "Volcano Engine (중국 본토)",
-    "OFox Vendor Auto": "자동 (게이트웨이 부하 분산)"
+    "OFox Vendor Auto": "자동 (게이트웨이 부하 분산)",
+    "Research Subject on the Web": "웹에서 주제 조사",
+    "Research Subject on the Web Help": "대본을 쓰기 전에 웹(과 위키백과)에서 영상 주제를 조사해 그 결과를 참고 자료로 모델에 전달합니다. 도구 호출을 지원하지 않는 로컬 모델을 포함해 모든 공급자에서 작동합니다. 대본마다 몇 초와 추가 프롬프트 토큰이 듭니다.",
+    "Web Search Provider": "검색 제공자",
+    "Web Search Provider Help": "둘 다 무료이며 키가 필요 없습니다. searxng는 docker-compose.yml의 메타 검색 컨테이너로 요청 제한이 없고 Docker에서 자동으로 사용됩니다. duckduckgo는 공개 HTML 엔드포인트를 읽으며 자동 대체 수단입니다.",
+    "SearXNG Base URL": "SearXNG 주소",
+    "Web Research Guardrails Note": "페이지는 Lightpanda 헤드리스 브라우저 컨테이너가 읽으므로 자바스크립트로만 렌더링되는 기사도 본문을 얻습니다. 출처는 사이트별로 중복 제거하고 본문이 없는 페이지는 버립니다."
   }
 }

@@ -2,10 +2,43 @@ x-common-volumes: &common-volumes
   - ./config.toml:/MoneyPrinterTurbo/config.toml
   - ./storage:/MoneyPrinterTurbo/storage
 
+# Topic research needs the same two helpers as the build-from-source stack: a
+# headless browser to read article pages and a meta search engine to find them.
+x-research-env: &research-env
+  LIGHTPANDA_URL: "${LIGHTPANDA_URL:-ws://lightpanda:9222}"
+  WEB_SEARCH_PROVIDER: "${WEB_SEARCH_PROVIDER:-searxng}"
+  SEARXNG_URL: "${SEARXNG_URL:-http://searxng:8080}"
+
 services:
+  lightpanda:
+    image: lightpanda/browser:nightly
+    container_name: "moneyprinterturbo-lightpanda"
+    command:
+      - "/bin/lightpanda"
+      - "serve"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "9222"
+      - "--obey-robots"
+      - "--log-level"
+      - "info"
+    restart: always
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: "moneyprinterturbo-searxng"
+    environment:
+      SEARXNG_BASE_URL: "http://searxng:8080/"
+      SEARXNG_SECRET: "${SEARXNG_SECRET:-moneyprinterturbo-local-only}"
+    volumes:
+      - ./docker/searxng:/etc/searxng
+    restart: always
+
   webui:
     image: ghcr.io/harry0703/moneyprinterturbo:latest
     container_name: "moneyprinterturbo-webui"
+    environment: *research-env
     ports:
       - "127.0.0.1:8501:8501"
     command: [ "streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=127.0.0.1", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False" ]
@@ -14,6 +47,7 @@ services:
   api:
     image: ghcr.io/harry0703/moneyprinterturbo:latest
     container_name: "moneyprinterturbo-api"
+    environment: *research-env
     ports:
       - "127.0.0.1:8080:8080"
     command: [ "python3", "main.py" ]

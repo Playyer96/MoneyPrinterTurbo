@@ -1,0 +1,23 @@
+# Minimal SearXNG config for MoneyPrinterTurbo's topic research.
+#
+# Only two things differ from upstream defaults: the JSON output format is
+# turned on (off by default, and it is the only format a program can consume)
+# and the rate limiter is off, because the only client is the api/webui
+# container on the private bridge network.
+use_default_settings: true
+
+server:
+  # Local-only service on an internal Docker network. Override with the
+  # SEARXNG_SECRET environment variable if you expose this port.
+  secret_key: "moneyprinterturbo-local-only"
+  limiter: false
+  image_proxy: false
+
+search:
+  formats:
+    - html
+    - json
+  # Research quality: prefer engines that return article text over shopping
+  # and social noise. Autocomplete is pointless for a machine client.
+  autocomplete: ""
+  safe_search: 0

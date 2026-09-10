@@ -1,6 +1,22 @@
 {
   "Language": "Bahasa Indonesia",
   "Translation": {
+    "Series Mode": "Bagi menjadi seri video",
+    "Series Mode Help": "Membuat satu video per bab, bukan satu video saja. Setiap bagian punya naskah, narasi, materi, dan berkasnya sendiri.",
+    "Series Parts": "Jumlah bagian",
+    "Series Parts Help": "Berapa banyak video yang dibuat. Isi 0 agar model menentukan sendiri berapa bagian yang benar-benar dibutuhkan topik ini.",
+    "Series Parts Auto Caption": "Otomatis: model menentukan jumlah bagian yang dibutuhkan topik.",
+    "Series Parts Fixed Caption": "Tetap: {parts} bagian.",
+    "Series Continuity": "Jaga urutan antar bagian",
+    "Series Continuity Help": "Beri tahu setiap bagian bab mana yang ada sebelum dan sesudahnya, agar seri terasa satu alur, bukan video yang tidak berkaitan.",
+    "Plan Series Chapters": "Rencanakan bab",
+    "Planning Series Chapters": "Merencanakan bab",
+    "Series Planning Failed": "Gagal merencanakan seri. Periksa pengaturan LLM lalu coba lagi.",
+    "Series Outline": "Bab",
+    "Series Outline Help": "Satu bab per baris, sesuai urutan. Kosongkan agar bab direncanakan saat tugas berjalan.",
+    "Series Outline Placeholder": "Satu bab per baris",
+    "Series Outline Count": "{count} bab akan dibuat.",
+    "Series Part Failed Warning": "Bagian {part} gagal dan dilewati: {subject}",
     "Kokoro Base URL": "URL Dasar Kokoro",
     "Kokoro API Key": "Kunci API Kokoro (opsional; [Panduan Konfigurasi](https://github.com/remsky/Kokoro-FastAPI))",
     "Kokoro Model": "Model Kokoro",
@@ -417,6 +433,12 @@
     "OFox Upstream Vendor Help": "Vendor upstream yang melayani pembuatan video OFox. BytePlus (internasional) adalah bawaan dengan kebijakan konten yang konsisten; Volcano Engine adalah vendor Tiongkok daratan; Auto membiarkan gateway OFox menyeimbangkan beban antar vendor.",
     "OFox Vendor BytePlus": "BytePlus (internasional, bawaan)",
     "OFox Vendor Volcengine": "Volcano Engine (Tiongkok daratan)",
-    "OFox Vendor Auto": "Otomatis (penyeimbangan gateway)"
+    "OFox Vendor Auto": "Otomatis (penyeimbangan gateway)",
+    "Research Subject on the Web": "Riset topik di web",
+    "Research Subject on the Web Help": "Cari topik video di web (dan Wikipedia) sebelum naskah ditulis, lalu serahkan hasilnya ke model sebagai fakta rujukan. Berfungsi untuk semua penyedia, termasuk model lokal tanpa pemanggilan alat. Menambah beberapa detik dan token prompt per naskah.",
+    "Web Search Provider": "Penyedia pencarian",
+    "Web Search Provider Help": "Keduanya gratis dan tanpa kunci. searxng adalah kontainer meta-pencarian dari docker-compose.yml — tanpa pembatasan laju dan otomatis dipakai di Docker. duckduckgo membaca endpoint HTML publik dan menjadi cadangan otomatis.",
+    "SearXNG Base URL": "Alamat SearXNG",
+    "Web Research Guardrails Note": "Halaman dibaca oleh kontainer peramban headless Lightpanda, sehingga artikel yang hanya dirender JavaScript tetap menghasilkan teks. Sumber dideduplikasi per situs dan halaman tanpa teks asli dibuang."
   }
 }

@@ -673,7 +673,7 @@ class TestVideoService(unittest.TestCase):
         """
         config.app["video_codec"] = "h264_nvenc"
 
-        def fake_run(command, capture_output, text, check):
+        def fake_run(command, capture_output, text, check, **kwargs):
             codec_index = command.index("-c:v") + 1
             codec = command[codec_index]
             if codec == "h264_nvenc":
@@ -713,7 +713,7 @@ class TestVideoService(unittest.TestCase):
         """
         config.app["video_codec"] = "h264_nvenc"
 
-        def fake_run(command, capture_output, text, check):
+        def fake_run(command, capture_output, text, check, **kwargs):
             codec_index = command.index("-c:v") + 1
             codec = command[codec_index]
             return types.SimpleNamespace(
@@ -1066,7 +1066,7 @@ class TestVideoService(unittest.TestCase):
         """The final concat is trimmed to the audio duration, so the safety
         margin cannot leave an audible silent tail."""
 
-        def fake_run(command, capture_output, text, check):
+        def fake_run(command, capture_output, text, check, **kwargs):
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with tempfile.TemporaryDirectory() as temp_dir:

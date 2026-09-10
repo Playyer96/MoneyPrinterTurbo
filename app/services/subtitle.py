@@ -13,6 +13,7 @@ except ImportError:
 from loguru import logger
 
 from app.config import config
+from app.services import guardrails
 from app.utils import utils
 
 model_size = config.whisper.get("model_size", "large-v3")
@@ -203,6 +204,10 @@ def _write_subtitle(segments, info, audio_file, subtitle_file, word_level):
 
     diff = end - start
     logger.info(f"complete, elapsed: {diff:.2f} s")
+
+    # Timing comes from the transcriber, which happily emits 0.2s flashes and
+    # overlapping segments. Fix them here, once, for every backend.
+    subtitles = guardrails.enforce_subtitle_cues(subtitles, word_level=word_level)
 
     idx = 1
     lines = []

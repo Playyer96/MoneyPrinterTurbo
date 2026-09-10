@@ -6,8 +6,9 @@ import pydantic
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import config
+from app.models import const
 
-# 忽略 Pydantic 的特定警告
+# Silence one specific Pydantic warning.
 warnings.filterwarnings(
     "ignore",
     category=UserWarning,
@@ -61,11 +62,14 @@ _SUBTITLE_ANIMATIONS = ("none", "pop_spring")
 
 def _get_valid_ui_choice(key: str, allowed_values: tuple[str, ...], default: str) -> str:
     """
-    读取经过校验的 WebUI 枚举配置，兼容旧用户可能残留的无效值。
+    Read a validated WebUI enum setting, tolerating invalid values left by
+    older installs.
 
-    请求体由 Pydantic 的 Literal 严格校验，拼写错误会返回明确的字段校验错误；
-    配置文件则需要宽容处理，避免用户升级后因为历史手工配置错误导致整个服务
-    无法启动。HTTP 状态码由应用统一的校验异常处理器决定，这里不绑定具体数值。
+    Request bodies are validated strictly by Pydantic's Literal, so a typo
+    returns a clear field validation error. Config files need the forgiving
+    path instead: a hand-edited legacy value must not stop the whole service
+    from starting after an upgrade. The HTTP status code is decided by the
+    application's shared validation exception handler, not pinned here.
     """
     configured_value = config.ui.get(key, default)
     return configured_value if configured_value in allowed_values else default
@@ -82,9 +86,11 @@ class MaterialInfo:
     provider: str = "pexels"
     url: str = ""
     duration: int = 0
-    # 在线素材搜索会附带经过筛选的公开来源信息，供搜索缓存和任务记录复用。
-    # 本地上传素材不需要填写；写入任务文件前仍会按字段白名单重新构造，
-    # 避免外部请求传入的签名 URL、凭据或无关字段进入持久化数据。
+    # Online material searches carry filtered public source info, reused by the
+    # search cache and the task record. Locally uploaded materials leave it
+    # empty; the value is rebuilt from a field allowlist before it is written to
+    # the task file, so signed URLs, credentials, or unrelated fields sent by an
+    # external request never reach persisted data.
     source_info: Optional[dict[str, Any]] = None
 
 
@@ -92,10 +98,10 @@ class VideoParams(BaseModel):
     """
     {
       "video_subject": "",
-      "video_aspect": "横屏 16:9（西瓜视频）",
-      "voice_name": "女生-晓晓",
+      "video_aspect": "landscape 16:9 (Xigua Video)",
+      "voice_name": "female - Xiaoxiao",
       "bgm_name": "random",
-      "font_name": "STHeitiMedium 黑体-中",
+      "font_name": "STHeitiMedium (Heiti SC Medium)",
       "text_color": "#FFFFFF",
       "font_size": 60,
       "stroke_color": "#000000",
@@ -131,8 +137,9 @@ class VideoParams(BaseModel):
     bgm_type: Optional[str] = "random"
     bgm_file: Optional[str] = ""
     bgm_volume: Optional[float] = 0.2
-    # 视频配乐供应商共用提示词，WebUI 新任务统一写入该字段。保留下面的
-    # Sonilo 专用字段以兼容旧任务记录和现有 CLI 参数。
+    # Shared music prompt across video music providers; new WebUI tasks always
+    # write this field. The Sonilo-specific field below stays for compatibility
+    # with old task records and the existing CLI argument.
     video_music_prompt: str = Field(default="", max_length=2000)
     sonilo_bgm_prompt: str = Field(default="", max_length=2000)
 
@@ -159,6 +166,18 @@ class VideoParams(BaseModel):
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
     custom_system_prompt: str = Field(default="", max_length=8000)
+
+    # Series mode: turn one subject into an ordered set of chapter videos.
+    # ``series_parts`` is the single count input: 0 lets the model decide how
+    # many chapters the subject actually needs, any other value pins it.
+    series_enabled: bool = False
+    series_parts: int = Field(default=0, ge=0, le=const.MAX_SERIES_PARTS)
+    # Pre-approved chapter subjects. Empty means the outline is generated when
+    # the task runs, so the WebUI can stay optional.
+    series_outline: List[str] = Field(default_factory=list)
+    # Tell each part which chapters come before and after it, so the series
+    # reads as one arc instead of unrelated videos on the same subject.
+    series_continuity: bool = True
 
 
 class SubtitleRequest(BaseModel):
@@ -287,7 +306,7 @@ class TaskResponseData(BaseModel):
 
 
 class TaskStatusData(BaseModel):
-    """任务查询对外保证的稳定字段；历史和扩展字段继续原样透传。"""
+    """Stable fields guaranteed by the task query; legacy and extra fields pass through unchanged."""
 
     model_config = ConfigDict(extra="allow")
 
@@ -306,7 +325,7 @@ class TaskStatusData(BaseModel):
 
 
 class TaskListData(BaseModel):
-    """分页任务列表结构。"""
+    """Paginated task list payload."""
 
     tasks: List[TaskStatusData]
     total: int
@@ -369,10 +388,12 @@ class TaskResponse(BaseResponse):
 
 class TaskQueryResponse(BaseResponse):
     """
-    任务查询会返回生成状态和可选的跨平台发布状态。
+    The task query returns the generation state plus an optional
+    cross-platform publishing state.
 
-    生成失败时包含 `failed_stage` 和 `error`；生成完成后如果启用了自动发布，
-    `cross_post_state` 会依次进入 pending、processing、complete 或 failed。
+    A failed generation includes `failed_stage` and `error`. When auto publish
+    is enabled, `cross_post_state` moves through pending, processing, and then
+    complete or failed once generation finishes.
     """
 
     data: TaskStatusData
@@ -409,7 +430,7 @@ class TaskQueryResponse(BaseResponse):
 
 
 class TaskListResponse(BaseResponse):
-    """任务列表使用独立响应模型，避免与单任务查询混用文档结构。"""
+    """The task list has its own response model, so its schema stays separate from the single-task query."""
 
     data: TaskListData
 

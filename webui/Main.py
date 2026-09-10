@@ -686,6 +686,13 @@ def _initialize_session_state():
         "match_materials_to_script": bool(
             config.app.get("match_materials_to_script", False)
         ),
+        "series_enabled": _saved_ui_bool("series_enabled", False),
+        "series_parts_input": _saved_ui_number(
+            "series_parts", 0, 0, const.MAX_SERIES_PARTS, int
+        ),
+        "series_continuity": _saved_ui_bool("series_continuity", True),
+        # The outline belongs to one task, so it is not persisted as config.
+        "series_outline": "",
         "custom_bgm_file_input": _saved_ui_text("custom_bgm_file"),
         "sonilo_bgm_prompt_input": _saved_ui_text(
             "sonilo_bgm_prompt",
@@ -828,6 +835,13 @@ def _find_final_task_video(task_path: str) -> str:
             candidates.append((int(match.group("index")), file_name))
 
     if not candidates:
+        # A series keeps its videos in part-NN subdirectories, so the parent
+        # task directory holds no final-*.mp4 of its own. Return the first
+        # part, so the history list still gets a thumbnail and a play entry.
+        for part_name in sorted(name for name in files if name.startswith("part-")):
+            part_video = _find_final_task_video(os.path.join(task_path, part_name))
+            if part_video:
+                return part_video
         return ""
 
     _, file_name = min(candidates, key=lambda item: item[0])
@@ -1031,6 +1045,13 @@ def _collect_task_summaries(limit=20):
     for task in runtime_tasks:
         task_id = task.get("task_id", "")
         if not task_id:
+            continue
+
+        if "/" in task_id:
+            # Series parts run under "<parent task>/part-NN" ids and their
+            # results are already collected into the parent task. Listing only
+            # the parent keeps one run from filling the panel with dozens of
+            # entries.
             continue
 
         task_path = os.path.join(utils.task_dir(), task_id)
@@ -1497,6 +1518,12 @@ def _apply_restored_params(params):
         "script_language_select", params.get("video_language") or ""
     )
     st.session_state["paragraph_number_input"] = params.get("paragraph_number", 1)
+    st.session_state["series_enabled"] = bool(params.get("series_enabled", False))
+    st.session_state["series_parts_input"] = max(
+        0, min(const.MAX_SERIES_PARTS, int(params.get("series_parts") or 0))
+    )
+    st.session_state["series_continuity"] = bool(params.get("series_continuity", True))
+    st.session_state["series_outline"] = "\n".join(params.get("series_outline") or [])
     st.session_state["video_script_prompt"] = params.get("video_script_prompt") or ""
     st.session_state["custom_system_prompt"] = (
         params.get("custom_system_prompt") or llm.DEFAULT_SCRIPT_SYSTEM_PROMPT
@@ -1991,6 +2018,15 @@ def _render_generation_task_snapshot(task_id, task):
                 )
             )
         elif (
+            isinstance(warning, Mapping) and warning.get("code") == "series_part_failed"
+        ):
+            st.warning(
+                tr("Series Part Failed Warning").format(
+                    part=warning.get("part", ""),
+                    subject=warning.get("subject", ""),
+                )
+            )
+        elif (
             isinstance(warning, Mapping)
             and warning.get("code") == "elevenlabs_bgm_failed"
         ):
@@ -2003,36 +2039,43 @@ def _render_generation_task_snapshot(task_id, task):
             st.warning(str(warning))
 
     try:
-        player_cols = st.columns(len(video_files) * 2 + 1)
-        for i, url in enumerate(video_files):
-            with player_cols[i * 2 + 1]:
-                st.video(url)
-                if not os.path.isfile(url):
-                    logger.warning(
-                        f"generated video is unavailable for download: "
-                        f"task_id={task_id}, video_file={url}"
-                    )
-                    continue
+        # A series returns dozens of videos. Wrapping at a fixed number per
+        # row keeps the original centred proportions for a single video and
+        # stops the columns from shrinking into unplayable slivers.
+        videos_per_row = 3
+        for row_start in range(0, len(video_files), videos_per_row):
+            row_videos = video_files[row_start : row_start + videos_per_row]
+            player_cols = st.columns(len(row_videos) * 2 + 1)
+            for offset, url in enumerate(row_videos):
+                i = row_start + offset
+                with player_cols[offset * 2 + 1]:
+                    st.video(url)
+                    if not os.path.isfile(url):
+                        logger.warning(
+                            f"generated video is unavailable for download: "
+                            f"task_id={task_id}, video_file={url}"
+                        )
+                        continue
 
-                download_label = tr("Download Video")
-                if len(video_files) > 1:
-                    download_label = f"{download_label} {i + 1}"
-                download_name = _build_video_download_name(
-                    task.get("video_subject"),
-                    i + 1,
-                    len(video_files),
-                )
-                with open(url, "rb") as video_file:
-                    st.download_button(
-                        download_label,
-                        data=video_file,
-                        file_name=download_name,
-                        mime=mimetypes.guess_type(url)[0] or "video/mp4",
-                        key=f"download_generated_video_{task_id}_{i}",
-                        icon=":material/download:",
-                        on_click="ignore",
-                        use_container_width=True,
+                    download_label = tr("Download Video")
+                    if len(video_files) > 1:
+                        download_label = f"{download_label} {i + 1}"
+                    download_name = _build_video_download_name(
+                        task.get("video_subject"),
+                        i + 1,
+                        len(video_files),
                     )
+                    with open(url, "rb") as video_file:
+                        st.download_button(
+                            download_label,
+                            data=video_file,
+                            file_name=download_name,
+                            mime=mimetypes.guess_type(url)[0] or "video/mp4",
+                            key=f"download_generated_video_{task_id}_{i}",
+                            icon=":material/download:",
+                            on_click="ignore",
+                            use_container_width=True,
+                        )
     except Exception as exc:
         logger.exception(
             f"failed to render generated video preview: task_id={task_id}, "
@@ -4858,6 +4901,94 @@ def _render_script_settings(panel, params):
             params.video_language = selected_language_code
             _set_runtime_config("ui", "video_language", params.video_language)
 
+            with st.container(key="series_settings"):
+                params.series_enabled = st.toggle(
+                    tr("Series Mode"),
+                    help=tr("Series Mode Help"),
+                    key="series_enabled",
+                )
+                _set_runtime_config("ui", "series_enabled", params.series_enabled)
+                if params.series_enabled:
+                    params.series_parts = int(
+                        st.number_input(
+                            tr("Series Parts"),
+                            min_value=0,
+                            max_value=const.MAX_SERIES_PARTS,
+                            step=1,
+                            help=tr("Series Parts Help"),
+                            key="series_parts_input",
+                        )
+                    )
+                    _set_runtime_config("ui", "series_parts", params.series_parts)
+                    st.caption(
+                        tr("Series Parts Auto Caption")
+                        if params.series_parts == 0
+                        else tr("Series Parts Fixed Caption").format(
+                            parts=params.series_parts
+                        )
+                    )
+                    params.series_continuity = st.toggle(
+                        tr("Series Continuity"),
+                        help=tr("Series Continuity Help"),
+                        key="series_continuity",
+                    )
+                    _set_runtime_config(
+                        "ui", "series_continuity", params.series_continuity
+                    )
+
+                    # The planning button must come before the text area:
+                    # Streamlit only accepts session_state writes for a widget
+                    # before that widget renders.
+                    if st.button(
+                        tr("Plan Series Chapters"),
+                        key="plan_series_chapters",
+                        use_container_width=True,
+                        type="secondary",
+                        icon=":material/format_list_numbered:",
+                    ):
+                        if not params.video_subject:
+                            st.toast(tr("Please Enter the Video Subject First"))
+                            st.warning(tr("Please Enter the Video Subject First"))
+                        else:
+                            with st.spinner(tr("Planning Series Chapters")):
+                                chapters = _run_llm_read_operation(
+                                    "generate_series_outline",
+                                    lambda app_config_snapshot: (
+                                        llm.generate_series_outline(
+                                            video_subject=params.video_subject,
+                                            parts=params.series_parts,
+                                            language=params.video_language,
+                                            video_script_prompt=st.session_state.get(
+                                                "video_script_prompt", ""
+                                            ),
+                                            app_config=app_config_snapshot,
+                                        )
+                                    ),
+                                )
+                            if chapters:
+                                st.session_state["series_outline"] = "\n".join(chapters)
+                            else:
+                                st.error(tr("Series Planning Failed"))
+
+                    series_outline_text = st.text_area(
+                        tr("Series Outline"),
+                        help=tr("Series Outline Help"),
+                        height=160,
+                        placeholder=tr("Series Outline Placeholder"),
+                        key="series_outline",
+                    )
+                    params.series_outline = [
+                        line.strip()
+                        for line in series_outline_text.splitlines()
+                        if line.strip()
+                    ][: const.MAX_SERIES_PARTS]
+                    if params.series_outline:
+                        st.caption(
+                            tr("Series Outline Count").format(
+                                count=len(params.series_outline)
+                            )
+                        )
+
             # 使用带 key 的局部容器限定折叠入口样式，保持 expander 的原生交互，
             # 同时避免样式误伤页面顶部的“基础设置”等其他折叠区域。
             with st.container(key="advanced_settings_script"):
@@ -4885,6 +5016,52 @@ def _render_script_settings(panel, params):
                     _set_runtime_config(
                         "app", "script_generation_backend", script_generation_backend
                     )
+
+                    # 联网检索在服务端完成，因此本地模型和不支持工具调用的
+                    # Provider 也能拿到最新事实。
+                    web_research_enabled = config.app.get("enable_web_research", False)
+                    use_web_research = st.checkbox(
+                        tr("Research Subject on the Web"),
+                        value=web_research_enabled,
+                        key="enable_web_research_checkbox",
+                        help=tr("Research Subject on the Web Help"),
+                    )
+                    if use_web_research != web_research_enabled:
+                        _set_runtime_config(
+                            "app", "enable_web_research", use_web_research
+                        )
+                    if use_web_research:
+                        search_provider = stable_selectbox(
+                            tr("Web Search Provider"),
+                            options=["searxng", "duckduckgo"],
+                            default_value=str(
+                                config.app.get("web_search_provider", "duckduckgo")
+                            ),
+                            key="web_search_provider_select",
+                            help=tr("Web Search Provider Help"),
+                        )
+                        _set_runtime_config(
+                            "app", "web_search_provider", search_provider
+                        )
+                        if search_provider == "searxng" and not os.getenv(
+                            "SEARXNG_URL", ""
+                        ):
+                            # Inside Docker the compose file already points at
+                            # the searxng container, so only a host run needs
+                            # to be told where the engine lives.
+                            _set_runtime_config(
+                                "app",
+                                "web_search_base_url",
+                                st.text_input(
+                                    tr("SearXNG Base URL"),
+                                    value=str(
+                                        config.app.get("web_search_base_url", "")
+                                    ),
+                                    placeholder="http://127.0.0.1:8080",
+                                    key="web_search_base_url_input",
+                                ).strip(),
+                            )
+                        st.caption(tr("Web Research Guardrails Note"))
 
                     params.paragraph_number = st.slider(
                         tr("Script Paragraph Number"),

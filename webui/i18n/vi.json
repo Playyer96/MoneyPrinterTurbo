@@ -1,6 +1,22 @@
 {
   "Language": "Tiếng Việt",
   "Translation": {
+    "Series Mode": "Chia thành loạt video",
+    "Series Mode Help": "Tạo một video cho mỗi chương thay vì chỉ một video. Mỗi phần có kịch bản, lời đọc, tư liệu và tệp riêng.",
+    "Series Parts": "Số phần",
+    "Series Parts Help": "Số video sẽ tạo. Để 0 thì mô hình tự quyết định chủ đề thực sự cần bao nhiêu phần.",
+    "Series Parts Auto Caption": "Tự động: mô hình quyết định chủ đề cần bao nhiêu phần.",
+    "Series Parts Fixed Caption": "Cố định: {parts} phần.",
+    "Series Continuity": "Giữ thứ tự các phần",
+    "Series Continuity Help": "Cho mỗi phần biết chương nào ở trước và sau nó, để cả loạt là một mạch liền thay vì những video rời rạc.",
+    "Plan Series Chapters": "Lập dàn ý chương",
+    "Planning Series Chapters": "Đang lập dàn ý chương",
+    "Series Planning Failed": "Không lập được dàn ý cho loạt video. Hãy kiểm tra cấu hình LLM rồi thử lại.",
+    "Series Outline": "Các chương",
+    "Series Outline Help": "Mỗi dòng một chương, theo thứ tự. Để trống để tự lập dàn ý khi tác vụ bắt đầu.",
+    "Series Outline Placeholder": "Mỗi dòng một chương",
+    "Series Outline Count": "Sẽ tạo {count} chương.",
+    "Series Part Failed Warning": "Phần {part} thất bại và đã bị bỏ qua: {subject}",
     "Kokoro Base URL": "URL cơ sở Kokoro",
     "Kokoro API Key": "Khóa API Kokoro (không bắt buộc; [Hướng dẫn cấu hình](https://github.com/remsky/Kokoro-FastAPI))",
     "Kokoro Model": "Mô hình Kokoro",
@@ -417,6 +433,12 @@
     "OFox Upstream Vendor Help": "Nhà cung cấp thượng nguồn phục vụ việc tạo video OFox. BytePlus (quốc tế) là mặc định với chính sách nội dung nhất quán; Volcano Engine là nhà cung cấp Trung Quốc đại lục; Tự động để gateway OFox cân bằng tải giữa các nhà cung cấp.",
     "OFox Vendor BytePlus": "BytePlus (quốc tế, mặc định)",
     "OFox Vendor Volcengine": "Volcano Engine (Trung Quốc đại lục)",
-    "OFox Vendor Auto": "Tự động (gateway cân bằng tải)"
+    "OFox Vendor Auto": "Tự động (gateway cân bằng tải)",
+    "Research Subject on the Web": "Nghiên cứu chủ đề trên web",
+    "Research Subject on the Web Help": "Tìm hiểu chủ đề video trên web (và Wikipedia) trước khi viết kịch bản, rồi đưa kết quả cho mô hình làm dữ kiện tham khảo. Hoạt động với mọi nhà cung cấp, kể cả mô hình cục bộ không gọi được công cụ. Mỗi kịch bản tốn thêm vài giây và một ít token.",
+    "Web Search Provider": "Dịch vụ tìm kiếm",
+    "Web Search Provider Help": "Cả hai đều miễn phí và không cần khóa. searxng là container tìm kiếm tổng hợp trong docker-compose.yml — không bị giới hạn tần suất và được dùng tự động khi chạy Docker. duckduckgo đọc điểm cuối HTML công khai và là phương án dự phòng tự động.",
+    "SearXNG Base URL": "Địa chỉ SearXNG",
+    "Web Research Guardrails Note": "Trang web được đọc bằng container trình duyệt headless Lightpanda, nên cả bài viết chỉ dựng bằng JavaScript vẫn lấy được nội dung. Nguồn được lọc trùng theo trang web và những trang không có nội dung thật sẽ bị loại."
   }
 }

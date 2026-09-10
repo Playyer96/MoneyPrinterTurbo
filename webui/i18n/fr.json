@@ -1,6 +1,22 @@
 {
   "Language": "Français",
   "Translation": {
+    "Series Mode": "Diviser en série de vidéos",
+    "Series Mode Help": "Génère une vidéo par chapitre au lieu d'une seule. Chaque partie a son propre script, sa narration, ses médias et son fichier.",
+    "Series Parts": "Nombre de parties",
+    "Series Parts Help": "Combien de vidéos générer. À 0, le modèle décide du nombre de parties dont le sujet a réellement besoin.",
+    "Series Parts Auto Caption": "Automatique : le modèle décide du nombre de parties nécessaires au sujet.",
+    "Series Parts Fixed Caption": "Fixe : {parts} parties.",
+    "Series Continuity": "Conserver l'ordre des parties",
+    "Series Continuity Help": "Indique à chaque partie les chapitres qui la précèdent et la suivent, pour que la série forme un fil conducteur au lieu de vidéos sans lien.",
+    "Plan Series Chapters": "Planifier les chapitres",
+    "Planning Series Chapters": "Planification des chapitres",
+    "Series Planning Failed": "Échec de la planification de la série. Vérifiez les paramètres du LLM et réessayez.",
+    "Series Outline": "Chapitres",
+    "Series Outline Help": "Un chapitre par ligne, dans l'ordre. Laissez vide pour planifier les chapitres au lancement de la tâche.",
+    "Series Outline Placeholder": "Un chapitre par ligne",
+    "Series Outline Count": "{count} chapitres seront générés.",
+    "Series Part Failed Warning": "La partie {part} a échoué et a été ignorée : {subject}",
     "Kokoro Base URL": "URL de base de Kokoro",
     "Kokoro API Key": "Clé API Kokoro (facultative ; [Configuration](https://github.com/remsky/Kokoro-FastAPI))",
     "Kokoro Model": "Modèle Kokoro",
@@ -417,6 +433,12 @@
     "OFox Upstream Vendor Help": "Fournisseur amont utilisé pour la génération vidéo OFox. BytePlus (international) est la valeur par défaut, avec une politique de contenu cohérente ; Volcano Engine est le fournisseur de Chine continentale ; Auto laisse la passerelle OFox répartir la charge entre les fournisseurs.",
     "OFox Vendor BytePlus": "BytePlus (international, défaut)",
     "OFox Vendor Volcengine": "Volcano Engine (Chine continentale)",
-    "OFox Vendor Auto": "Auto (répartition par la passerelle)"
+    "OFox Vendor Auto": "Auto (répartition par la passerelle)",
+    "Research Subject on the Web": "Rechercher le sujet sur le web",
+    "Research Subject on the Web Help": "Recherche le sujet de la vidéo sur le web (et sur Wikipédia) avant d'écrire le script, puis transmet les résultats au modèle comme faits de référence. Fonctionne avec tous les fournisseurs, y compris les modèles locaux sans appel d'outils. Ajoute quelques secondes et des jetons supplémentaires par script.",
+    "Web Search Provider": "Moteur de recherche",
+    "Web Search Provider Help": "Les deux sont gratuits et sans clé. searxng est le conteneur de métarecherche de docker-compose.yml : aucune limitation de débit, activé automatiquement sous Docker. duckduckgo interroge le point d'accès HTML public et sert de repli automatique.",
+    "SearXNG Base URL": "URL de SearXNG",
+    "Web Research Guardrails Note": "Les pages sont lues par le conteneur du navigateur headless Lightpanda, si bien que les articles rendus uniquement en JavaScript produisent tout de même du texte. Les sources sont dédupliquées par site et les pages sans véritable texte sont écartées."
   }
 }

@@ -100,7 +100,45 @@ Before you finish:
 - Don't refactor unrelated code in the same edit — keep the diff to the
   smallest working change.
 
-## 3. Always use project skills
+## 3. Everything runs in Docker, and everything uses the GPU
+
+Two standing rules for anything added to this repo — a dependency, a model
+server, a headless browser, a queue, a worker:
+
+1. **Dockerize it.** It gets a service in `docker-compose.yml` (plus whichever
+   override files it needs) and is reached by service name over the `mpt-net`
+   bridge. `docker compose up -d --build` stays the whole setup procedure.
+   Never ship an instruction that tells a human to install a binary, a
+   runtime, or a model on the host first, and never leave a native-install
+   path as the documented happy path.
+2. **Use the GPU.** Anything that can run on an accelerator must, and must
+   pick it at runtime rather than at build time: CUDA on NVIDIA, ROCm on AMD,
+   Metal/MPS on Apple Silicon, CPU only as the last fallback. The same image
+   has to work on all of them without the user configuring anything.
+
+### "It doesn't look possible" is not an answer
+
+When the two rules appear to conflict, find the arrangement that keeps both
+from the user's point of view instead of dropping one. The precedent is in
+this repo already: macOS does not pass Metal through to Docker's Linux VM, so
+no container on a Mac can touch the GPU. `docker-compose.mac.yml` therefore
+runs the model server on the host, auto-started by a LaunchAgent, and points
+the containers at it — the user still types one `docker compose` command, and
+the GPU is still used.
+
+So, in order:
+
+1. Run it in a container with the accelerator passed through.
+2. If the platform forbids that, run it as a compose-managed host service
+   that the containers reach by URL, auto-started, with the compose command
+   unchanged.
+3. If neither works, ship the CPU fallback **and** write down in the compose
+   file exactly which platform limitation forced it and what would undo it.
+
+Never silently degrade to CPU, and never answer a "can this be dockerized"
+question with "no" until options 1-3 have actually been tried.
+
+## 4. Always use project skills
 
 When a relevant skill exists — anything under `.claude/skills/` in this
 repo, or any skill listed in your environment's available-skills list —
@@ -119,7 +157,7 @@ the audits those skills exist to support.
 - If you think a skill is missing for a workflow you keep repeating,
   propose adding one rather than improvising.
 
-## 4. Per-tool setup
+## 5. Per-tool setup
 
 ### Auto-reads `AGENTS.md` (no setup needed)
 

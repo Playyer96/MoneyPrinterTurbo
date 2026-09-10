@@ -1,6 +1,22 @@
 {
   "Language": "简体中文",
   "Translation": {
+    "Series Mode": "拆分为系列视频",
+    "Series Mode Help": "为每个章节生成一条视频，而不是只生成一条。每一集都有自己的文案、配音、素材和成片。",
+    "Series Parts": "分集数量",
+    "Series Parts Help": "要生成多少条视频。填 0 表示由模型根据主题自动决定分集数量。",
+    "Series Parts Auto Caption": "自动：由模型根据主题决定分集数量。",
+    "Series Parts Fixed Caption": "固定：{parts} 集。",
+    "Series Continuity": "保持分集连贯",
+    "Series Continuity Help": "告诉每一集它的上一集和下一集讲什么，让系列成为一条完整线索，而不是互不相关的视频。",
+    "Plan Series Chapters": "规划章节",
+    "Planning Series Chapters": "正在规划章节",
+    "Series Planning Failed": "章节规划失败，请检查大模型设置后重试。",
+    "Series Outline": "章节列表",
+    "Series Outline Help": "每行一个章节，按顺序排列。留空则在任务开始时自动规划。",
+    "Series Outline Placeholder": "每行一个章节",
+    "Series Outline Count": "将生成 {count} 集。",
+    "Series Part Failed Warning": "第 {part} 集生成失败，已跳过：{subject}",
     "Kokoro Voices Unavailable": "暂时无法获取 Kokoro 音色，已保留原有选择。请检查服务连接，或手动填写音色。",
     "Login Required": "需要登录",
     "Please login to access settings": "请登录后访问配置设置 (:gray[默认用户名: admin, 密码: admin, 您可以在 config.toml 中修改])",
@@ -91,7 +107,7 @@
     "Random": "随机拼接（推荐）",
     "Sequential": "顺序拼接",
     "Video Transition Mode": "视频转场模式",
-    "None": "无转场",
+    "None": "无动画",
     "Shuffle": "随机转场",
     "FadeIn": "渐入",
     "FadeOut": "渐出",
@@ -189,7 +205,6 @@
     "Single Word (Word by Word)": "逐词显示",
     "Word-by-word Timing Help": "逐词显示在 Azure TTS V1（Edge TTS）或 Whisper 下最准确；其他语音服务缺少逐词时间轴时，可能按短语或整句显示。",
     "Subtitle Animation": "字幕入场动画",
-    "None": "无动画",
     "Pop Up (Spring)": "弹跳出现",
     "Custom": "自定义位置（70，表示离顶部70%的位置）",
     "Custom Position (% from top)": "自定义位置（距顶部百分比）",
@@ -519,6 +534,12 @@
     "OFox Upstream Vendor Help": "OFox 视频生成使用的上游厂商。BytePlus（国际）为默认值，内容政策一致；火山引擎为大陆厂商；自动分发由 OFox 网关按权重在可用厂商间调度。",
     "OFox Vendor BytePlus": "BytePlus（国际，默认）",
     "OFox Vendor Volcengine": "火山引擎（中国大陆）",
-    "OFox Vendor Auto": "自动分发（网关调度）"
+    "OFox Vendor Auto": "自动分发（网关调度）",
+    "Research Subject on the Web": "联网检索视频主题",
+    "Research Subject on the Web Help": "生成脚本前先联网检索主题（含维基百科），并把检索结果作为参考资料交给模型。任何 Provider 都可使用，包括不支持工具调用的本地模型。每次生成会多花几秒并增加提示词 token。",
+    "Web Search Provider": "搜索服务商",
+    "Web Search Provider Help": "两者均免费且无需 Key。searxng 是 docker-compose.yml 中的聚合搜索容器，不受限流，Docker 部署下自动使用；duckduckgo 直接抓取公开 HTML 接口，并作为自动兜底。",
+    "SearXNG Base URL": "SearXNG 地址",
+    "Web Research Guardrails Note": "页面由 Lightpanda 无头浏览器容器读取，因此纯 JavaScript 渲染的文章同样能取到正文。检索结果按站点去重，没有正文的页面会被丢弃。"
   }
 }

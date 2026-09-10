@@ -1,6 +1,22 @@
 {
   "Language": "English",
   "Translation": {
+    "Series Mode": "Split Into a Video Series",
+    "Series Mode Help": "Generate one video per chapter instead of a single video. Each part gets its own script, narration, footage and file.",
+    "Series Parts": "Number of Parts",
+    "Series Parts Help": "How many videos to generate. 0 lets the model decide how many parts the subject actually needs.",
+    "Series Parts Auto Caption": "Automatic: the model decides how many parts the subject needs.",
+    "Series Parts Fixed Caption": "Fixed: {parts} parts.",
+    "Series Continuity": "Keep Parts in Order",
+    "Series Continuity Help": "Tell each part which chapters come before and after it, so the series reads as one arc instead of unrelated videos.",
+    "Plan Series Chapters": "Plan Chapters",
+    "Planning Series Chapters": "Planning chapters",
+    "Series Planning Failed": "Failed to plan the series. Check the LLM settings and try again.",
+    "Series Outline": "Chapters",
+    "Series Outline Help": "One chapter per line, in order. Leave it empty to plan the chapters when the task runs.",
+    "Series Outline Placeholder": "One chapter per line",
+    "Series Outline Count": "{count} chapters will be generated.",
+    "Series Part Failed Warning": "Part {part} failed and was skipped: {subject}",
     "Kokoro Voices Unavailable": "Could not load Kokoro voices. Your previous selection is retained. Check the connection or enter voices manually.",
     "Login Required": "Login Required",
     "Please login to access settings": "Please login to access settings",
@@ -189,7 +205,6 @@
     "Single Word (Word by Word)": "Word by word",
     "Word-by-word Timing Help": "Word-by-word timing is most accurate with Azure TTS V1 (Edge TTS) or Whisper. Other voice providers may fall back to phrase or sentence timing.",
     "Subtitle Animation": "Entrance animation",
-    "None": "None",
     "Pop Up (Spring)": "Spring pop",
     "Custom": "Custom",
     "Custom Position (% from top)": "Custom Position (% from top)",
@@ -519,6 +534,12 @@
     "OFox Upstream Vendor Help": "Which upstream vendor serves OFox video generation. BytePlus (international) is the default with a consistent content policy; Volcano Engine is the mainland-China vendor; Auto lets the OFox gateway load-balance across vendors.",
     "OFox Vendor BytePlus": "BytePlus (International, default)",
     "OFox Vendor Volcengine": "Volcano Engine (Mainland China)",
-    "OFox Vendor Auto": "Auto (gateway load balancing)"
+    "OFox Vendor Auto": "Auto (gateway load balancing)",
+    "Research Subject on the Web": "Research the Subject on the Web",
+    "Research Subject on the Web Help": "Search the web (and Wikipedia) for the video subject before writing the script, and hand the findings to the model as reference facts. Works with any provider, including local models without tool calling. Adds a few seconds and extra prompt tokens per script.",
+    "Web Search Provider": "Web Search Provider",
+    "Web Search Provider Help": "Both are free and keyless. searxng is the meta-search container from docker-compose.yml — not rate-limited, and it is used automatically inside Docker. duckduckgo scrapes the public HTML endpoint and is the automatic fallback.",
+    "SearXNG Base URL": "SearXNG Base URL",
+    "Web Research Guardrails Note": "Pages are read by the Lightpanda headless browser container, so JavaScript-only articles still produce text. Sources are de-duplicated by site and pages without real prose are dropped."
   }
 }

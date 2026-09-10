@@ -26,6 +26,11 @@ Working on the MoneyPrinterTurbo Python repo. Apply this rule on every edit:
 4. Always invoke a matching skill via the Skill tool (anything in
    `.claude/skills/` or your environment's available-skills list) instead
    of re-implementing the same workflow inline.
+5. Dockerize everything you add (a service in `docker-compose.yml`, reached
+   by service name) and make it use the GPU, chosen at runtime: CUDA / ROCm /
+   Metal, CPU only as a last resort. If a platform blocks that, run it as a
+   compose-managed host service instead of dropping the requirement — never
+   answer "not possible" without trying that.
 
 Style: short, declarative, lowercase. Preserve backticks, format
 specifiers, and code references. If a term is ambiguous, gloss it in

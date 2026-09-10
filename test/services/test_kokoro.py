@@ -7,7 +7,7 @@ import pytest
 import requests
 
 from app.config import config
-from app.services import voice
+from app.services import guardrails, voice
 
 
 @pytest.fixture
@@ -73,7 +73,12 @@ def test_unspeakable_text_does_not_make_requests(monkeypatch, kokoro_config, tmp
 
 
 @pytest.mark.parametrize("provider", ["kokoro", "chatterbox"])
-@pytest.mark.parametrize("rate, expected", [(0.1, 0.25), (1.2, 1.2), (5, 4.0)])
+# tts() clamps speed to the intelligible range before the provider sees it, so
+# the provider's own wider API limits (0.25-4.0) are never reached from here.
+@pytest.mark.parametrize(
+    "rate, expected",
+    [(0.1, guardrails.MIN_VOICE_RATE), (1.2, 1.2), (5, guardrails.MAX_VOICE_RATE)],
+)
 def test_transport_closes_audio_and_preserves_contract(monkeypatch, tmp_path, provider, rate, expected):
     monkeypatch.setattr(config, provider, {
         "base_url": "http://localhost:8880/v1/", "api_key": "key", "model_id": provider,

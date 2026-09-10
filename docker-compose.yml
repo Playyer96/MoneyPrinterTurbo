@@ -1,9 +1,10 @@
 x-common-volumes: &common-volumes
   - ./:/MoneyPrinterTurbo
 
-# Everything runs in Docker. Three services on a private bridge network:
-# webui and api reach voicestudio by service name, so this works identically
-# on Linux, macOS and Windows.
+# Everything runs in Docker. Five services on a private bridge network:
+# webui and api reach voicestudio (TTS), lightpanda (headless browser) and
+# searxng (meta search) by service name, so this works identically on
+# Linux, macOS and Windows.
 #
 #   docker compose up -d --build      start (and rebuild if sources changed)
 #   docker compose restart            restart without rebuilding
@@ -19,6 +20,12 @@ x-common-volumes: &common-volumes
 #   AMD:    docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d
 #
 #   Apple: docker compose -f docker-compose.yml -f docker-compose.mac.yml up -d
+#
+# Windows is the plain case: Docker Desktop on the WSL2 backend, and the same
+# commands above verbatim in PowerShell or cmd. `make up` is a convenience for
+# Unix shells only -- on Windows use `docker compose` directly, adding the
+# NVIDIA line above for a CUDA GPU. Keep the clone on the WSL2 filesystem or
+# on a drive shared with Docker Desktop; the bind mount below is the repo.
 #
 # Apple Silicon is the odd one out. macOS does not pass Metal through to
 # Docker's Linux VM, so no container on a Mac can reach the GPU -- the mac
@@ -37,10 +44,16 @@ volumes:
   voicestudio_profiles:
   voicestudio_output:
 
-x-voicestudio-env: &voicestudio-env
+x-service-env: &service-env
   # Service name on the bridge network by default. docker-compose.mac.yml
   # repoints this at the host, where the GPU actually is on Apple Silicon.
   VOICESTUDIO_BASE_URL: "${VOICESTUDIO_BASE_URL:-http://voicestudio:8780}"
+  # Topic research talks to two more containers on the same bridge: a headless
+  # browser that renders article pages, and a meta search engine that is not
+  # rate-limited the way scraping DuckDuckGo directly is.
+  LIGHTPANDA_URL: "${LIGHTPANDA_URL:-ws://lightpanda:9222}"
+  WEB_SEARCH_PROVIDER: "${WEB_SEARCH_PROVIDER:-searxng}"
+  SEARXNG_URL: "${SEARXNG_URL:-http://searxng:8080}"
 
 services:
   voicestudio:
@@ -81,13 +94,58 @@ services:
         limits:
           memory: 8G
 
+  lightpanda:
+    # Headless browser for topic research. ~10MB, no Chrome and no Node: it
+    # renders the page and returns the DOM over CDP, so JavaScript-only news
+    # and trend pages produce real text instead of an empty shell.
+    #
+    # --obey-robots is deliberate. Research reads other people's sites; a
+    # renderer that ignores robots.txt is how a project gets its IP banned.
+    image: lightpanda/browser:nightly
+    container_name: "moneyprinterturbo-lightpanda"
+    command:
+      - "/bin/lightpanda"
+      - "serve"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "9222"
+      - "--obey-robots"
+      - "--log-level"
+      - "info"
+    networks:
+      - mpt-net
+    restart: unless-stopped
+    # A browser renders one page at a time here and holds no models.
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  searxng:
+    # Meta search over DuckDuckGo, Brave, Wikipedia and friends. Running our
+    # own means research queries are not rate-limited by any single engine and
+    # no API key or paid search vendor is involved.
+    image: searxng/searxng:latest
+    container_name: "moneyprinterturbo-searxng"
+    networks:
+      - mpt-net
+    environment:
+      SEARXNG_BASE_URL: "http://searxng:8080/"
+      SEARXNG_SECRET: "${SEARXNG_SECRET:-moneyprinterturbo-local-only}"
+    volumes:
+      # Not read-only: SearXNG's entrypoint fixes permissions on this
+      # directory at startup and fails on a ro mount.
+      - ./docker/searxng:/etc/searxng
+    restart: unless-stopped
+
   webui:
     build:
       context: .
       dockerfile: Dockerfile
     image: moneyprinterturbo:latest
     container_name: "moneyprinterturbo-webui"
-    environment: *voicestudio-env
+    environment: *service-env
     networks:
       - mpt-net
     ports:
@@ -102,7 +160,7 @@ services:
       dockerfile: Dockerfile
     image: moneyprinterturbo:latest
     container_name: "moneyprinterturbo-api"
-    environment: *voicestudio-env
+    environment: *service-env
     networks:
       - mpt-net
     ports:

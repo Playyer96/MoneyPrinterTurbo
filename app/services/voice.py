@@ -30,6 +30,7 @@ from moviepy.audio.io.AudioFileClip import AudioFileClip
 from openai import OpenAI
 
 from app.config import config
+from app.services import guardrails
 from app.utils import utils
 
 _DEFAULT_EDGE_TTS_TIMEOUT_SECONDS = 30.0
@@ -1107,7 +1108,13 @@ def tts(
     voice_file: str,
     voice_volume: float = 1.0,
 ) -> Union[SubMaker, None]:
-    # 无停顿标签时，原样直通原始文本，避免无意义的正则处理或空白截断
+    # Every provider is reached through this function, so clamping here is
+    # what makes the speed and volume limits unavoidable rather than advisory.
+    voice_rate = guardrails.clamp_voice_rate(voice_rate)
+    voice_volume = guardrails.clamp_voice_volume(voice_volume)
+
+    # Without pause tags, pass the original text straight through: no point
+    # running the regex or risking whitespace truncation.
     if not utils.has_pause_tags(text):
         return _single_tts(
             text=text,
@@ -1117,7 +1124,8 @@ def tts(
             voice_volume=voice_volume,
         )
 
-    # 仅 Azure TTS v1 (Edge TTS) 且脚本包含停顿标签时进入分段合成
+    # Only Azure TTS v1 (Edge TTS) with pause tags in the script takes the
+    # segmented synthesis path.
     if is_azure_v1_voice(voice_name):
         return _tts_with_pauses(
             text=text,
@@ -1127,8 +1135,8 @@ def tts(
             voice_volume=voice_volume,
         )
 
-    # 其他声音提供商（如 Gemini、Fish Audio、SiliconFlow、Kokoro）包含停顿标签时，
-    # 清理停顿标签后以单次请求合成
+    # Other providers (Gemini, Fish Audio, SiliconFlow, Kokoro, ...) strip the
+    # pause tags and synthesize in a single request.
     clean_text = utils.remove_pause_tags(text)
     return _single_tts(
         text=clean_text,

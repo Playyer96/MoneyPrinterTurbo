@@ -36,6 +36,7 @@ from app.models.schema import (
     VideoParams,
     VideoTransitionMode,
 )
+from app.services import guardrails
 from app.services import bgm as bgm_service
 from app.services.utils import video_effects
 from app.utils import file_security, utils
@@ -810,6 +811,9 @@ def combine_videos(
     finally:
         close_clip(audio_clip)
     logger.info(f"audio duration: {audio_duration} seconds")
+    # Every render path lands here, so the shot-length floor holds regardless
+    # of what the WebUI, the API or a saved task file asked for.
+    max_clip_duration = guardrails.clamp_clip_duration(max_clip_duration)
     logger.info(f"maximum clip duration: {max_clip_duration} seconds")
     required_video_duration = _get_required_video_duration(audio_duration)
     logger.info(

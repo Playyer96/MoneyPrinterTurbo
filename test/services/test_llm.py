@@ -155,6 +155,43 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertIs(captured["app_config"], app_config)
         self.assertEqual(captured["app_config"]["openai_api_key"], "snapshot-key")
 
+    def test_generate_script_appends_web_research_when_enabled(self):
+        """Research runs server-side, so every provider gets the same facts."""
+        captured = {}
+
+        def fake_generate_response(prompt, app_config=None):
+            captured["prompt"] = prompt
+            return "Researched script."
+
+        app_config = {"enable_web_research": True}
+        with (
+            patch.object(llm, "_generate_response", side_effect=fake_generate_response),
+            patch.object(
+                llm.web_research_service, "research", return_value="Fact: sky is blue."
+            ) as fake_research,
+        ):
+            llm.generate_script(video_subject="the sky", app_config=app_config)
+
+        fake_research.assert_called_once()
+        self.assertIn("Fact: sky is blue.", captured["prompt"])
+        self.assertIn("untrusted reference material", captured["prompt"])
+
+    def test_generate_script_skips_web_research_by_default(self):
+        captured = {}
+
+        def fake_generate_response(prompt, app_config=None):
+            captured["prompt"] = prompt
+            return "Plain script."
+
+        with (
+            patch.object(llm, "_generate_response", side_effect=fake_generate_response),
+            patch.object(llm.web_research_service, "research") as fake_research,
+        ):
+            llm.generate_script(video_subject="the sky", app_config={})
+
+        fake_research.assert_not_called()
+        self.assertNotIn("# Web Research", captured["prompt"])
+
     def test_generate_script_strips_each_bracket_group_independently(self):
         """
         format_response must remove each [bracket] and (paren) group in
