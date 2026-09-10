@@ -6115,9 +6115,6 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
             accept_multiple_files=False,
             key="custom_bgm_uploader",
             help=tr("Upload Background Music Help"),
-            # Streamlit 默认会在控件上展示全局 200MB 上限。这里必须与服务层
-            # 30MB 硬限制保持一致，避免界面允许选择、提交时才被服务端拒绝。
-            max_upload_size=bgm_service.MAX_BGM_UPLOAD_BYTES // (1024 * 1024),
         )
         if uploaded_bgm_file is not None and bgm_enabled:
             try:

@@ -165,29 +165,29 @@ class TestMaterialUploadService(unittest.TestCase):
                     self.assertEqual(os.listdir(temp_dir), [])
                 self.assertEqual(source.tell(), 0)
 
-    def test_per_media_size_limits_are_enforced_and_temp_files_removed(self):
-        cases = (
-            ("clip.mp4", "MAX_VIDEO_MATERIAL_UPLOAD_BYTES"),
-            ("photo.png", "MAX_IMAGE_MATERIAL_UPLOAD_BYTES"),
-        )
-        for filename, limit_name in cases:
-            with self.subTest(filename=filename):
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    with (
-                        patch.object(
-                            material_upload,
-                            "uploaded_material_dir",
-                            return_value=temp_dir,
-                        ),
-                        patch.object(material_upload, limit_name, 4),
-                    ):
-                        with self.assertRaisesRegex(
-                            material_upload.MaterialUploadError, "exceeds"
-                        ):
-                            material_upload.save_material_upload(
-                                filename, io.BytesIO(b"12345")
-                            )
-                    self.assertEqual(os.listdir(temp_dir), [])
+    def test_validation_timeout_scales_with_file_size(self):
+        # a fixed timeout would reject large but valid footage now that uploads
+        # are uncapped, so the budget has to grow with the file.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            small = os.path.join(temp_dir, "small.mp4")
+            large = os.path.join(temp_dir, "large.mp4")
+            with open(small, "wb") as handle:
+                handle.write(b"0")
+            with open(large, "wb") as handle:
+                handle.write(b"0" * (5 * 1024 * 1024))
+
+            base = material_upload.MATERIAL_VALIDATION_BASE_TIMEOUT_SECONDS
+            self.assertAlmostEqual(
+                material_upload._validation_timeout_seconds(small), base, places=3
+            )
+            self.assertGreater(material_upload._validation_timeout_seconds(large), base)
+            # a missing file must not crash the caller before FFmpeg reports it.
+            self.assertEqual(
+                material_upload._validation_timeout_seconds(
+                    os.path.join(temp_dir, "gone.mp4")
+                ),
+                base,
+            )
 
     def test_validation_failure_and_storage_failure_remove_temp_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:

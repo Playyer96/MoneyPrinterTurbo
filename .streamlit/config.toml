@@ -1,0 +1,19 @@
+# Streamlit only reads $CWD/.streamlit/config.toml, and every launcher runs
+# `streamlit run ./webui/Main.py` from the repo root, so this file must stay here.
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+
+[logger]
+hideWelcomeMessage = true
+
+[server]
+# Streamlit defaults both of these to 200 MB, which is what surfaced as the
+# "Limit 200MB per file" cap on every uploader. Source footage is routinely
+# larger, and the services validate uploads by decoding them rather than by
+# size, so raise both to an effectively unlimited 10 GB.
+maxUploadSize = 10240
+maxMessageSize = 10240

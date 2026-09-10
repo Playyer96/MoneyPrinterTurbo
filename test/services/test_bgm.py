@@ -34,7 +34,7 @@ class _TextUpload(io.BytesIO):
 
 class TestBackgroundMusicService(unittest.TestCase):
     def test_should_use_bgm_is_provider_independent(self):
-        """通用开关必须覆盖当前来源和未来提供商，不能再写提供商特判。"""
+        """The shared switch must cover current and future providers; no per-provider special cases."""
         test_cases = [
             ("random", 0.2, True),
             ("custom", 0.2, True),
@@ -64,8 +64,9 @@ class TestBackgroundMusicService(unittest.TestCase):
         )
 
     def test_sanitize_upload_filename_accepts_common_audio_formats(self):
-        # WebUI 与 API 共用同一格式白名单；这里覆盖大小写和常见容器，避免未来
-        # 修改上传控件时只支持界面展示、服务层却拒绝文件。
+        # the WebUI and API share one format allowlist. cover case variants and
+        # common containers so a future uploader change cannot leave the UI
+        # accepting a file the service rejects.
         for extension in bgm.SUPPORTED_BGM_EXTENSIONS:
             filename = f"background{extension.upper()}"
             with self.subTest(filename=filename):
@@ -113,8 +114,9 @@ class TestBackgroundMusicService(unittest.TestCase):
                 [name for name in os.listdir(temp_dir) if name.startswith(".bgm-upload-")],
                 [],
             )
-            # 服务会把文件指针恢复到开头，同一个 UploadedFile 仍可供 Streamlit
-            # 试听或后续 rerun 使用，不会因为保存操作变成空文件。
+            # the service rewinds the file pointer, so the same UploadedFile
+            # still works for Streamlit preview and later reruns instead of
+            # reading empty after a save.
             self.assertEqual(source.tell(), 0)
 
     def test_validate_bgm_upload_checks_audio_without_persisting_file(self):
@@ -127,8 +129,9 @@ class TestBackgroundMusicService(unittest.TestCase):
                 validated_name = bgm.validate_bgm_upload("preview.m4a", source)
 
             self.assertEqual(validated_name, "preview.m4a")
-            # WebUI 预检只允许短暂使用临时文件，用户尚未点击生成时不能把文件
-            # 留在持久化 BGM 目录，也不能改变后续试听所需的文件指针。
+            # the WebUI preflight may only use a temp file briefly: before the
+            # user clicks generate nothing may stay in the persistent BGM
+            # directory, and the pointer preview needs must stay intact.
             self.assertEqual(os.listdir(temp_dir), [])
 
     def test_staging_rejects_empty_unseekable_and_non_binary_uploads(self):
@@ -163,20 +166,29 @@ class TestBackgroundMusicService(unittest.TestCase):
                 with self.assertRaises(bgm.BgmUploadError):
                     bgm.validate_bgm_upload("invalid.m4a", io.BytesIO(b"invalid"))
 
-            # 失败的预检同样不能在持久化目录留下临时音频，避免随后被随机 BGM
-            # 枚举逻辑选中，也避免长期运行时逐步堆积无效文件。
+            # a failed preflight must not leave staged audio in the persistent
+            # directory either, or random BGM enumeration could pick it up and
+            # invalid files would pile up over a long run.
             self.assertEqual(os.listdir(temp_dir), [])
 
-    def test_save_bgm_upload_rejects_oversized_file_and_cleans_temp_file(self):
+    def test_validation_timeout_scales_with_file_size(self):
+        # uploads are uncapped, so the decode budget has to grow with the track
+        # instead of a fixed 30s that would fail long but valid audio.
+        completed = SimpleNamespace(returncode=0)
         with tempfile.TemporaryDirectory() as temp_dir:
-            with (
-                patch.object(bgm, "uploaded_bgm_dir", return_value=temp_dir),
-                patch.object(bgm, "MAX_BGM_UPLOAD_BYTES", 4),
-            ):
-                with self.assertRaises(bgm.BgmUploadError):
-                    bgm.save_bgm_upload("large.mp3", io.BytesIO(b"12345"))
+            track = os.path.join(temp_dir, "long.wav")
+            with open(track, "wb") as handle:
+                handle.write(b"0" * (5 * 1024 * 1024))
 
-            self.assertEqual(os.listdir(temp_dir), [])
+            with patch.object(bgm.subprocess, "run", return_value=completed) as run:
+                bgm._validate_audio(track)
+            self.assertGreater(
+                run.call_args.kwargs["timeout"], bgm.VALIDATION_BASE_TIMEOUT_SECONDS
+            )
+
+            with patch.object(bgm.subprocess, "run", return_value=completed) as run:
+                bgm._validate_audio(track, timeout_seconds=120)
+            self.assertEqual(run.call_args.kwargs["timeout"], 120)
 
     def test_save_bgm_upload_rejects_invalid_audio_before_replacing_target(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -193,7 +205,7 @@ class TestBackgroundMusicService(unittest.TestCase):
                 with self.assertRaises(bgm.BgmUploadError):
                     bgm.save_bgm_upload("music.mp3", io.BytesIO(b"broken-file"))
 
-            # 校验失败发生在原子替换之前，已有用户文件不能被损坏。
+            # validation fails before the atomic replace, so an existing user file is never corrupted.
             self.assertEqual(target.read_bytes(), b"existing-valid-file")
             self.assertEqual(os.listdir(temp_dir), ["music.mp3"])
 

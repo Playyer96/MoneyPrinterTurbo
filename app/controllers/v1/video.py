@@ -36,8 +36,9 @@ from app.services import state as sm
 from app.services import task as tm
 from app.utils import file_security, utils
 
-# 统一在 V1 视频路由入口执行鉴权。verify_token 会在 api_key 为空时
-# 保留现有免认证行为，只有管理员显式配置后才会影响客户端。
+# authenticate once at the V1 video router entry point. verify_token keeps the
+# existing no-auth behaviour while api_key is empty, so clients are only
+# affected after an admin configures one explicitly.
 router = new_router(dependencies=[Depends(base.verify_token)])
 
 _enable_redis = config.app.get("enable_redis", False)
@@ -55,7 +56,7 @@ def _build_redis_url(host: str, port: int, db: int, password: str | None) -> str
 
 
 redis_url = _build_redis_url(_redis_host, _redis_port, _redis_db, _redis_password)
-# 根据配置选择合适的任务管理器
+# pick the task manager that matches the configuration
 if _enable_redis:
     task_manager = RedisTaskManager(
         max_concurrent_tasks=_max_concurrent_tasks,
@@ -70,8 +71,9 @@ else:
 
 
 def _sanitize_upload_filename(filename: str, request_id: str) -> str:
-    # 浏览器或客户端有时会附带目录信息，甚至可能夹带 ../ 这类穿越片段。
-    # 这里只保留纯文件名，避免上传接口把文件写到目标目录之外。
+    # browsers and clients sometimes attach directory information, and may even
+    # smuggle in ../ traversal segments. keep only the bare filename so the
+    # upload endpoint cannot write outside the target directory.
     normalized_name = (filename or "").replace("\\", "/").split("/")[-1].strip()
     if not normalized_name or normalized_name in {".", ".."}:
         raise HttpException(
@@ -98,7 +100,7 @@ def _resolve_path_within_directory(base_dir: str, unsafe_path: str, request_id: 
 
 
 def _public_task_data(task: dict) -> dict:
-    """复制任务状态并移除仅用于服务端进程协调的内部字段。"""
+    """Copy the task state and drop internal fields used only for server-side process coordination."""
     public_task = dict(task)
     public_task.pop("cross_post_owner", None)
     return public_task
@@ -114,8 +116,10 @@ def _task_file_to_uri(file: str, endpoint: str, task_dir: str, request_id: str) 
     try:
         resolved_path = file_security.resolve_path_within_directory(task_dir, file)
     except ValueError as exc:
-        # 任务状态理论上只应保存任务目录内的产物路径。这里不再继续拼接 URL，
-        # 避免把异常路径包装成可访问链接；同时保留原值，便于排查历史脏数据。
+        # task state should only ever hold artifact paths inside the task
+        # directory. stop building a URL here so an unexpected path is never
+        # wrapped into a reachable link, but keep the original value so legacy
+        # dirty data stays debuggable.
         logger.warning(
             f"skip unsafe task output path, request_id: {request_id}, path: {file}, "
             f"error: {str(exc)}"
@@ -132,7 +136,7 @@ def _task_file_to_uri(file: str, endpoint: str, task_dir: str, request_id: str) 
 def _parse_byte_range(
     range_header: str | None, file_size: int, request_id: str
 ) -> tuple[int, int]:
-    """解析单段 HTTP Range，并把无效或越界请求稳定转换成 416。"""
+    """Parse a single HTTP Range and turn invalid or out-of-bounds requests into a stable 416."""
     if file_size <= 0:
         raise HttpException(
             task_id=request_id,
@@ -144,8 +148,9 @@ def _parse_byte_range(
         return 0, file_size - 1
 
     try:
-        # 视频播放器这里只需要单段 bytes range。拒绝多段请求可以避免返回体
-        # 与 Content-Range 不一致，也避免异常字符串落入 int() 产生 500。
+        # the video player only needs a single bytes range. rejecting
+        # multi-range requests keeps the body consistent with Content-Range and
+        # keeps a malformed string out of int(), which would raise a 500.
         if not range_header.startswith("bytes=") or "," in range_header:
             raise ValueError("unsupported range format")
         start_text, end_text = range_header[6:].split("-", 1)
@@ -218,9 +223,11 @@ def create_task(
                 tm.start, task_id=task_id, params=body, stop_at=stop_at
             )
         except Exception:
-            # 状态记录在调度前创建，默认标记为 processing。如果调度器没能
-            # 接管任务（例如线程启动失败或 Redis 队列不可用），必须回滚该
-            # 记录，否则 API 和 WebUI 会永久展示一个实际从未运行的任务。
+            # the state record is created before scheduling and defaults to
+            # processing. if the scheduler never takes the task (a thread that
+            # fails to start, or an unavailable Redis queue) the record must be
+            # rolled back, otherwise the API and WebUI show a task that never
+            # ran, forever.
             sm.state.delete_task(task_id)
             raise
         logger.success(f"Task created: {utils.to_json(task)}")
@@ -333,8 +340,9 @@ def get_bgm_list(request: Request):
             {
                 "name": filename,
                 "size": os.path.getsize(file),
-                # 只返回文件名，避免把服务器绝对路径暴露给调用方。服务端会
-                # 在 storage/bgm 和 resource/songs 两个白名单目录中重新解析。
+                # return the filename only, never the server's absolute path.
+                # the server re-resolves it inside the storage/bgm and
+                # resource/songs allowlists.
                 "file": filename,
             }
         )
@@ -347,11 +355,11 @@ def get_bgm_list(request: Request):
     response_model=BgmUploadResponse,
     summary="Upload a background music file",
     description=(
-        "Validate an MP3, M4A, AAC, WAV, FLAC, OGG, OPUS, or WMA file up to "
-        "30 MB and store it under an immutable UUID filename in storage/bgm."
+        "Validate an MP3, M4A, AAC, WAV, FLAC, OGG, OPUS, or WMA file and "
+        "store it under an immutable UUID filename in storage/bgm."
     ),
     responses={
-        400: {"description": "The filename, format, size, or audio stream is invalid"},
+        400: {"description": "The filename, format, or audio stream is invalid"},
         500: {"description": "FFmpeg validation or persistent storage is unavailable"},
     },
 )
@@ -360,8 +368,9 @@ def upload_bgm_file(request: Request, file: UploadFile = File(...)):
     try:
         safe_filename = bgm_service.save_bgm_upload(file.filename, file.file)
     except bgm_service.BgmUploadError as exc:
-        # 上传失败通常可以由用户更换文件后恢复，因此记录 request_id 和明确原因，
-        # 但不输出文件内容或绝对路径，避免日志泄露用户数据。
+        # a rejected upload is usually recoverable by picking another file, so
+        # log the request_id and a precise reason, but never file content or
+        # absolute paths, which would leak user data into the log.
         logger.warning(
             f"background music upload rejected: request_id={request_id}, error={str(exc)}"
         )
@@ -371,8 +380,10 @@ def upload_bgm_file(request: Request, file: UploadFile = File(...)):
             message=f"{request_id}: {str(exc)}",
         )
     except bgm_service.BgmServiceError as exc:
-        # 工具链或存储故障属于服务端问题，不能伪装成用户文件错误。日志保留
-        # request_id 和内部原因，HTTP 响应只返回稳定文案，避免暴露服务器路径。
+        # toolchain or storage failures are server problems and must not be
+        # disguised as user file errors. the log keeps the request_id and the
+        # internal cause; the HTTP response returns fixed text so no server path
+        # is exposed.
         logger.error(
             f"background music upload failed: request_id={request_id}, error={str(exc)}"
         )
@@ -397,8 +408,9 @@ def get_video_materials_list(request: Request):
     files = []
     for suffix in allowed_suffixes:
         files.extend(glob.glob(os.path.join(local_videos_dir, f"*.{suffix}")))
-    # 文件系统枚举顺序不稳定，直接返回会导致“顺序拼接”在不同机器或不同
-    # 时刻表现不一致。这里统一按文件名排序，至少保证服务端返回顺序可预测。
+    # filesystem enumeration order is not stable, so returning it as-is makes
+    # "sequential concat" behave differently across machines and runs. sort by
+    # filename so the server's order is at least predictable.
     files.sort(key=lambda file_path: os.path.basename(file_path).lower())
     video_materials_list = []
     for file in files:
@@ -407,8 +419,9 @@ def get_video_materials_list(request: Request):
             {
                 "name": filename,
                 "size": os.path.getsize(file),
-                # 与 BGM 一样，只返回文件名；创建任务时再在 local_videos
-                # 白名单目录内解析，避免 API 泄露宿主机绝对路径。
+                # as with BGM, return the filename only; task creation
+                # re-resolves it inside the local_videos allowlist so the API
+                # never leaks a host absolute path.
                 "file": filename,
             }
         )

@@ -12,11 +12,12 @@ from PIL import Image, UnidentifiedImageError
 from app.utils import utils
 
 
-# Local materials are usually short clips. This matches Streamlit's default upload
-# limit while still placing an explicit server-side bound on direct API clients.
-MAX_VIDEO_MATERIAL_UPLOAD_BYTES = 200 * 1024 * 1024
-MAX_IMAGE_MATERIAL_UPLOAD_BYTES = 20 * 1024 * 1024
-MATERIAL_VALIDATION_TIMEOUT_SECONDS = 120
+# Uploads are bounded by disk, not by a byte cap: source footage is routinely
+# larger than any number we would pick. Validation still decodes every frame, so
+# the FFmpeg timeout scales with the file instead of rejecting it up front.
+MATERIAL_VALIDATION_BASE_TIMEOUT_SECONDS = 120
+# ponytail: 10 MB/s decode floor; raise it if slow hardware trips the timeout.
+MATERIAL_VALIDATION_BYTES_PER_SECOND = 10 * 1024 * 1024
 
 SUPPORTED_VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".flv", ".mkv")
 SUPPORTED_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
@@ -117,9 +118,18 @@ def _validate_image(file_path: str, extension: str) -> None:
         ) from exc
 
 
-def _validate_video(
-    file_path: str, timeout_seconds: int = MATERIAL_VALIDATION_TIMEOUT_SECONDS
-) -> None:
+def _validation_timeout_seconds(file_path: str) -> float:
+    """Bound a hung FFmpeg without failing a large but valid upload."""
+    try:
+        size_bytes = os.path.getsize(file_path)
+    except OSError:
+        size_bytes = 0
+    return MATERIAL_VALIDATION_BASE_TIMEOUT_SECONDS + (
+        size_bytes / MATERIAL_VALIDATION_BYTES_PER_SECOND
+    )
+
+
+def _validate_video(file_path: str, timeout_seconds: float | None = None) -> None:
     # FFmpeg treats a standalone image as a one-frame video stream. Reject images
     # explicitly so renaming photo.jpg to photo.mp4 cannot bypass the media class.
     try:
@@ -135,6 +145,9 @@ def _validate_video(
         pass
     else:
         raise MaterialUploadError("uploaded file must contain a video, not an image")
+
+    if timeout_seconds is None:
+        timeout_seconds = _validation_timeout_seconds(file_path)
 
     try:
         decoded = subprocess.run(
@@ -173,12 +186,6 @@ def _stage_material_upload(
 ) -> tuple[str, Literal["video", "image"], str, int]:
     safe_name = sanitize_material_filename(filename)
     material_kind = _material_kind(safe_name)
-    maximum_bytes = (
-        MAX_VIDEO_MATERIAL_UPLOAD_BYTES
-        if material_kind == "video"
-        else MAX_IMAGE_MATERIAL_UPLOAD_BYTES
-    )
-    maximum_megabytes = maximum_bytes // (1024 * 1024)
 
     try:
         target_dir = uploaded_material_dir(create=True)
@@ -206,11 +213,6 @@ def _stage_material_upload(
                 if not isinstance(chunk, (bytes, bytearray, memoryview)):
                     raise MaterialUploadError("local material upload must be binary")
                 total_bytes += len(chunk)
-                if total_bytes > maximum_bytes:
-                    raise MaterialUploadError(
-                        f"{material_kind} material exceeds the "
-                        f"{maximum_megabytes} MB limit"
-                    )
                 output.write(chunk)
             output.flush()
             os.fsync(output.fileno())
