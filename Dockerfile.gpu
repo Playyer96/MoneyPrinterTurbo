@@ -16,10 +16,13 @@ RUN chmod 777 /MoneyPrinterTurbo
 
 ENV PYTHONPATH="/MoneyPrinterTurbo"
 
-# Same knob as the CPU Dockerfile: local users in China keep the mirrors,
-# everyone else (Windows/NVIDIA hosts are mostly outside China) can skip the
-# cross-border round trip with --build-arg PIP_USE_OFFICIAL=1.
-ARG PIP_USE_OFFICIAL=0
+# Same knobs as the CPU Dockerfile. "auto" measures which side of the world
+# this build is on rather than assuming China; see docker/pick-mirror.py.
+ARG DOCKER_BUILD_MIRROR=auto
+# Legacy override, still set by .github/workflows/docker-ghcr.yml.
+ARG PIP_USE_OFFICIAL=auto
+
+COPY docker/pick-mirror.py /usr/local/bin/pick-mirror.py
 
 # Any failure in this chain must abort the build. Only removing the
 # distro-provided blinker is optional, so the `|| echo` is scoped inside its
@@ -46,19 +49,35 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy only the requirements.txt first to leverage Docker cache
 COPY requirements.txt ./
 
-# Install Python dependencies
-RUN if [ "$PIP_USE_OFFICIAL" = "1" ]; then \
-        python3 -m pip install --no-cache-dir --retries 3 --timeout 60 -r requirements.txt; \
+# Install Python dependencies. Preferred index first, the others as fallback:
+# a fallback costs nothing when the first choice works, and it turns a blocked
+# or down index into a slow build rather than a failed one.
+RUN set -u; \
+    if [ "$PIP_USE_OFFICIAL" = "1" ]; then \
+        MIRROR=default; \
+    elif [ "$PIP_USE_OFFICIAL" = "0" ]; then \
+        MIRROR=china; \
+    elif [ "$DOCKER_BUILD_MIRROR" = "auto" ]; then \
+        MIRROR="$(python3 /usr/local/bin/pick-mirror.py)"; \
     else \
-        python3 -m pip install --no-cache-dir \
-            -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
-            --retries 3 --timeout 60 -r requirements.txt || \
-        python3 -m pip install --no-cache-dir \
-            -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/ --trusted-host mirrors.tuna.tsinghua.edu.cn \
-            --retries 3 --timeout 60 -r requirements.txt || \
-        python3 -m pip install --no-cache-dir \
-            --retries 3 --timeout 60 -r requirements.txt; \
-    fi
+        MIRROR="$DOCKER_BUILD_MIRROR"; \
+    fi; \
+    ALIYUN="-i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com"; \
+    TUNA="-i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/ --trusted-host mirrors.tuna.tsinghua.edu.cn"; \
+    if [ "$MIRROR" = "china" ]; then \
+        set -- "$ALIYUN" "$TUNA" ""; \
+    else \
+        set -- "" "$ALIYUN" "$TUNA"; \
+    fi; \
+    for index in "$@"; do \
+        echo "pip install via ${index:-official PyPI}"; \
+        if python3 -m pip install --no-cache-dir $index --retries 3 --timeout 60 -r requirements.txt; then \
+            exit 0; \
+        fi; \
+        echo "index ${index:-official PyPI} failed, trying the next one" >&2; \
+    done; \
+    echo "no configured PyPI index could install the requirements" >&2; \
+    exit 1
 
 # Now copy the rest of the codebase into the image
 COPY . .

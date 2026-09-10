@@ -1,6 +1,10 @@
 # Run the stack with `make up`, stop it with `make down`, check it with
-# `make status`. Plain `docker compose` still works -- .env pins the mac
-# override so it cannot accidentally start the CPU-only container.
+# `make status`. The GPU stack is chosen automatically: docker/detect-stack.sh
+# reports whether this host is a Mac, has the NVIDIA container runtime, or has
+# an AMD/ROCm device node, and the right override is layered in. Setting
+# COMPOSE_FILE (in .env or the environment) overrides the detection.
+#
+# Windows has no make; docker\up.ps1 does the same detection there.
 #
 # macOS does not pass Metal through to Docker's Linux VM, and MLX has no Linux
 # build at all, so the model server has to run on the host to reach the GPU.
@@ -71,11 +75,16 @@ mac-status:
 # are the whole stack. uname decides, so one target works on both.
 IS_MAC := $(shell [ "$$(uname -s)" = "Darwin" ] && echo 1)
 
+# Exported so every `docker compose` below -- and any bare `docker compose` the
+# user types in the same shell -- agrees on which overrides are in play.
+export COMPOSE_FILE := $(shell sh docker/detect-stack.sh)
+
 up:
 ifdef IS_MAC
 	@curl -sf --max-time 2 http://127.0.0.1:8780/health >/dev/null 2>&1 \
 		|| $(MAKE) --no-print-directory mac-setup
 endif
+	@echo "stack: $(COMPOSE_FILE)"
 	@docker compose up -d
 	@$(MAKE) --no-print-directory status
 

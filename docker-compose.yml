@@ -14,18 +14,24 @@ x-common-volumes: &common-volumes
 # cpu and whisper is set to "auto", so the same image uses whatever the
 # container can actually see. Nothing to configure for NVIDIA or CPU.
 #
-# Two cases need one extra file, because Docker refuses to start when asked
-# for a device driver the host lacks -- it cannot be probed for:
+# A GPU needs one extra file layered on top, because Docker refuses to start
+# when asked for a device driver the host lacks -- it cannot be probed for, so
+# the reservations cannot sit in this file and be ignored when absent:
 #   NVIDIA: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 #   AMD:    docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d
+#   Apple:  docker compose -f docker-compose.yml -f docker-compose.mac.yml up -d
 #
-#   Apple: docker compose -f docker-compose.yml -f docker-compose.mac.yml up -d
+# You should not have to know which of those you are. Picking one is automatic:
+#   Linux/macOS:  make up
+#   Windows:      powershell -ExecutionPolicy Bypass -File docker\up.ps1
+# Both ask docker/detect-stack.sh (or its PowerShell twin) whether this host is
+# a Mac, has the NVIDIA container runtime, or has an AMD /dev/kfd, and layer in
+# the matching override. Setting COMPOSE_FILE yourself overrides the guess.
 #
-# Windows is the plain case: Docker Desktop on the WSL2 backend, and the same
-# commands above verbatim in PowerShell or cmd. `make up` is a convenience for
-# Unix shells only -- on Windows use `docker compose` directly, adding the
-# NVIDIA line above for a CUDA GPU. Keep the clone on the WSL2 filesystem or
-# on a drive shared with Docker Desktop; the bind mount below is the repo.
+# Windows specifics: Docker Desktop on the WSL2 backend, and for CUDA an NVIDIA
+# driver installed on Windows itself, not inside WSL. Keep the clone on the
+# WSL2 filesystem or a drive shared with Docker Desktop -- the bind mount below
+# is the repo, and a non-shared path silently mounts empty.
 #
 # Apple Silicon is the odd one out. macOS does not pass Metal through to
 # Docker's Linux VM, so no container on a Mac can reach the GPU -- the mac
@@ -43,6 +49,15 @@ volumes:
   voicestudio_models:
   voicestudio_profiles:
   voicestudio_output:
+
+# Package sources for the app image. "auto" measures which side of the world
+# this build is on (docker/pick-mirror.py) instead of hardcoding the China
+# mirrors for everyone -- from outside China those were the slow path, since
+# the official index was only reached after both mirrors timed out. Force it
+# with DOCKER_BUILD_MIRROR=china|default in .env or the environment.
+x-build-args: &build-args
+  DOCKER_BUILD_MIRROR: "${DOCKER_BUILD_MIRROR:-auto}"
+  PIP_USE_OFFICIAL: "${PIP_USE_OFFICIAL:-auto}"
 
 x-service-env: &service-env
   # Service name on the bridge network by default. docker-compose.mac.yml
@@ -143,6 +158,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *build-args
     image: moneyprinterturbo:latest
     container_name: "moneyprinterturbo-webui"
     environment: *service-env
@@ -158,6 +174,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *build-args
     image: moneyprinterturbo:latest
     container_name: "moneyprinterturbo-api"
     environment: *service-env
