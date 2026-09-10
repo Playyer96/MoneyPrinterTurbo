@@ -1,5 +1,11 @@
-# Use NVIDIA CUDA runtime as parent image (includes CUDA 12.1 + cuDNN 8)
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+# NVIDIA CUDA image for the webui/api services. Used by docker-compose.gpu.yml
+# on Linux and on Windows (Docker Desktop + WSL2 + NVIDIA Container Toolkit).
+#
+# cuDNN 9, not 8: requirements.txt pins faster-whisper 1.1.0, which resolves
+# CTranslate2 to 4.x, and CTranslate2 >= 4.5 links against libcudnn_ops.so.9.
+# On a cudnn8 base the image builds fine and then fails at the first
+# transcription with a missing-library error, so the base tag is load-bearing.
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 # Avoid interactive timezone prompt
 ENV DEBIAN_FRONTEND=noninteractive
@@ -10,9 +16,15 @@ RUN chmod 777 /MoneyPrinterTurbo
 
 ENV PYTHONPATH="/MoneyPrinterTurbo"
 
-# 安装链中的任何前置步骤失败都必须终止构建。只有删除系统自带 blinker
-# 属于可忽略操作，因此把容错限制在该子命令的括号内，避免末尾的
-# `|| true` 把 apt、PPA、Python 或 pip 安装失败一并转换成成功状态。
+# Same knob as the CPU Dockerfile: local users in China keep the mirrors,
+# everyone else (Windows/NVIDIA hosts are mostly outside China) can skip the
+# cross-border round trip with --build-arg PIP_USE_OFFICIAL=1.
+ARG PIP_USE_OFFICIAL=0
+
+# Any failure in this chain must abort the build. Only removing the
+# distro-provided blinker is optional, so the `|| echo` is scoped inside its
+# own parentheses -- a trailing `|| true` would turn an apt, PPA, Python or
+# pip failure into a successful build producing an unusable image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common \
         git \
@@ -35,14 +47,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt ./
 
 # Install Python dependencies
-RUN python3 -m pip install --no-cache-dir \
-    -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
-    --retries 3 --timeout 60 -r requirements.txt || \
-    python3 -m pip install --no-cache-dir \
-    -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/ --trusted-host mirrors.tuna.tsinghua.edu.cn \
-    --retries 3 --timeout 60 -r requirements.txt || \
-    python3 -m pip install --no-cache-dir \
-    --retries 3 --timeout 60 -r requirements.txt
+RUN if [ "$PIP_USE_OFFICIAL" = "1" ]; then \
+        python3 -m pip install --no-cache-dir --retries 3 --timeout 60 -r requirements.txt; \
+    else \
+        python3 -m pip install --no-cache-dir \
+            -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
+            --retries 3 --timeout 60 -r requirements.txt || \
+        python3 -m pip install --no-cache-dir \
+            -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/ --trusted-host mirrors.tuna.tsinghua.edu.cn \
+            --retries 3 --timeout 60 -r requirements.txt || \
+        python3 -m pip install --no-cache-dir \
+            --retries 3 --timeout 60 -r requirements.txt; \
+    fi
 
 # Now copy the rest of the codebase into the image
 COPY . .
@@ -50,6 +66,8 @@ COPY . .
 # Expose the port the app runs on
 EXPOSE 8501
 
-# 容器内部必须监听 0.0.0.0，宿主机仍通过 docker 端口映射限制为 127.0.0.1。
-# browser.serverAddress 只决定浏览器展示的访问地址，不能替代 server.address。
+# Inside the container the server must listen on 0.0.0.0; the host side is
+# still limited to 127.0.0.1 by the docker port mapping. browser.serverAddress
+# only sets the URL shown to the user and is not a substitute for
+# server.address.
 CMD ["streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=127.0.0.1", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False"]
