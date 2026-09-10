@@ -1,50 +1,56 @@
 x-common-volumes: &common-volumes
   - ./:/MoneyPrinterTurbo
 
-# MoneyPrinterTurbo runs in Docker; the OmniVoice TTS server runs natively on
-# the host. That is deliberate: a Linux container never sees Apple Metal
-# (torch's MPS backend does not exist in linux wheels), so a containerised
-# VoiceStudio is CPU-only on every Mac. Running it on the host lets server.py
-# pick cuda -> mps -> cpu and actually land on the GPU, on Macs and NVIDIA
-# boxes alike.
+# Everything runs in Docker. Three services on a private bridge network:
+# webui and api reach voicestudio by service name, so this works identically
+# on Linux, macOS and Windows.
 #
-#   ./mpt.sh up                 # GPU server + containers (./mpt.sh down stops both)
-#   ./mpt.sh status             # what is running
+#   docker compose up -d --build      start (and rebuild if sources changed)
+#   docker compose restart            restart without rebuilding
+#   docker compose down               stop and remove
 #
-# The containerised CPU fallback is still here behind a profile:
-#   docker compose --profile container-tts up -d
+# GPU selection is automatic at runtime: the TTS server picks cuda -> mps ->
+# cpu and whisper is set to "auto", so the same image uses whatever the
+# container can actually see. Nothing to configure for NVIDIA or CPU.
+#
+# Two cases need one extra file, because Docker refuses to start when asked
+# for a device driver the host lacks -- it cannot be probed for:
+#   NVIDIA: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#   AMD:    docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d
+#
+# Apple Silicon needs neither and cannot use either: Docker runs a Linux VM
+# and macOS does not pass Metal through, so Macs run on the CPU. That is a
+# platform limitation, not a setting.
 networks:
   mpt-net:
     driver: bridge
 
-# Named volumes keep voice profiles + generated audio across container
-# restarts and re-creates, and stop the bind-mounted MoneyPrinterTurbo
-# source dir from accumulating voice_studio state inside the repo.
-# Only used by the container-tts profile.
+# Named volumes keep the downloaded models, voice profiles and generated
+# audio across container restarts and re-creates, and stop the bind-mounted
+# MoneyPrinterTurbo source dir from accumulating voice_studio state inside
+# the repo. Model weights live here rather than in the image or the repo.
 volumes:
   voicestudio_models:
   voicestudio_profiles:
   voicestudio_output:
 
 x-voicestudio-env: &voicestudio-env
-  # Default to the host-native server, which is the only way to reach a GPU
-  # on macOS. Override to "http://voicestudio:8780" when running the
-  # container-tts profile instead.
-  VOICESTUDIO_BASE_URL: "${VOICESTUDIO_BASE_URL:-http://host.docker.internal:8780}"
-
-# host-gateway resolves host.docker.internal on plain Linux too, where Docker
-# Desktop's automatic mapping does not exist.
-x-host-gateway: &host-gateway
-  - "host.docker.internal:host-gateway"
+  # Service name on the bridge network -- no host.docker.internal, so this
+  # resolves the same way on every platform.
+  VOICESTUDIO_BASE_URL: "http://voicestudio:8780"
 
 services:
   voicestudio:
-    # CPU-only fallback for hosts that cannot run the server natively.
-    # Not started by default -- see the profile note at the top of this file.
-    profiles: ["container-tts"]
+    # OmniVoice lives in its own image so the app image does not carry
+    # torch/transformers. PYTORCH_INDEX_URL selects the CPU, CUDA or ROCm
+    # wheels; the GPU override files set it.
     build:
       context: ./vendor/voice_studio
       dockerfile: Dockerfile
+      args:
+        # Empty = default PyPI torch, which auto-uses an NVIDIA GPU when one
+        # is attached and the CPU when none is. Only ROCm needs an override.
+        PYTORCH_INDEX_URL: "${PYTORCH_INDEX_URL:-}"
     image: voicestudio:latest
     container_name: "moneyprinterturbo-voicestudio"
     networks:
@@ -78,8 +84,10 @@ services:
       dockerfile: Dockerfile
     image: moneyprinterturbo:latest
     container_name: "moneyprinterturbo-webui"
+    depends_on:
+      voicestudio:
+        condition: service_healthy
     environment: *voicestudio-env
-    extra_hosts: *host-gateway
     networks:
       - mpt-net
     ports:
@@ -94,8 +102,10 @@ services:
       dockerfile: Dockerfile
     image: moneyprinterturbo:latest
     container_name: "moneyprinterturbo-api"
+    depends_on:
+      voicestudio:
+        condition: service_healthy
     environment: *voicestudio-env
-    extra_hosts: *host-gateway
     networks:
       - mpt-net
     ports:

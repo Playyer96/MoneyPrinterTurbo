@@ -1,10 +1,7 @@
 import json
 import os.path
 import re
-from types import SimpleNamespace
 from timeit import default_timer as timer
-
-import requests
 
 try:
     from faster_whisper import WhisperModel
@@ -16,71 +13,19 @@ from app.config import config
 from app.utils import utils
 
 model_size = config.whisper.get("model_size", "large-v3")
-device = config.whisper.get("device", "cpu")
-compute_type = config.whisper.get("compute_type", "int8")
+# "auto" lets CTranslate2 use the GPU when the container has one attached
+# (NVIDIA via docker-compose.gpu.yml) and fall back to the CPU when it does
+# not, so the same image works on every host without a config edit. Note
+# CTranslate2 has no ROCm or Metal backend, so AMD and Mac stay on the CPU
+# here even though OmniVoice itself does use ROCm.
+device = config.whisper.get("device", "auto")
+compute_type = config.whisper.get("compute_type", "default")
 initial_prompt = config.whisper.get("initial_prompt", "") or None
 model = None
 
 
-def _remote_transcribe(audio_file: str):
-    """Transcribe on the host-side GPU server, or return None to fall back.
-
-    faster-whisper's CTranslate2 backend is cpu/cuda only, so inside a Linux
-    container on a Mac whisper can never leave the CPU. The VoiceStudio server
-    already runs natively on the host for the same reason (see voicestudio.sh);
-    it exposes /transcribe backed by MLX, which does run on Metal. Any failure
-    here -- server down, no mlx, non-Mac host -- returns None so the caller
-    loads faster-whisper locally exactly as before.
-    """
-    from app.services import voice
-
-    base_url = voice.get_voicestudio_base_url()
-    try:
-        with open(audio_file, "rb") as fh:
-            response = requests.post(
-                f"{base_url}/transcribe",
-                data=fh.read(),
-                headers={"Content-Type": "application/octet-stream"},
-                timeout=600,
-            )
-    except Exception as e:
-        logger.info(f"remote whisper unavailable ({type(e).__name__}), using local model")
-        return None
-
-    if response.status_code != 200:
-        logger.info(
-            f"remote whisper returned status {response.status_code}, using local model"
-        )
-        return None
-
-    payload = response.json()
-    # Rebuild the attribute-access shape faster-whisper returns so the
-    # segment-walking code below stays identical for both backends.
-    segments = [
-        SimpleNamespace(
-            text=seg["text"],
-            start=seg["start"],
-            end=seg["end"],
-            words=[SimpleNamespace(**w) for w in seg["words"]],
-        )
-        for seg in payload["segments"]
-    ]
-    info = SimpleNamespace(
-        language=payload["language"],
-        language_probability=payload["language_probability"],
-    )
-    logger.info(f"transcribed on remote GPU whisper at {base_url}")
-    return segments, info
-
-
 def create(audio_file, subtitle_file: str = "", word_level: bool = False):
     global model
-
-    remote = _remote_transcribe(audio_file)
-    if remote is not None:
-        segments, info = remote
-        return _write_subtitle(segments, info, audio_file, subtitle_file, word_level)
-
     if WhisperModel is None:
         logger.warning("faster_whisper not available, skipping whisper subtitle generation")
         return ""

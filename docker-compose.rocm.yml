@@ -1,0 +1,29 @@
+# AMD / ROCm override.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d --build
+#
+# ROCm builds of torch expose AMD GPUs through the same torch.cuda API, so
+# server.py's existing cuda branch drives them with no code change -- only
+# the wheels and the device nodes differ. ROCm is Linux-only; there is no
+# ROCm on macOS or Windows.
+#
+# Prerequisites:
+#   1. ROCm-capable AMD GPU and host driver (amdgpu)
+#   2. The user running docker in the `video` and `render` groups
+#
+# Note: whisper stays on the CPU here. faster-whisper runs on CTranslate2,
+# which has CUDA and CPU backends only -- no ROCm. TTS still gets the GPU.
+services:
+  voicestudio:
+    build:
+      args:
+        PYTORCH_INDEX_URL: https://download.pytorch.org/whl/rocm6.2
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    security_opt:
+      - seccomp:unconfined
+    ipc: host

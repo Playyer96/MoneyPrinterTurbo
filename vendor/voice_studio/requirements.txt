@@ -11,7 +11,3 @@ scipy
 huggingface_hub
 fastapi
 uvicorn
-# Metal-backed whisper for /transcribe. Apple Silicon only -- MLX has no
-# Linux/Windows build, and the endpoint degrades to a 503 (callers fall back
-# to their own faster-whisper) wherever this is not installed.
-mlx-whisper; sys_platform == "darwin" and platform_machine == "arm64"

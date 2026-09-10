@@ -472,10 +472,12 @@ upload_post_max_pending_tasks = 10
 # The model is downloaded automatically on first use unless a matching local
 # directory exists at ./models/whisper-{model_size}.
 model_size = "large-v3"
-# device: "cpu" or "cuda". Common compute types include "int8" for CPU and
-# "float16" or "int8_float16" for CUDA.
-device = "cpu"
-compute_type = "int8"
+# device: "auto" picks the GPU when the container has one attached and the CPU
+# otherwise, so the same config works everywhere; "cpu" and "cuda" force it.
+# CTranslate2 (what faster-whisper runs on) has no ROCm or Metal backend, so
+# AMD and Apple hosts transcribe on the CPU regardless.
+device = "auto"
+compute_type = "default"
 # Optional prompt that biases Whisper's decoder toward specific vocabulary
 # (brand names, technical terms). Passed as initial_prompt to transcribe().
 # Leave empty to disable.

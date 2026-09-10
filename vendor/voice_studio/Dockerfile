@@ -6,9 +6,12 @@
 #     build:
 #       context: ./vendor/voice_studio
 #
-# CPU-only is the default. For NVIDIA hosts, set PYTORCH_INDEX_URL to
-# the appropriate CUDA wheel index and add the
-# `deploy.resources.reservations.devices` block in compose.
+# Which GPU the model uses is decided at runtime, not here: server.py picks
+# cuda -> mps -> cpu, and torch's default PyPI wheel carries CUDA support
+# that activates only when a GPU is actually attached to the container. So
+# one image covers NVIDIA and CPU with no configuration. AMD needs different
+# wheels entirely -- docker-compose.rocm.yml overrides PYTORCH_INDEX_URL for
+# that case.
 
 FROM python:3.11-slim-bookworm
 
@@ -25,9 +28,15 @@ RUN apt-get update \
 # Install Python deps. requirements.txt includes fastapi + uvicorn so the
 # HTTP server is reachable inside the container without an extra layer.
 COPY requirements.txt ./
-ARG PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
-RUN pip install --no-cache-dir --retries 3 --timeout 120 \
-    torch torchaudio --index-url ${PYTORCH_INDEX_URL}
+# Empty means the default PyPI index, whose linux/x86_64 torch bundles CUDA
+# and still runs fine on a CPU-only host. The ROCm override sets this.
+ARG PYTORCH_INDEX_URL=
+RUN if [ -n "${PYTORCH_INDEX_URL}" ]; then \
+        pip install --no-cache-dir --retries 3 --timeout 120 \
+            torch torchaudio --index-url "${PYTORCH_INDEX_URL}"; \
+    else \
+        pip install --no-cache-dir --retries 3 --timeout 120 torch torchaudio; \
+    fi
 RUN pip install --no-cache-dir --retries 3 --timeout 120 -r requirements.txt
 RUN HF_HUB_OFFLINE=1 python -c "from omnivoice.models.omnivoice import OmniVoice"
 

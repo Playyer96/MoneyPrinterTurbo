@@ -1,52 +1,49 @@
-# GPU override file
-# Usage: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+# NVIDIA override. Attaches the GPU to every service that runs a model.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#
+# Only needed because Docker cannot probe for a device driver: asking for the
+# nvidia driver on a host without it is a hard startup failure, so it cannot
+# live in the base file. The images themselves need no NVIDIA-specific build
+# -- torch's default wheel already carries CUDA and activates it when a GPU
+# is visible, and whisper's device is "auto".
 #
 # Prerequisites:
-#   1. NVIDIA GPU driver installed on host
-#   2. NVIDIA Container Toolkit installed
-#   3. Verify with: docker info | grep nvidia
-#
-# This file overrides the default docker-compose.yml to:
-#   - Build with Dockerfile.gpu (NVIDIA CUDA base image)
-#   - Attach GPU devices to both services because video generation can run in
-#     either the WebUI process or the API process
+#   1. NVIDIA GPU driver on the host
+#   2. NVIDIA Container Toolkit
+#   3. Verify with: docker info | grep -i nvidia
+x-nvidia: &nvidia
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
 services:
+  # OmniVoice: torch picks up the GPU through torch.cuda.
+  voicestudio: *nvidia
+
+  # Video generation runs in whichever process the request lands on, and
+  # faster-whisper's "auto" device needs the GPU visible here too.
   webui:
     build:
-      context: .
       dockerfile: Dockerfile.gpu
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]
   api:
     build:
-      context: .
       dockerfile: Dockerfile.gpu
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-
-  # The TTS server too, when running the container-tts profile on an NVIDIA
-  # host. Without this the voicestudio container installs CPU-only torch and
-  # stays on the CPU even though the GPU is right there.
-  #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml \
-  #     --profile container-tts up -d
-  voicestudio:
-    build:
-      args:
-        PYTORCH_INDEX_URL: https://download.pytorch.org/whl/cu124
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]

@@ -11,7 +11,6 @@ Endpoints:
     GET  /health           -> liveness probe
     GET  /voices           -> list bundled voice-design presets
     POST /generate         -> synthesize WAV (JSON: text, voice, speed?)
-    POST /transcribe       -> transcribe raw audio bytes (Metal/MLX whisper)
 
 The legacy profile-management endpoints (/profiles, /tts) used to live
 here; they are gone by design. Voice cloning is still possible via the
@@ -27,7 +26,7 @@ import uuid
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -41,12 +40,6 @@ app = FastAPI(title="OmniVoice HTTP API", version="2.0.0")
 _tts_lock = threading.Lock()
 _model = None
 _model_lock = threading.Lock()
-
-# Whisper runs on the same GPU as TTS, so it gets its own lock rather than
-# sharing _tts_lock: a transcription and a synthesis are independent requests
-# and only need to avoid running *concurrently on the GPU*, not to queue
-# behind each other's model loads.
-_whisper_lock = threading.Lock()
 
 # Bundled voice-design presets. Each entry maps a stable name (kept as the
 # original character name the user expects to see in the dropdown) to the
@@ -73,6 +66,10 @@ def _load_model():
         import torch
         from omnivoice.models.omnivoice import OmniVoice
 
+        # ROCm builds of torch expose AMD GPUs through the same torch.cuda
+        # API, so this branch covers both NVIDIA and AMD. mps only ever
+        # matches when the server runs natively on a Mac -- a Linux container
+        # cannot reach Metal, so in Docker an Apple host lands on cpu.
         if torch.cuda.is_available():
             device, dtype = "cuda", torch.float16
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -173,75 +170,6 @@ def generate_audio(request: GenerateRequest):
         filename=filename,
         background=None,
     )
-
-
-# faster-whisper's CTranslate2 backend has no Metal support (cpu and cuda
-# only), so on Apple Silicon the only way to put whisper on the GPU is MLX.
-# MoneyPrinterTurbo posts audio here instead of transcribing in-container;
-# app/services/subtitle.py falls back to its own faster-whisper when this
-# endpoint is unreachable or unavailable.
-MLX_WHISPER_REPO = os.environ.get(
-    "MLX_WHISPER_REPO", "mlx-community/whisper-large-v3-mlx"
-)
-
-
-@app.post("/transcribe")
-async def transcribe(request: Request, word_timestamps: bool = True):
-    try:
-        import mlx_whisper
-    except ImportError as exc:  # non-Mac host, or mlx not installed
-        raise HTTPException(
-            status_code=503, detail=f"mlx_whisper unavailable: {exc}"
-        ) from exc
-
-    audio = await request.body()
-    if not audio:
-        raise HTTPException(status_code=400, detail="empty audio body")
-
-    # mlx_whisper decodes via ffmpeg, which needs a real file on disk.
-    tmp_path = os.path.join("/tmp", f"{uuid.uuid4().hex}.audio")
-    try:
-        with open(tmp_path, "wb") as fh:
-            fh.write(audio)
-        with _whisper_lock:
-            result = mlx_whisper.transcribe(
-                tmp_path,
-                path_or_hf_repo=MLX_WHISPER_REPO,
-                word_timestamps=word_timestamps,
-            )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500, detail=f"transcription failed: {exc}"
-        ) from exc
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-
-    # Mirror the faster-whisper shape the caller already knows how to walk.
-    # Timestamps come back as numpy floats, so cast for JSON serialization.
-    segments = [
-        {
-            "text": seg.get("text", ""),
-            "start": float(seg.get("start", 0.0)),
-            "end": float(seg.get("end", 0.0)),
-            "words": [
-                {
-                    "word": w.get("word", ""),
-                    "start": float(w.get("start", 0.0)),
-                    "end": float(w.get("end", 0.0)),
-                }
-                for w in (seg.get("words") or [])
-            ],
-        }
-        for seg in result.get("segments", [])
-    ]
-    return {
-        "language": result.get("language", ""),
-        "language_probability": 1.0,
-        "segments": segments,
-    }
 
 
 def main() -> None:
