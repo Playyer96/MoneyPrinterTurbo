@@ -1,0 +1,29 @@
+# Apple Silicon override -- the only way to use the GPU on a Mac.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.mac.yml up -d
+#
+# macOS does not pass Metal through to Docker's Linux VM, so a containerised
+# model server is CPU-only on every Mac no matter how it is configured. This
+# override therefore scales the voicestudio container to zero and points the
+# app at a copy running natively on the host, where torch reaches Metal via
+# MPS and whisper via MLX. TTS drops from ~72s to ~4s, whisper from ~58s to
+# ~7s on an M-series chip.
+#
+# The host server is started by a LaunchAgent at login, so there is nothing
+# to run by hand. Install it once with:
+#
+#   make mac-setup
+#
+# Everything else -- build, restart, down -- stays plain docker compose.
+services:
+  voicestudio:
+    # Built but never started: the host copy serves these requests instead.
+    deploy:
+      replicas: 0
+
+  webui:
+    environment:
+      VOICESTUDIO_BASE_URL: "http://host.docker.internal:8780"
+  api:
+    environment:
+      VOICESTUDIO_BASE_URL: "http://host.docker.internal:8780"

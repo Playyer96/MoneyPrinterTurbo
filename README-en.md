@@ -310,6 +310,31 @@ docker compose -f docker-compose.release.yml up
 > If you need to build the image locally, you can still run `docker compose up`.
 > Before the first start, copy `config.example.toml` to `config.toml` so it can be mounted into the containers.
 
+#### GPU acceleration
+
+Device selection is automatic at runtime, so the default build already uses an
+NVIDIA GPU when one is attached and the CPU when none is. Two cases need an
+extra compose file, because Docker treats a missing device driver as a startup
+failure and cannot be asked to probe for one:
+
+| Hardware | Command |
+| --- | --- |
+| CPU only | `docker compose up -d --build` |
+| NVIDIA | `docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build` |
+| AMD / ROCm (Linux) | `docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d --build` |
+| Apple Silicon | `make mac-setup` once, then `docker compose -f docker-compose.yml -f docker-compose.mac.yml up -d --build` |
+
+Apple Silicon is the exception. macOS does not pass Metal through to Docker's
+Linux VM, so no container on a Mac can reach the GPU. `make mac-setup` installs
+the model server as a LaunchAgent that starts at login and runs on the host,
+where torch reaches Metal through MPS and whisper through MLX; the compose
+override then points the app at it and leaves the TTS container stopped. On an
+M-series chip this is the difference between roughly 130s and 14s of TTS plus
+transcription per video. Remove it again with `make mac-teardown`.
+
+Note that whisper stays on the CPU under ROCm: faster-whisper runs on
+CTranslate2, which has CUDA and CPU backends only.
+
 #### ② Access the WebUI
 
 Open your browser and visit http://127.0.0.1:8501
@@ -319,120 +344,6 @@ Open your browser and visit http://127.0.0.1:8501
 Open your browser and visit http://127.0.0.1:8080/docs or http://127.0.0.1:8080/redoc
 
 > The API allows same-origin browser access by default. Set the `CORS_ALLOWED_ORIGINS` environment variable only when a separate browser frontend must call the API directly from another origin, for example `http://localhost:3000,https://frontend.example.com`. CORS does not affect curl, Postman, n8n, or other server-side clients.
-
-### Manual Deployment 📦
-
-#### ① Create a Python Virtual Environment
-
-Use [uv](https://docs.astral.sh/uv/) to manage the Python environment and dependencies. The project supports Python 3.11 or later; the example below uses Python 3.11.
-
-```shell
-git clone https://github.com/harry0703/MoneyPrinterTurbo.git
-cd MoneyPrinterTurbo
-uv python install 3.11
-uv sync --frozen
-```
-
-If you are not using `uv` yet, you can still use `venv + pip`.
-
-```shell
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Notes:
-
-- `pyproject.toml` is now the primary dependency manifest.
-- `uv.lock` pins the resolved environment, so `uv sync --frozen` is recommended by default.
-- `requirements.txt` is kept only for legacy `pip`-based installation.
-
-#### ② Launch the WebUI 🌐
-
-Note that you need to execute the following commands in the `root directory` of the MoneyPrinterTurbo project
-
-###### Windows
-
-```powershell
-.\webui.bat
-```
-
-You can also run `webui.bat` in CMD.
-`webui.bat` prefers the project `.venv` or bundled Python from the portable package. If no project Python is found but `uv` is installed, it automatically falls back to `uv run streamlit`.
-To allow other devices on your LAN to access the WebUI, run `set MPT_WEBUI_HOST=0.0.0.0` before running `webui.bat`.
-
-###### macOS or Linux
-
-```shell
-sh webui.sh
-```
-
-The script automatically uses the project virtual environment or `uv` and selects an available local port. To allow access from other devices on your LAN, run:
-
-```shell
-MPT_WEBUI_HOST=0.0.0.0 sh webui.sh
-```
-
-After launching, the browser will open automatically
-
-#### ③ Launch the API Service 🚀
-
-```shell
-uv run python main.py
-```
-
-If you have already activated the virtual environment manually, you can still run:
-
-```shell
-python main.py
-```
-
-#### ④ Pure CLI Mode (No Browser) ⌨️
-
-If you cannot use a browser or port forwarding, generate videos directly from the
-command line. The simplest complete generation command is:
-
-```shell
-uv run python cli.py --video-subject "How AI is changing everyday life"
-```
-
-Subtitle style and voiceover options resolve in this order: **explicit CLI option >
-saved `[ui]` value in `config.toml` > built-in default**. Other generation settings,
-such as background music, video count, and paragraph count, are not inherited from
-the WebUI. If the WebUI is set to use uploaded audio, pass `--custom-audio-file`
-explicitly, since the uploaded path is not persisted.
-
-For the complete command reference, parameter descriptions, and usage instructions,
-run:
-
-```shell
-uv run python cli.py --help
-```
-
-To run several tasks sequentially, pass a UTF-8 JSON array or JSONL manifest. CLI
-options act as defaults, and each object overrides fields from `VideoParams`:
-
-```json
-[
-  { "video_subject": "How solar panels work" },
-  { "video_subject": "How wind turbines work", "video_aspect": "16:9" }
-]
-```
-
-```shell
-uv run python cli.py --batch-file ./tasks.json --stop-at video
-```
-
-The manifest is resolved from the current working directory. Relative
-`custom_audio_file` and local `video_materials[].url` values inside it are resolved
-from the manifest's directory; file paths supplied as CLI defaults keep their normal
-current-working-directory semantics. A manifest is limited to 100 tasks and 1 MiB.
-All entries are validated before the first task starts, tasks continue after an
-individual runtime failure, and the command prints one JSON summary when finished.
-The summary contains `total`, `succeeded`, `failed`, and `tasks`; each task entry has
-`index`, `task_id`, `status`, `result`, `failed_stage`, and `error`.
-
-## Voiceover, Subtitles, and Background Music 🎙️
 
 ### Voice Synthesis
 

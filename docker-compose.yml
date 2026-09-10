@@ -18,9 +18,12 @@ x-common-volumes: &common-volumes
 #   NVIDIA: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 #   AMD:    docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d
 #
-# Apple Silicon needs neither and cannot use either: Docker runs a Linux VM
-# and macOS does not pass Metal through, so Macs run on the CPU. That is a
-# platform limitation, not a setting.
+#   Apple: docker compose -f docker-compose.yml -f docker-compose.mac.yml up -d
+#
+# Apple Silicon is the odd one out. macOS does not pass Metal through to
+# Docker's Linux VM, so no container on a Mac can reach the GPU -- the mac
+# override therefore runs the model server on the host (auto-started by a
+# LaunchAgent, see docker-compose.mac.yml) and points the app at it.
 networks:
   mpt-net:
     driver: bridge
@@ -35,9 +38,9 @@ volumes:
   voicestudio_output:
 
 x-voicestudio-env: &voicestudio-env
-  # Service name on the bridge network -- no host.docker.internal, so this
-  # resolves the same way on every platform.
-  VOICESTUDIO_BASE_URL: "http://voicestudio:8780"
+  # Service name on the bridge network by default. docker-compose.mac.yml
+  # repoints this at the host, where the GPU actually is on Apple Silicon.
+  VOICESTUDIO_BASE_URL: "${VOICESTUDIO_BASE_URL:-http://voicestudio:8780}"
 
 services:
   voicestudio:
@@ -84,9 +87,6 @@ services:
       dockerfile: Dockerfile
     image: moneyprinterturbo:latest
     container_name: "moneyprinterturbo-webui"
-    depends_on:
-      voicestudio:
-        condition: service_healthy
     environment: *voicestudio-env
     networks:
       - mpt-net
@@ -102,9 +102,6 @@ services:
       dockerfile: Dockerfile
     image: moneyprinterturbo:latest
     container_name: "moneyprinterturbo-api"
-    depends_on:
-      voicestudio:
-        condition: service_healthy
     environment: *voicestudio-env
     networks:
       - mpt-net

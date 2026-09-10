@@ -245,35 +245,54 @@ class TestSubtitleService(unittest.TestCase):
 
         self.assertEqual([item[2] for item in items], ["Hello", "World"])
 
-    def test_create_passes_auto_device_through_to_whisper_model(self):
+    def test_create_uses_remote_gpu_transcription_when_available(self):
         """
-        The device default must reach CTranslate2 as "auto".
+        The host-side GPU server short-circuits the local model entirely.
 
-        That is what lets one image use the GPU when the container has one
-        attached and the CPU when it does not, so a hardcoded "cpu" here would
-        silently pin every GPU host to the CPU.
+        faster-whisper cannot reach Apple Metal from inside the container, so
+        `create()` posts audio to the native server first. This asserts the
+        remote segments reach the SRT without WhisperModel ever being touched.
         """
-        self.assertEqual(subtitle.device, "auto")
-
-        captured = {}
-
-        class _FakeWhisperModel:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-            def transcribe(self, *args, **kwargs):
-                info = SimpleNamespace(language="en", language_probability=1.0)
-                return [], info
+        remote = (
+            [
+                SimpleNamespace(
+                    text="Hello world",
+                    start=0.1,
+                    end=0.8,
+                    words=[
+                        SimpleNamespace(word=" Hello", start=0.1, end=0.4),
+                        SimpleNamespace(word=" world.", start=0.4, end=0.8),
+                    ],
+                )
+            ],
+            SimpleNamespace(language="en", language_probability=1.0),
+        )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             subtitle_file = Path(tmp_dir) / "subtitle.srt"
-            with patch.object(subtitle, "model", None), patch.object(
-                subtitle, "WhisperModel", _FakeWhisperModel
-            ):
+            with patch.object(subtitle, "_remote_transcribe", return_value=remote), \
+                    patch.object(subtitle, "WhisperModel", None):
                 subtitle.create("audio.mp3", str(subtitle_file))
+            items = subtitle.file_to_subtitles(str(subtitle_file))
 
-        self.assertEqual(captured["device"], "auto")
-        self.assertEqual(captured["compute_type"], "default")
+        self.assertEqual([item[2] for item in items], ["Hello world"])
+
+    def test_create_falls_back_to_local_model_when_remote_unavailable(self):
+        """
+        A dead or non-Mac GPU server must not break subtitles.
+
+        `_remote_transcribe` returns None on any failure, and `create()` then
+        follows the original local-model path -- here that path is unavailable,
+        so the pre-existing empty-string contract still holds.
+        """
+        with patch.object(subtitle, "_remote_transcribe", return_value=None), \
+                patch.object(subtitle, "WhisperModel", None):
+            self.assertEqual(subtitle.create("audio.mp3"), "")
+
+    def test_remote_transcribe_returns_none_when_server_is_unreachable(self):
+        """A connection error is a fallback signal, not an exception to propagate."""
+        with patch.object(subtitle.requests, "post", side_effect=OSError("refused")):
+            self.assertIsNone(subtitle._remote_transcribe(__file__))
 
 
 if __name__ == "__main__":

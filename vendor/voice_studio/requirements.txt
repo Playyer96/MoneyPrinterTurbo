@@ -11,3 +11,4 @@ scipy
 huggingface_hub
 fastapi
 uvicorn
+mlx-whisper; sys_platform == "darwin" and platform_machine == "arm64"
