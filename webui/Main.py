@@ -64,6 +64,12 @@ from app.services import version_checker
 from app.utils.logging_utils import configure_terminal_logger
 from app.utils import utils
 
+# Auto-launch the bundled VoiceStudio (OmniVoice) server so the WebUI's
+# preview buttons work out of the box. The probe inside the helper makes the
+# call idempotent — a server already running externally is left alone, and
+# streamlit's hot-reload does not spawn a duplicate process.
+voice.ensure_voicestudio_server_running()
+
 st.set_page_config(
     page_title="MoneyPrinterTurbo",
     page_icon="🤖",
@@ -2642,8 +2648,8 @@ def _render_cache_management_settings(panel):
             tr("Cache Total Size"), _format_file_size(total_stats.total_size)
         )
         oldest_text = (
-            datetime.fromtimestamp(total_stats.oldest_mtime).strftime("%Y-%m-%d")
-            if total_stats.oldest_mtime is not None
+            datetime.fromtimestamp(total_stats.oldest_mtime_ns / 1_000_000_000).strftime("%Y-%m-%d")
+            if total_stats.oldest_mtime_ns is not None
             else "-"
         )
         metric_oldest.metric(tr("Oldest Cache Date"), oldest_text)

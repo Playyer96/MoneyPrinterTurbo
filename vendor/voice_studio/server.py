@@ -1,144 +1,247 @@
 """
-FastAPI HTTP server for the headless VoiceStudio.
+Minimal HTTP bridge to OmniVoice (k2-fsa/OmniVoice).
 
-Exposes :mod:`core`'s two operations over HTTP so external tools (e.g.
-MoneyPrinterTurbo) can use VoiceStudio as a TTS provider without importing
-the OmniVoice stack in-process.
+Exposes a small JSON-over-HTTP surface so MoneyPrinterTurbo can use
+OmniVoice as a TTS provider without importing torch / transformers in its
+own image. Each request loads the model lazily on first call and reuses it
+for subsequent calls; concurrent requests are serialized through a single
+lock because the heavy OmniVoice model is loaded once per process.
 
 Endpoints:
-    GET  /health              -> healthy check
-    GET  /profiles            -> list of available voice profiles
-    POST /profiles            -> create a profile (multipart: profile_name + audio file)
-    POST /tts                 -> synthesize audio (JSON: text + profile_name) -> WAV
+    GET  /health           -> liveness probe
+    GET  /voices           -> list bundled voice-design presets
+    POST /generate         -> synthesize WAV (JSON: text, voice, speed?)
+    POST /transcribe       -> transcribe raw audio bytes (Metal/MLX whisper)
 
-Run (from the voice_studio directory):
-    python server.py
-or:
-    uvicorn server:app --host 127.0.0.1 --port 8780
-
-Host/port can be overridden via the ``VOICESTUDIO_HOST`` / ``VOICESTUDIO_PORT``
-environment variables.
+The legacy profile-management endpoints (/profiles, /tts) used to live
+here; they are gone by design. Voice cloning is still possible via the
+omnivoice Python API directly when callers need it, but MoneyPrinterTurbo
+only consumes the bundled presets here.
 """
 
 from __future__ import annotations
 
 import os
-import tempfile
 import threading
 import uuid
 from typing import Optional
 
-import core
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8780
 
-app = FastAPI(title="VoiceStudio HTTP API", version="1.0.0")
+app = FastAPI(title="OmniVoice HTTP API", version="2.0.0")
 
-# OmniVoice is a single heavy model attached to one device. Serialize TTS so
-# concurrent video tasks don't contend on the GPU / model-load path.
+# OmniVoice is a single heavy model attached to one device. Serialize TTS
+# so concurrent video tasks don't contend on the GPU / model-load path.
 _tts_lock = threading.Lock()
+_model = None
+_model_lock = threading.Lock()
+
+# Whisper runs on the same GPU as TTS, so it gets its own lock rather than
+# sharing _tts_lock: a transcription and a synthesis are independent requests
+# and only need to avoid running *concurrently on the GPU*, not to queue
+# behind each other's model loads.
+_whisper_lock = threading.Lock()
+
+# Bundled voice-design presets. Each entry maps a stable name (kept as the
+# original character name the user expects to see in the dropdown) to the
+# `instruct` string OmniVoice consumes. Names are short, lowercase, ASCII so
+# they round-trip cleanly through MPT's voice id parser
+# (voicestudio:<name>) and through TOML config keys.
+VOICE_PRESETS: dict[str, str] = {
+    "cr7": "male, middle-aged, low pitch, portuguese accent",
+    "goku": "male, young adult, moderate pitch",
+    "narrator": "male, middle-aged, moderate pitch",
+    "casual": "female, young adult, moderate pitch",
+    "energetic": "male, young adult, high pitch",
+}
 
 
-class TtsRequest(BaseModel):
+def _load_model():
+    """Lazy-load the OmniVoice model on first use; serializes concurrent loads."""
+    global _model
+    if _model is not None:
+        return _model
+    with _model_lock:
+        if _model is not None:
+            return _model
+        import torch
+        from omnivoice.models.omnivoice import OmniVoice
+
+        if torch.cuda.is_available():
+            device, dtype = "cuda", torch.float16
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device, dtype = "mps", torch.float32
+        else:
+            device, dtype = "cpu", torch.float32
+
+        model_id = os.environ.get("OMNIVOICE_MODEL_ID", "k2-fsa/OmniVoice")
+        # uvicorn.error is the logger uvicorn actually configures, so this
+        # line shows up in the server output and you can see which device
+        # (cuda / mps / cpu) the model actually landed on.
+        import logging
+        logging.getLogger("uvicorn.error").info(
+            "loading OmniVoice model '%s' on %s ...", model_id, device
+        )
+        _model = OmniVoice.from_pretrained(model_id, device_map=device, dtype=dtype)
+    return _model
+
+
+class GenerateRequest(BaseModel):
     text: str
-    profile_name: str
-    voice_rate: Optional[float] = None
-    voice_volume: Optional[float] = None
-
-
-def _clean_profile_name(profile_name: str) -> str:
-    name = (profile_name or "").strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="profile_name cannot be empty")
-    return name
-
-
-def _list_profile_names() -> list[str]:
-    if not os.path.isdir(core.PROFILES_DIR):
-        return []
-    names = []
-    for filename in sorted(os.listdir(core.PROFILES_DIR)):
-        if filename.endswith(".json"):
-            names.append(filename[:-5])
-    return names
+    voice: str = "narrator"
+    speed: Optional[float] = None
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True}
+    return {"ok": True, "voices": list(VOICE_PRESETS.keys())}
 
 
-@app.get("/profiles")
-def list_profiles() -> dict:
-    return {"profiles": _list_profile_names()}
+@app.get("/voices")
+def list_voices() -> dict:
+    """Return every bundled voice-design preset as ``name -> instruct``.
+
+    MoneyPrinterTurbo's WebUI shows the name as the option label; the
+    instruct string stays on the server so callers never need to know how
+    OmniVoice phrases voice descriptions internally.
+    """
+    return {
+        "voices": [
+            {"name": name, "instruct": instruct}
+            for name, instruct in VOICE_PRESETS.items()
+        ]
+    }
 
 
-@app.post("/profiles")
-async def create_profile(
-    profile_name: str = Form(...),
-    file: UploadFile = File(...),
-) -> dict:
-    name = _clean_profile_name(profile_name)
-    if name in _list_profile_names():
-        raise HTTPException(
-            status_code=409, detail=f"voice profile '{name}' already exists"
-        )
-
-    audio_bytes = await file.read()
-    if not audio_bytes:
-        raise HTTPException(status_code=400, detail="uploaded audio is empty")
-
-    ext = os.path.splitext(file.filename or "")[1].lower() or ".wav"
-    tmp_audio = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-            tmp.write(audio_bytes)
-            tmp_audio = tmp.name
-        saved_path = core.create_profile(audio_path=tmp_audio, profile_name=name)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500, detail=f"profile creation failed: {exc}"
-        ) from exc
-    finally:
-        if tmp_audio:
-            try:
-                os.remove(tmp_audio)
-            except OSError:
-                pass
-    return {"profile_name": name, "path": saved_path}
-
-
-@app.post("/tts")
-def generate_audio(request: TtsRequest):
+@app.post("/generate")
+def generate_audio(request: GenerateRequest):
     text = (request.text or "").strip()
-    name = _clean_profile_name(request.profile_name)
     if not text:
         raise HTTPException(status_code=400, detail="text cannot be empty")
+    voice = (request.voice or "").strip().lower()
+    instruct = VOICE_PRESETS.get(voice)
+    if not instruct:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"unknown voice '{voice}'; available: "
+                + ", ".join(sorted(VOICE_PRESETS.keys()))
+            ),
+        )
 
-    filename = f"{uuid.uuid4().hex}.wav"
     try:
         with _tts_lock:
-            out_path = core.generate_audio(
-                text=text,
-                profile_name=name,
-                output_filename=filename,
-            )
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+            model = _load_model()
+            generate_kwargs = {"text": text, "instruct": instruct}
+            if request.speed is not None and request.speed > 0:
+                generate_kwargs["speed"] = float(request.speed)
+            waveforms = model.generate(**generate_kwargs)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(
             status_code=500, detail=f"audio generation failed: {exc}"
         ) from exc
-    return FileResponse(out_path, media_type="audio/wav", filename=filename)
+
+    # OmniVoice returns one or more waveform tensors at the model's native
+    # 24 kHz. Persist them as a temporary WAV the response can stream, then
+    # clean up. Sampling rate is fixed by the model and not user-tunable.
+    filename = f"{uuid.uuid4().hex}.wav"
+    out_path = os.path.join("/tmp", filename)
+    try:
+        import torch
+        import soundfile as sf
+
+        wav = waveforms[0]
+        if hasattr(wav, "detach"):
+            wav = wav.detach().cpu().float().numpy()
+        sf.write(out_path, wav, 24000)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"audio write failed: {exc}"
+        ) from exc
+
+    return FileResponse(
+        out_path,
+        media_type="audio/wav",
+        filename=filename,
+        background=None,
+    )
+
+
+# faster-whisper's CTranslate2 backend has no Metal support (cpu and cuda
+# only), so on Apple Silicon the only way to put whisper on the GPU is MLX.
+# MoneyPrinterTurbo posts audio here instead of transcribing in-container;
+# app/services/subtitle.py falls back to its own faster-whisper when this
+# endpoint is unreachable or unavailable.
+MLX_WHISPER_REPO = os.environ.get(
+    "MLX_WHISPER_REPO", "mlx-community/whisper-large-v3-mlx"
+)
+
+
+@app.post("/transcribe")
+async def transcribe(request: Request, word_timestamps: bool = True):
+    try:
+        import mlx_whisper
+    except ImportError as exc:  # non-Mac host, or mlx not installed
+        raise HTTPException(
+            status_code=503, detail=f"mlx_whisper unavailable: {exc}"
+        ) from exc
+
+    audio = await request.body()
+    if not audio:
+        raise HTTPException(status_code=400, detail="empty audio body")
+
+    # mlx_whisper decodes via ffmpeg, which needs a real file on disk.
+    tmp_path = os.path.join("/tmp", f"{uuid.uuid4().hex}.audio")
+    try:
+        with open(tmp_path, "wb") as fh:
+            fh.write(audio)
+        with _whisper_lock:
+            result = mlx_whisper.transcribe(
+                tmp_path,
+                path_or_hf_repo=MLX_WHISPER_REPO,
+                word_timestamps=word_timestamps,
+            )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"transcription failed: {exc}"
+        ) from exc
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    # Mirror the faster-whisper shape the caller already knows how to walk.
+    # Timestamps come back as numpy floats, so cast for JSON serialization.
+    segments = [
+        {
+            "text": seg.get("text", ""),
+            "start": float(seg.get("start", 0.0)),
+            "end": float(seg.get("end", 0.0)),
+            "words": [
+                {
+                    "word": w.get("word", ""),
+                    "start": float(w.get("start", 0.0)),
+                    "end": float(w.get("end", 0.0)),
+                }
+                for w in (seg.get("words") or [])
+            ],
+        }
+        for seg in result.get("segments", [])
+    ]
+    return {
+        "language": result.get("language", ""),
+        "language_probability": 1.0,
+        "segments": segments,
+    }
 
 
 def main() -> None:

@@ -412,8 +412,10 @@ subtitle_provider = "edge"
 # Leave unset to follow the app default (libx264). Hardware encoders are optional;
 # unsupported encoders automatically fall back to libx264.
 # Available values: "libx264", "h264_nvenc", "h264_amf", "h264_qsv",
-# "h264_mf", "h264_videotoolbox".
-# video_codec = "libx264"
+# "h264_mf", "h264_videotoolbox", or "auto" to pick the first available
+# hardware encoder for the current platform (videotoolbox on macOS, nvenc on
+# Linux/Windows NVIDIA, qsv on Intel iGPU, amf on AMD).
+# video_codec = "auto"
 
 # -----------------------------------------------------------------------------
 # Storage and Task Runtime / 存储与任务运行

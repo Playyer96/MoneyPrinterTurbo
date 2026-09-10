@@ -100,10 +100,26 @@ Before you finish:
 - Don't refactor unrelated code in the same edit — keep the diff to the
   smallest working change.
 
-## 3. Per-tool setup
+## 3. Always use project skills
 
-Most modern AI coding tools read this file automatically. A few don't —
-they need a one-time manual setup.
+When a relevant skill exists — anything under `.claude/skills/` in this
+repo, or any skill listed in your environment's available-skills list —
+invoke it through the Skill tool instead of re-implementing the
+behavior in your own code or instructions.
+
+Skills encode the project's preferred workflow for a recurring task
+(translation, schema migration, code review, deploy, etc.). Re-doing
+the same work inline drifts from the documented process and breaks
+the audits those skills exist to support.
+
+- Check the available-skills list at the start of any non-trivial task.
+- When a skill directly matches the task, call `Skill` with that skill's
+  exact name as the first parameter.
+- Do not invent a new helper that duplicates what an existing skill does.
+- If you think a skill is missing for a workflow you keep repeating,
+  propose adding one rather than improvising.
+
+## 4. Per-tool setup
 
 ### Auto-reads `AGENTS.md` (no setup needed)
 

@@ -26,7 +26,7 @@ resources_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "resour
 
 
 class _FakeMoviePyClip:
-    """为最终混音单测提供最小 MoviePy 接口，避免 CI 真实编码大型视频。"""
+    """Minimal MoviePy surface for the final mix-down unit test, so CI does not encode real large videos."""
 
     def __init__(self, *, duration=5, fps=44100):
         self.duration = duration
@@ -65,10 +65,12 @@ class TestVideoService(unittest.TestCase):
 
     def test_subtitle_spring_animation_keeps_color_and_mask_aligned(self):
         """
-        弹跳动画必须同步缩放颜色帧和透明蒙版。
+        The bounce animation must scale the color frame and the alpha mask in lock-step.
 
-        旧实现只缩放颜色帧，首帧仍使用原尺寸蒙版，合成后会短暂出现黑色
-        文字轮廓。使用纯白画面和完整蒙版可以精确比较二者的有效像素区域。
+        The old implementation only scaled the color frame, so the first frame still
+        used the original mask size and briefly showed a black text outline after
+        compositing. With a pure-white frame and a full mask we can compare the two
+        regions pixel-for-pixel.
         """
         color_frame = vd.np.full((20, 30, 3), 255, dtype=vd.np.uint8)
         mask_frame = vd.np.ones((20, 30), dtype=float)
@@ -85,7 +87,7 @@ class TestVideoService(unittest.TestCase):
             vd.np.testing.assert_array_equal(initial_color, initial_mask)
             self.assertLess(initial_color.sum(), color_frame.shape[0] * color_frame.shape[1])
 
-            # 动画结束后必须精确恢复原始尺寸，避免长字幕持续模糊或缩放。
+            # after the animation ends the frame must return to its original size, otherwise long subtitles stay blurry or scaled
             settled_color = animated.get_frame(
                 vd._SUBTITLE_SPRING_DURATION_SECONDS
             )
@@ -99,7 +101,7 @@ class TestVideoService(unittest.TestCase):
             vd.close_clip(clip)
 
     def test_subtitle_spring_scale_handles_time_boundaries(self):
-        """零时长、负时间和动画结束点都不能产生除零或非法缩放比例。"""
+        """Zero duration, negative time, and the animation end-point must not produce divide-by-zero or invalid scale factors."""
         duration = vd._SUBTITLE_SPRING_DURATION_SECONDS
 
         self.assertEqual(vd._get_subtitle_spring_scale(0, duration), 0.05)
@@ -108,7 +110,7 @@ class TestVideoService(unittest.TestCase):
         self.assertEqual(vd._get_subtitle_spring_scale(1, 0), 1.0)
 
     def test_scale_subtitle_frame_rejects_unsupported_shapes(self):
-        """异常通道或维度应明确失败，避免把损坏帧继续交给视频编码器。"""
+        """Unsupported channels or dimensions must fail clearly, so damaged frames are not passed on to the video encoder."""
         with self.assertRaisesRegex(ValueError, "2D mask or 3D color"):
             vd._scale_subtitle_frame_on_canvas(vd.np.zeros((8,)), 0.5)
         with self.assertRaisesRegex(ValueError, "RGB or RGBA"):
@@ -525,6 +527,26 @@ class TestVideoService(unittest.TestCase):
         config.app["video_codec"] = "h264_nvenc"
 
         with patch.object(vd, "_ffmpeg_encoder_exists", return_value=False):
+            self.assertEqual(vd._get_effective_video_codec(), "libx264")
+
+    def test_get_effective_video_codec_auto_picks_platform_priority(self):
+        """
+        `video_codec = "auto"` must probe ffmpeg via the platform priority list
+        and return the first encoder the ffmpeg build actually exposes; when
+        none are available, it must fall back to libx264.
+        """
+        config.app["video_codec"] = "auto"
+
+        with patch.object(
+            vd,
+            "_detect_hardware_codec",
+            return_value="h264_videotoolbox",
+        ):
+            self.assertEqual(
+                vd._get_effective_video_codec(), "h264_videotoolbox"
+            )
+
+        with patch.object(vd, "_detect_hardware_codec", return_value=None):
             self.assertEqual(vd._get_effective_video_codec(), "libx264")
 
     def test_get_configured_video_codec_uses_stable_default_when_unset(self):

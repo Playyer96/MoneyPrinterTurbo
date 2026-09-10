@@ -9,6 +9,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -329,19 +330,92 @@ def get_voicestudio_base_url() -> str:
     return str(configured or VOICESTUDIO_DEFAULT_BASE_URL).strip().rstrip("/")
 
 
-def get_voicestudio_voices() -> list[str]:
-    """Read voice profiles from the local VoiceStudio server.
+def ensure_voicestudio_server_running(timeout: float = 2.0) -> bool:
+    """
+    Spawn the bundled VoiceStudio server when the configured port is dead.
 
-    Each profile is returned as ``voicestudio:<profile_name>`` so it can be
-    selected in the WebUI and dispatched by :func:`_single_tts`.
+    Idempotent: probes ``GET /voices`` first, only launches when unreachable,
+    so the WebUI's hot-reload and any externally-managed server (Docker, a
+    separate terminal) stay unaffected. Returns True when a usable server is
+    reachable at the end of the call, False otherwise — never raises, so
+    importing this module never breaks startup.
     """
     base_url = get_voicestudio_base_url()
     try:
-        response = requests.get(f"{base_url}/profiles", timeout=5)
+        response = requests.get(f"{base_url}/voices", timeout=timeout)
+        if response.status_code == 200:
+            return True
+    except Exception:
+        pass
+
+    server_script = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "vendor",
+        "voice_studio",
+        "server.py",
+    )
+    if not os.path.isfile(server_script):
+        logger.warning(
+            f"voicestudio server script missing at {server_script}; "
+            "start it manually before generating previews"
+        )
+        return False
+
+    logger.info(f"voicestudio not reachable at {base_url}; launching bundled server")
+    try:
+        kwargs = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "stdin": subprocess.DEVNULL,
+        }
+        if sys.platform != "win32":
+            kwargs["start_new_session"] = True
+        else:
+            kwargs["creationflags"] = getattr(
+                subprocess, "DETACHED_PROCESS", 0x00000008
+            )
+        subprocess.Popen([sys.executable, server_script], **kwargs)
+    except Exception as exc:
+        logger.warning(f"failed to spawn voicestudio server: {exc}")
+        return False
+
+    # give the server a moment to bind; do not block startup forever.
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(f"{base_url}/voices", timeout=1.0)
+            if response.status_code == 200:
+                logger.success(f"voicestudio server is up at {base_url}")
+                return True
+        except Exception:
+            time.sleep(0.5)
+    logger.warning(
+        f"voicestudio server did not respond within 15s at {base_url}; "
+        "check the server logs and try again"
+    )
+    return False
+
+
+def get_voicestudio_voices() -> list[str]:
+    """Read bundled voice-design presets from the local OmniVoice server.
+
+    Each preset is returned as ``voicestudio:<preset_name>`` so it can be
+    selected in the WebUI and dispatched by :func:`_single_tts`. The
+    matching ``instruct`` string is resolved server-side; callers only
+    see stable preset names.
+    """
+    base_url = get_voicestudio_base_url()
+    try:
+        response = requests.get(f"{base_url}/voices", timeout=5)
         if response.status_code == 200:
             data = response.json()
-            profiles = data.get("profiles", []) if isinstance(data, dict) else []
-            return [f"voicestudio:{name}" for name in profiles if name]
+            voices = data.get("voices", []) if isinstance(data, dict) else []
+            names = [
+                entry.get("name")
+                for entry in voices
+                if isinstance(entry, dict) and entry.get("name")
+            ]
+            return [f"voicestudio:{name}" for name in names]
         logger.warning(
             f"voicestudio voices request failed with status {response.status_code}"
         )
@@ -354,35 +428,18 @@ def get_voicestudio_voices() -> list[str]:
 def create_voicestudio_profile(
     profile_name: str, audio_bytes: bytes, original_filename: str
 ) -> tuple[bool, str]:
-    """Create a new VoiceStudio voice profile from an uploaded audio sample.
+    """Backwards-compat stub kept for the WebUI import surface.
 
-    Returns ``(ok, message)``; ``message`` is a non-sensitive status text.
+    The voice-design bridge no longer creates per-voice profile files; users
+    pick one of the bundled voice presets. Keep the symbol so the WebUI
+    module keeps importing; downstream code paths treat the failure return
+    the same way as a server outage.
     """
-    name = (profile_name or "").strip()
-    if not name:
-        return False, "profile name cannot be empty"
-    if not audio_bytes:
-        return False, "uploaded audio is empty"
-
-    base_url = get_voicestudio_base_url()
-    files = {"file": (os.path.basename(original_filename or "voice.wav"), audio_bytes)}
-    try:
-        response = requests.post(
-            f"{base_url}/profiles", data={"profile_name": name}, files=files, timeout=600
-        )
-    except Exception as e:
-        logger.warning(f"voicestudio profile creation unavailable ({type(e).__name__})")
-        return False, "voice studio server unavailable"
-    if response.status_code == 409:
-        return False, "profile already exists"
-    if response.status_code != 200:
-        logger.error(
-            f"voicestudio profile creation failed with status "
-            f"{response.status_code}: {response.text[:200]}"
-        )
-        return False, "profile creation failed"
-    logger.success(f"voicestudio profile created: {name}")
-    return True, f"profile created: {name}"
+    _ = (profile_name, audio_bytes, original_filename)
+    return False, (
+        "voice profile cloning is not available in this build; pick one of "
+        "the bundled voice presets instead"
+    )
 
 
 _AZURE_VOICES_DATA_FILE = os.path.join(
@@ -766,7 +823,8 @@ def _single_tts(
             reference_id = None
         return fish_audio_tts(text, voice_file, voice_rate, voice_volume, reference_id=reference_id)
     elif is_voicestudio_voice(voice_name):
-        # 格式: voicestudio:<profile_name>
+        # Format: voicestudio:<preset_name>; the bridge resolves the matching
+        # instruct string server-side.
         parts = voice_name.split(":", 1)
         if len(parts) >= 2 and parts[1].strip():
             return voicestudio_tts(
@@ -2698,24 +2756,25 @@ def fish_audio_tts(
 
 def voicestudio_tts(
     text: str,
-    profile_name: str,
+    voice_preset: str,
     voice_file: str,
     voice_rate: float = 1.0,
     voice_volume: float = 1.0,
 ) -> Union[SubMaker, None]:
-    """Synthesize speech with the self-hosted VoiceStudio server.
+    """Synthesize speech with the self-hosted OmniVoice bridge.
 
-    VoiceStudio is a headless OmniVoice-based voice-cloning TTS service (kept
-    under ``vendor/voice_studio``).  ``profile_name`` selects one of the cloned
-    voice profiles (e.g. "goku").  The server is started separately with
-    ``python server.py`` and defaults to ``http://127.0.0.1:8780``, overridable
-    via ``[voicestudio] base_url`` in the config file.
+    The bridge is a headless FastAPI service (kept under ``vendor/voice_studio``)
+    that wraps the OmniVoice ``k2-fsa/OmniVoice`` model. ``voice_preset``
+    selects one of the bundled voice-design presets (e.g. "narrator", "casual",
+    "news_anchor", "energetic"); the matching ``instruct`` string is resolved
+    on the server side. The server defaults to ``http://127.0.0.1:8780`` and
+    is overridable via the ``[voicestudio] base_url`` config key.
 
-    ``voice_rate``/``voice_volume`` are applied afterwards by the caller
-    (MoviePy), because OmniVoice exposes no native prosody control.  The
-    endpoint returns raw WAV audio with no word-level timestamps, so subtitles
-    fall back to the full-text SubMaker; set ``subtitle_provider = "whisper"``
-    for tighter sync.
+    ``voice_rate`` is forwarded to OmniVoice as ``speed`` when set; volume is
+    applied afterwards by MoviePy because OmniVoice exposes no native gain
+    control. The endpoint returns raw WAV audio with no word-level timestamps,
+    so subtitles fall back to the full-text SubMaker; set
+    ``subtitle_provider = "whisper"`` for tighter sync.
     """
     text = (text or "").strip()
     if not text:
@@ -2727,19 +2786,23 @@ def voicestudio_tts(
         return None
     base_url = get_voicestudio_base_url()
 
-    payload = {"text": text, "profile_name": profile_name}
+    payload = {"text": text, "voice": voice_preset}
+    # OmniVoice's `speed` argument is what the upstream library documents as
+    # the playback-speed knob. Only forward it when the caller actually asked
+    # for a non-default value so the server keeps its 1.0 baseline otherwise.
+    if voice_rate not in (None, 1.0) and float(voice_rate) > 0:
+        payload["speed"] = float(voice_rate)
     for i in range(3):
         try:
-            logger.info(f"start voicestudio tts, profile: {profile_name}, try: {i + 1}")
+            logger.info(
+                f"start voicestudio tts, voice preset: {voice_preset}, try: {i + 1}"
+            )
             ensure_file_path_exists(voice_file)
             # 首次合成会下载并加载 OmniVoice 权重（几 GB），允许长时间等待。
-            response = requests.post(f"{base_url}/tts", json=payload, timeout=1800)
+            response = requests.post(f"{base_url}/generate", json=payload, timeout=1800)
             if response.status_code == 404:
-                logger.error(f"VoiceStudio voice profile not found: {profile_name}")
+                logger.error(f"VoiceStudio voice preset not found: {voice_preset}")
                 return None
-            if response.status_code == 409:
-                logger.error("VoiceStudio TTS rejected the request (409)")
-                continue
             if response.status_code != 200:
                 logger.error(
                     f"voicestudio tts failed with status "

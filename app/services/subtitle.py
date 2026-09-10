@@ -1,7 +1,10 @@
 import json
 import os.path
 import re
+from types import SimpleNamespace
 from timeit import default_timer as timer
+
+import requests
 
 try:
     from faster_whisper import WhisperModel
@@ -19,8 +22,65 @@ initial_prompt = config.whisper.get("initial_prompt", "") or None
 model = None
 
 
+def _remote_transcribe(audio_file: str):
+    """Transcribe on the host-side GPU server, or return None to fall back.
+
+    faster-whisper's CTranslate2 backend is cpu/cuda only, so inside a Linux
+    container on a Mac whisper can never leave the CPU. The VoiceStudio server
+    already runs natively on the host for the same reason (see voicestudio.sh);
+    it exposes /transcribe backed by MLX, which does run on Metal. Any failure
+    here -- server down, no mlx, non-Mac host -- returns None so the caller
+    loads faster-whisper locally exactly as before.
+    """
+    from app.services import voice
+
+    base_url = voice.get_voicestudio_base_url()
+    try:
+        with open(audio_file, "rb") as fh:
+            response = requests.post(
+                f"{base_url}/transcribe",
+                data=fh.read(),
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=600,
+            )
+    except Exception as e:
+        logger.info(f"remote whisper unavailable ({type(e).__name__}), using local model")
+        return None
+
+    if response.status_code != 200:
+        logger.info(
+            f"remote whisper returned status {response.status_code}, using local model"
+        )
+        return None
+
+    payload = response.json()
+    # Rebuild the attribute-access shape faster-whisper returns so the
+    # segment-walking code below stays identical for both backends.
+    segments = [
+        SimpleNamespace(
+            text=seg["text"],
+            start=seg["start"],
+            end=seg["end"],
+            words=[SimpleNamespace(**w) for w in seg["words"]],
+        )
+        for seg in payload["segments"]
+    ]
+    info = SimpleNamespace(
+        language=payload["language"],
+        language_probability=payload["language_probability"],
+    )
+    logger.info(f"transcribed on remote GPU whisper at {base_url}")
+    return segments, info
+
+
 def create(audio_file, subtitle_file: str = "", word_level: bool = False):
     global model
+
+    remote = _remote_transcribe(audio_file)
+    if remote is not None:
+        segments, info = remote
+        return _write_subtitle(segments, info, audio_file, subtitle_file, word_level)
+
     if WhisperModel is None:
         logger.warning("faster_whisper not available, skipping whisper subtitle generation")
         return ""
@@ -48,10 +108,6 @@ def create(audio_file, subtitle_file: str = "", word_level: bool = False):
             )
             return None
 
-    logger.info(f"start, output file: {subtitle_file}")
-    if not subtitle_file:
-        subtitle_file = f"{audio_file}.srt"
-
     segments, info = model.transcribe(
         audio_file,
         beam_size=5,
@@ -60,6 +116,14 @@ def create(audio_file, subtitle_file: str = "", word_level: bool = False):
         vad_parameters=dict(min_silence_duration_ms=500),
         **({"initial_prompt": initial_prompt} if initial_prompt else {}),
     )
+    return _write_subtitle(segments, info, audio_file, subtitle_file, word_level)
+
+
+def _write_subtitle(segments, info, audio_file, subtitle_file, word_level):
+    """Turn transcribed segments into an SRT file. Backend-agnostic."""
+    logger.info(f"start, output file: {subtitle_file}")
+    if not subtitle_file:
+        subtitle_file = f"{audio_file}.srt"
 
     logger.info(
         f"detected language: '{info.language}', probability: {info.language_probability:.2f}"

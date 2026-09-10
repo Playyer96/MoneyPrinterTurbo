@@ -1,36 +1,23 @@
-# OmniVoice Docker Ignore
+# VoiceStudio local state and dev artifacts. The image only needs the
+# Python source; voice profiles and generated audio are produced at runtime
+# and persisted via the named volumes declared in docker-compose.yml.
 
-# Virtual environments
+# Generated artifacts — recreated per-container, kept off the image.
+output/
+voice_profiles/*.pt
+voice_profiles/*.mp3
+voice_profiles/*.wav
+voice_inputs/
+
+# Local Python venv and caches; requirements.txt covers deps.
 .venv/
-venv/
-env/
-
-# Node modules
-node_modules/
-bun.lockb
-.turbo/
-
-# Python caches
 __pycache__/
-*.py[cod]
-*$py.class
+*.pyc
+*.pyo
 .pytest_cache/
 .ruff_cache/
-.mypy_cache/
 
-# Databases and user data 
-# We don't want to copy existing local data into the image layout!
-*.db
-*.sqlite
-*.sqlite3
-omnivoice_data/
-frontend/dist/
-
-# Git internals
-.git/
-.github/
-
-# IDE files
-.DS_Store
+# Editor / OS noise.
 .vscode/
 .idea/
+.DS_Store

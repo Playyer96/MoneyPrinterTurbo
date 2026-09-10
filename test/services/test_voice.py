@@ -1588,12 +1588,18 @@ class TestVoiceStudioVoice(unittest.TestCase):
             with patch.object(vs.config, "voicestudio", {"base_url": "http://localhost:9999/"}):
                 self.assertEqual(vs.get_voicestudio_base_url(), "http://localhost:9999")
 
-    def test_get_voicestudio_voices_reads_server_profiles(self):
+    def test_get_voicestudio_voices_reads_server_presets(self):
         class _FakeResponse:
             status_code = 200
 
             def json(self):
-                return {"profiles": ["cr7_profile", "goku", "homero"]}
+                return {
+                    "voices": [
+                        {"name": "cr7", "instruct": "confident male athlete"},
+                        {"name": "goku", "instruct": "young male anime hero"},
+                        {"name": "narrator", "instruct": "warm narrator"},
+                    ]
+                }
 
         with (
             patch.dict(os.environ, {"VOICESTUDIO_BASE_URL": ""}),
@@ -1602,10 +1608,10 @@ class TestVoiceStudioVoice(unittest.TestCase):
         ):
             result = vs.get_voicestudio_voices()
 
-        mock_get.assert_called_once_with("http://localhost:9999/profiles", timeout=5)
+        mock_get.assert_called_once_with("http://localhost:9999/voices", timeout=5)
         self.assertEqual(
             result,
-            ["voicestudio:cr7_profile", "voicestudio:goku", "voicestudio:homero"],
+            ["voicestudio:cr7", "voicestudio:goku", "voicestudio:narrator"],
         )
 
     def test_get_voicestudio_voices_offline_returns_empty(self):
@@ -1655,21 +1661,21 @@ class TestVoiceStudioVoice(unittest.TestCase):
             voice_file = str(Path(tmp_dir) / "vaudio.wav")
             sub_maker = vs.voicestudio_tts(
                 text="Hello world. Second sentence.",
-                profile_name="goku",
+                voice_preset="narrator",
                 voice_file=voice_file,
             )
             generated_audio = Path(voice_file).read_bytes()
 
         post.assert_called_once_with(
-            "http://localhost:8780/tts",
-            json={"text": "Hello world. Second sentence.", "profile_name": "goku"},
+            "http://localhost:8780/generate",
+            json={"text": "Hello world. Second sentence.", "voice": "narrator"},
             timeout=1800,
         )
         self.assertEqual(generated_audio, b"S" * 200)
         self.assertIsNotNone(sub_maker)
         self.assertTrue(getattr(sub_maker, "subs", []))
 
-    def test_voicestudio_tts_profile_not_found_returns_none(self):
+    def test_voicestudio_tts_preset_not_found_returns_none(self):
         class _FakeResponse:
             status_code = 404
             text = "not found"
@@ -1683,7 +1689,7 @@ class TestVoiceStudioVoice(unittest.TestCase):
                 patch.object(vs, "AudioFileClip"),
             ):
                 result = vs.voicestudio_tts(
-                    text="hello", profile_name="missing", voice_file=out
+                    text="hello", voice_preset="missing", voice_file=out
                 )
         finally:
             if os.path.exists(out):
@@ -1695,7 +1701,7 @@ class TestVoiceStudioVoice(unittest.TestCase):
             vs.requests, "post"
         ) as post:
             result = vs.voicestudio_tts(
-                text="   ", profile_name="goku", voice_file="unused.wav"
+                text="   ", voice_preset="narrator", voice_file="unused.wav"
             )
         self.assertIsNone(result)
         post.assert_not_called()
@@ -1705,7 +1711,7 @@ class TestVoiceStudioVoice(unittest.TestCase):
             vs.config, "voicestudio", {"base_url": "http://localhost:8780"}
         ), patch.object(vs.requests, "post") as post:
             result = vs.voicestudio_tts(
-                text="---", profile_name="goku", voice_file="unused.wav"
+                text="---", voice_preset="narrator", voice_file="unused.wav"
             )
         self.assertIsNone(result)
         post.assert_not_called()
@@ -1714,11 +1720,11 @@ class TestVoiceStudioVoice(unittest.TestCase):
         sentinel = object()
         with patch.object(vs, "voicestudio_tts", return_value=sentinel) as mock_tts:
             result = vs._single_tts(
-                text="hello", voice_name="voicestudio:goku", voice_rate=1.0, voice_file="out.wav"
+                text="hello", voice_name="voicestudio:cr7", voice_rate=1.0, voice_file="out.wav"
             )
         self.assertIs(result, sentinel)
         mock_tts.assert_called_once_with(
-            "hello", "goku", "out.wav", 1.0, 1.0
+            "hello", "cr7", "out.wav", 1.0, 1.0
         )
 
     def test_voicestudio_dispatch_rejects_malformed_voice_name(self):
@@ -1729,69 +1735,44 @@ class TestVoiceStudioVoice(unittest.TestCase):
         self.assertIsNone(result)
         mock_tts.assert_not_called()
 
-    def test_create_voicestudio_profile_success(self):
-        class _FakeResponse:
-            status_code = 200
-            text = ""
-
-        captured = {}
-
-        def _fake_post(url, data=None, files=None, timeout=None):
-            captured["url"] = url
-            captured["data"] = data
-            captured["files"] = files
-            return _FakeResponse()
-
-        with patch.dict(
-            os.environ, {"VOICESTUDIO_BASE_URL": ""}
-        ), patch.object(
-            vs.config, "voicestudio", {"base_url": "http://localhost:8780/"}
-        ), patch.object(vs.requests, "post", side_effect=_fake_post) as post:
+    def test_create_voicestudio_profile_returns_unsupported(self):
+        """Profile cloning was removed when the bridge moved to bundled
+        voice-design presets. The function is kept as a stable import so
+        the WebUI module still loads, but callers must see a clear failure.
+        """
+        with patch.object(vs.requests, "post") as post:
             ok, message = vs.create_voicestudio_profile(
-                profile_name="newvo",
+                profile_name="anything",
                 audio_bytes=b"RIFF-audio",
                 original_filename="sample.wav",
             )
-        self.assertTrue(ok)
-        self.assertIn("newvo", message)
-        post.assert_called_once()
-        self.assertEqual(captured["url"], "http://localhost:8780/profiles")
-        self.assertEqual(captured["data"], {"profile_name": "newvo"})
-        self.assertIn("file", captured["files"])
+        self.assertFalse(ok)
+        self.assertIn("not available", message)
+        post.assert_not_called()
 
     def test_create_voicestudio_profile_conflict_returns_failure(self):
-        class _FakeResponse:
-            status_code = 409
-            text = "already exists"
-
-        with patch.object(
-            vs.config, "voicestudio", {"base_url": "http://localhost:8780"}
-        ), patch.object(vs.requests, "post", return_value=_FakeResponse()):
+        """Profile cloning is gone; the stub returns the same unsupported
+        message regardless of input so callers see a single, stable failure.
+        """
+        with patch.object(vs.requests, "post") as post:
             ok, message = vs.create_voicestudio_profile(
                 profile_name="goku",
                 audio_bytes=b"RIFF-audio",
                 original_filename="sample.wav",
             )
         self.assertFalse(ok)
-        self.assertEqual(message, "profile already exists")
+        self.assertIn("not available", message)
+        post.assert_not_called()
 
     def test_create_voicestudio_profile_offline_returns_failure(self):
-        import requests as req_lib
-
-        with patch.object(
-            vs.config, "voicestudio", {"base_url": "http://localhost:8780"}
-        ), patch.object(
-            vs.requests,
-            "post",
-            side_effect=req_lib.exceptions.ConnectionError("down"),
-        ):
+        with patch.object(vs.requests, "post") as post:
             ok, message = vs.create_voicestudio_profile(
                 profile_name="x",
                 audio_bytes=b"RIFF-audio",
                 original_filename="sample.wav",
             )
         self.assertFalse(ok)
-        self.assertEqual(message, "voice studio server unavailable")
+        post.assert_not_called()
 
     def test_create_voicestudio_profile_empty_input_is_rejected(self):
         ok, message = vs.create_voicestudio_profile(

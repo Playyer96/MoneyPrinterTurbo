@@ -1,29 +1,105 @@
 x-common-volumes: &common-volumes
   - ./:/MoneyPrinterTurbo
 
+# MoneyPrinterTurbo runs in Docker; the OmniVoice TTS server runs natively on
+# the host. That is deliberate: a Linux container never sees Apple Metal
+# (torch's MPS backend does not exist in linux wheels), so a containerised
+# VoiceStudio is CPU-only on every Mac. Running it on the host lets server.py
+# pick cuda -> mps -> cpu and actually land on the GPU, on Macs and NVIDIA
+# boxes alike.
+#
+#   ./mpt.sh up                 # GPU server + containers (./mpt.sh down stops both)
+#   ./mpt.sh status             # what is running
+#
+# The containerised CPU fallback is still here behind a profile:
+#   docker compose --profile container-tts up -d
+networks:
+  mpt-net:
+    driver: bridge
+
+# Named volumes keep voice profiles + generated audio across container
+# restarts and re-creates, and stop the bind-mounted MoneyPrinterTurbo
+# source dir from accumulating voice_studio state inside the repo.
+# Only used by the container-tts profile.
+volumes:
+  voicestudio_models:
+  voicestudio_profiles:
+  voicestudio_output:
+
+x-voicestudio-env: &voicestudio-env
+  # Default to the host-native server, which is the only way to reach a GPU
+  # on macOS. Override to "http://voicestudio:8780" when running the
+  # container-tts profile instead.
+  VOICESTUDIO_BASE_URL: "${VOICESTUDIO_BASE_URL:-http://host.docker.internal:8780}"
+
+# host-gateway resolves host.docker.internal on plain Linux too, where Docker
+# Desktop's automatic mapping does not exist.
+x-host-gateway: &host-gateway
+  - "host.docker.internal:host-gateway"
+
 services:
+  voicestudio:
+    # CPU-only fallback for hosts that cannot run the server natively.
+    # Not started by default -- see the profile note at the top of this file.
+    profiles: ["container-tts"]
+    build:
+      context: ./vendor/voice_studio
+      dockerfile: Dockerfile
+    image: voicestudio:latest
+    container_name: "moneyprinterturbo-voicestudio"
+    networks:
+      - mpt-net
+    environment:
+      # server.py reads these; matches the defaults in the Dockerfile.
+      VOICESTUDIO_HOST: "0.0.0.0"
+      VOICESTUDIO_PORT: "8780"
+      HF_HOME: "/voicestudio/models"
+      HF_HUB_DISABLE_XET: "1"
+    ports:
+      # Host-side port mapping is optional; mainly for ad-hoc curl from the
+      # host. Inter-container traffic goes over the mpt-net bridge and never
+      # touches this mapping.
+      - "127.0.0.1:8780:8780"
+    volumes:
+      - voicestudio_models:/voicestudio/models
+      - voicestudio_profiles:/voicestudio/voice_profiles
+      - voicestudio_output:/voicestudio/output
+    restart: unless-stopped
+    # VoiceStudio loads a ~5GB OmniVoice stack on first request. Give the
+    # container enough memory headroom; bump up if OOMs on a small host.
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+
   webui:
     build:
       context: .
       dockerfile: Dockerfile
+    image: moneyprinterturbo:latest
     container_name: "moneyprinterturbo-webui"
-    environment:
-      # VoiceStudio runs on the Windows host; reach it from Docker via host.docker.internal.
-      VOICESTUDIO_BASE_URL: "http://host.docker.internal:8780"
+    environment: *voicestudio-env
+    extra_hosts: *host-gateway
+    networks:
+      - mpt-net
     ports:
       - "127.0.0.1:8501:8501"
     command: [ "streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=127.0.0.1", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False" ]
     volumes: *common-volumes
-    restart: always
+    restart: unless-stopped
+
   api:
     build:
       context: .
       dockerfile: Dockerfile
+    image: moneyprinterturbo:latest
     container_name: "moneyprinterturbo-api"
-    environment:
-      VOICESTUDIO_BASE_URL: "http://host.docker.internal:8780"
+    environment: *voicestudio-env
+    extra_hosts: *host-gateway
+    networks:
+      - mpt-net
     ports:
       - "127.0.0.1:8080:8080"
     command: [ "python3", "main.py" ]
     volumes: *common-volumes
-    restart: always
+    restart: unless-stopped

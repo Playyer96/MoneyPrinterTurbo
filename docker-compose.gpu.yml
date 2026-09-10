@@ -33,3 +33,20 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+  # The TTS server too, when running the container-tts profile on an NVIDIA
+  # host. Without this the voicestudio container installs CPU-only torch and
+  # stays on the CPU even though the GPU is right there.
+  #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml \
+  #     --profile container-tts up -d
+  voicestudio:
+    build:
+      args:
+        PYTORCH_INDEX_URL: https://download.pytorch.org/whl/cu124
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

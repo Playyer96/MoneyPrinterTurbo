@@ -92,8 +92,28 @@ _SUPPORTED_VIDEO_CODECS = (
     "h264_qsv",
     "h264_mf",
     "h264_videotoolbox",
+    "auto",
 )
 _runtime_disabled_video_codecs = set()
+# 硬件编码器默认不带 preset/quality/bitrate 时，ffmpeg 可能报错或悄悄回退软件编码。
+# 这里给每个硬件编码器补上最小可工作的 ffmpeg 参数；MoviePy 的 write_videofile
+# 会把 ffmpeg_params 透传给最终的 ffmpeg 调用。
+# ponytail: 全局单一参数表，按需扩展；用户自定义 ffmpeg_params 时优先用户传入。
+_HARDWARE_CODEC_FFMPEG_PARAMS = {
+    "h264_nvenc": ["-preset", "p4", "-rc", "vbr", "-b:v", "5M"],
+    "h264_amf": ["-usage", "transcoding", "-quality", "balanced", "-b:v", "5M"],
+    "h264_qsv": ["-preset", "veryfast", "-b:v", "5M"],
+    "h264_mf": ["-b:v", "5M"],
+    "h264_videotoolbox": ["-b:v", "5M"],
+}
+# Auto-detection picks the first codec available in the bundled ffmpeg, ordered
+# by what is most likely to be useful on each platform.
+# ponytail: per-OS priority list; reorder when new hardware backends land.
+_HARDWARE_CODEC_AUTO_PRIORITY = {
+    "darwin": ("h264_videotoolbox", "h264_qsv"),
+    "linux": ("h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox"),
+    "win32": ("h264_nvenc", "h264_qsv", "h264_amf", "h264_mf", "h264_videotoolbox"),
+}
 
 
 def _get_subtitle_spring_scale(time_seconds: float, duration_seconds: float) -> float:
@@ -303,14 +323,27 @@ def _ffmpeg_encoder_exists(ffmpeg_binary: str, codec: str) -> bool:
 
 def _get_effective_video_codec(preferred_codec: str | None = None) -> str:
     """
-    返回本次实际使用的视频编码器。
+    Return the codec actually used for this run.
 
-    用户选择硬件编码器时，先做 FFmpeg encoder 列表检测；如果本进程里已经
-    实际编码失败过，也直接回退，避免一个任务里每个片段都重复失败。
+    When the user picks `auto`, probe ffmpeg for an available hardware encoder
+    based on the current platform. When the user picks a specific hardware
+    codec, validate it against ffmpeg's encoder list and the runtime-disabled
+    set so a single failure does not repeat for every clip in a task.
     """
     selected_codec = preferred_codec or _get_configured_video_codec()
     if selected_codec == _DEFAULT_VIDEO_CODEC:
         return _DEFAULT_VIDEO_CODEC
+
+    if selected_codec == "auto":
+        resolved = _detect_hardware_codec(utils.get_ffmpeg_binary())
+        if resolved is None:
+            logger.info(
+                f"no hardware encoder available on {sys.platform}, "
+                f"fallback to {_DEFAULT_VIDEO_CODEC}"
+            )
+            return _DEFAULT_VIDEO_CODEC
+        logger.info(f"auto-detected hardware codec: {resolved}")
+        return resolved
 
     if selected_codec in _runtime_disabled_video_codecs:
         logger.warning(
@@ -328,6 +361,22 @@ def _get_effective_video_codec(preferred_codec: str | None = None) -> str:
         return _DEFAULT_VIDEO_CODEC
 
     return selected_codec
+
+
+def _detect_hardware_codec(ffmpeg_binary: str) -> str | None:
+    """
+    Probe ffmpeg for an available hardware H.264 encoder.
+
+    Order is platform-specific (videotoolbox on macOS, nvenc first on
+    Linux/Windows) so the most likely useful encoder is preferred. Returns
+    None when no hardware encoder is available, which the caller maps to the
+    software fallback.
+    """
+    priority = _HARDWARE_CODEC_AUTO_PRIORITY.get(sys.platform, ())
+    for codec in priority:
+        if _ffmpeg_encoder_exists(ffmpeg_binary, codec):
+            return codec
+    return None
 
 
 def _disable_runtime_video_codec(codec: str, reason: str):
@@ -365,7 +414,11 @@ def _fallback_write_videofile(clip, output_file: str, failed_codec: str, reason:
     Windows 上 FFmpeg 失败原因比较复杂：可能是显卡/驱动不支持，也可能是输出
     文件被占用、目录权限、杀软拦截等通用 IO 问题。只有 libx264 能成功写出时，
     才能判断原始失败大概率来自硬件编码器本身，避免误伤后续任务。
+
+    回退时丢掉硬件编码器专属的 ffmpeg_params，避免把 -rc/preset 等只对硬件
+    编码器有意义的参数喂给 libx264。
     """
+    kwargs.pop("ffmpeg_params", None)
     clip.write_videofile(output_file, codec=_DEFAULT_VIDEO_CODEC, **kwargs)
     _disable_runtime_video_codec(failed_codec, reason)
     return _DEFAULT_VIDEO_CODEC
@@ -377,8 +430,16 @@ def _write_videofile_with_codec_fallback(clip, output_file: str, codec: str, **k
 
     硬件编码器是否可用不仅取决于 FFmpeg，还取决于显卡、驱动和当前运行环境。
     生成任务不能因为高级编码器不可用而整体失败，所以这里把回退集中处理。
+
+    硬件编码器在缺省调用下可能因为缺少 preset/quality/bitrate 等参数而
+    不可用；这里按 codec 注入最小的可用参数；调用方传入的 ffmpeg_params 优先。
     """
     effective_codec = _get_effective_video_codec(codec)
+    if (
+        effective_codec in _HARDWARE_CODEC_FFMPEG_PARAMS
+        and "ffmpeg_params" not in kwargs
+    ):
+        kwargs["ffmpeg_params"] = _HARDWARE_CODEC_FFMPEG_PARAMS[effective_codec]
     try:
         clip.write_videofile(output_file, codec=effective_codec, **kwargs)
         return effective_codec

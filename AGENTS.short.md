@@ -23,6 +23,9 @@ Working on the MoneyPrinterTurbo Python repo. Apply this rule on every edit:
    regex/SQL/shell/paths/URLs, test fixtures, and base64.
 2. New comments and strings you add must be English.
 3. Scope is touched files only — never run a repo-wide sweep.
+4. Always invoke a matching skill via the Skill tool (anything in
+   `.claude/skills/` or your environment's available-skills list) instead
+   of re-implementing the same workflow inline.
 
 Style: short, declarative, lowercase. Preserve backticks, format
 specifiers, and code references. If a term is ambiguous, gloss it in
