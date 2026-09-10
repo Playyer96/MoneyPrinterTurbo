@@ -65,6 +65,31 @@ VOICE_PRESETS: dict[str, str] = {
 }
 
 
+def _pick_device(torch):
+    """Return (device, dtype) for OmniVoice, refusing a silent CPU fallback.
+
+    ROCm builds of torch expose AMD GPUs through the same torch.cuda API, so
+    that branch covers NVIDIA and AMD alike. mps matches only when this runs
+    natively on a Mac; a Linux container cannot reach Metal, so a containerised
+    Apple host would otherwise land on cpu.
+    """
+    if torch.cuda.is_available():
+        return "cuda", torch.float16
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps", torch.float32
+    # CPU inference is ~15x slower and looks like a hang rather than a failure,
+    # so it is refused instead of silently accepted. On a Mac this fires when
+    # the server is containerised -- the fix is the host server, not CPU.
+    if os.environ.get("VOICESTUDIO_ALLOW_CPU") != "1":
+        raise RuntimeError(
+            "no GPU available to OmniVoice (no cuda/rocm, no mps). "
+            "On Apple Silicon, run the host server: `make mac-setup`, and "
+            "bring the stack up with docker-compose.mac.yml. "
+            "Set VOICESTUDIO_ALLOW_CPU=1 to accept CPU inference."
+        )
+    return "cpu", torch.float32
+
+
 def _load_model():
     """Lazy-load the OmniVoice model on first use; serializes concurrent loads."""
     global _model
@@ -76,16 +101,7 @@ def _load_model():
         import torch
         from omnivoice.models.omnivoice import OmniVoice
 
-        # ROCm builds of torch expose AMD GPUs through the same torch.cuda
-        # API, so this branch covers NVIDIA and AMD alike. mps matches only
-        # when this runs natively on a Mac; a Linux container cannot reach
-        # Metal, so a containerised Apple host lands on cpu.
-        if torch.cuda.is_available():
-            device, dtype = "cuda", torch.float16
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device, dtype = "mps", torch.float32
-        else:
-            device, dtype = "cpu", torch.float32
+        device, dtype = _pick_device(torch)
 
         model_id = os.environ.get("OMNIVOICE_MODEL_ID", "k2-fsa/OmniVoice")
         # uvicorn.error is the logger uvicorn actually configures, so this

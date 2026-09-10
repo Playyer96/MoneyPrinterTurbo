@@ -30,7 +30,7 @@ def _remote_transcribe(audio_file: str):
 
     faster-whisper's CTranslate2 backend is cpu/cuda only, so inside a Linux
     container on a Mac whisper can never leave the CPU. The VoiceStudio server
-    already runs natively on the host for the same reason (see voicestudio.sh);
+    already runs natively on the host for the same reason (see `make mac-setup`);
     it exposes /transcribe backed by MLX, which does run on Metal. Any failure
     here -- server down, no mlx, non-Mac host -- returns None so the caller
     loads faster-whisper locally exactly as before.
@@ -47,12 +47,16 @@ def _remote_transcribe(audio_file: str):
                 timeout=600,
             )
     except Exception as e:
-        logger.info(f"remote whisper unavailable ({type(e).__name__}), using local model")
+        logger.warning(
+            f"remote whisper unavailable ({type(e).__name__}), falling back to the "
+            f"local model at {base_url} -- on a Mac this means CPU transcription"
+        )
         return None
 
     if response.status_code != 200:
-        logger.info(
-            f"remote whisper returned status {response.status_code}, using local model"
+        logger.warning(
+            f"remote whisper returned status {response.status_code}, falling back to "
+            f"the local model -- on a Mac this means CPU transcription"
         )
         return None
 

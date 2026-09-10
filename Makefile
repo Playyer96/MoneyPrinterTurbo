@@ -1,16 +1,18 @@
-# One-time host setup for Apple Silicon. Everything else is plain
-# `docker compose` -- there is no make target to run, build or stop the app.
+# Run the stack with `make up`, stop it with `make down`, check it with
+# `make status`. Plain `docker compose` still works -- .env pins the mac
+# override so it cannot accidentally start the CPU-only container.
 #
-# macOS does not pass Metal through to Docker's Linux VM, so the model server
-# has to run on the host to reach the GPU. These targets install it as a
-# LaunchAgent, which starts it at login and restarts it if it dies, so you
-# never launch it by hand.
+# macOS does not pass Metal through to Docker's Linux VM, and MLX has no Linux
+# build at all, so the model server has to run on the host to reach the GPU.
+# `make up` treats it as part of the stack: it starts the host server if it is
+# not answering, then brings the containers up. On Linux there is no host
+# server and `make up` is just `docker compose up -d`.
 
 PLIST := $(HOME)/Library/LaunchAgents/com.moneyprinterturbo.voicestudio.plist
 REPO  := $(shell pwd)
 UID   := $(shell id -u)
 
-.PHONY: mac-setup mac-teardown mac-status
+.PHONY: up down status mac-setup mac-teardown mac-status
 
 mac-setup:
 	@test -x "$(REPO)/.venv/bin/python" || { \
@@ -62,3 +64,31 @@ mac-status:
 		| grep -E "state|pid" || echo "LaunchAgent not installed"
 	@curl -sf --max-time 2 http://127.0.0.1:8780/health || echo "(server not answering)"
 	@grep -i "loading OmniVoice" storage/logs/voicestudio.log 2>/dev/null | tail -1 || true
+
+# --- the whole stack, GPU included -------------------------------------------
+
+# Apple hosts need the host-side model server; everywhere else the containers
+# are the whole stack. uname decides, so one target works on both.
+IS_MAC := $(shell [ "$$(uname -s)" = "Darwin" ] && echo 1)
+
+up:
+ifdef IS_MAC
+	@curl -sf --max-time 2 http://127.0.0.1:8780/health >/dev/null 2>&1 \
+		|| $(MAKE) --no-print-directory mac-setup
+endif
+	@docker compose up -d
+	@$(MAKE) --no-print-directory status
+
+down:
+	@docker compose down
+	@echo "containers stopped; the host GPU server keeps running (make mac-teardown removes it)"
+
+status:
+	@docker compose ps --format "  {{.Name}}\t{{.Status}}"
+ifdef IS_MAC
+	@printf "  moneyprinterturbo-voicestudio\thost process, "
+	@curl -sf --max-time 2 http://127.0.0.1:8780/health >/dev/null 2>&1 \
+		&& echo "Up ($$(grep -i 'loading OmniVoice' storage/logs/voicestudio.log 2>/dev/null \
+			| tail -1 | sed 's/.* on //;s/ \.\.\..*//' || echo 'not loaded yet'))" \
+		|| echo "DOWN -- run: make mac-setup"
+endif

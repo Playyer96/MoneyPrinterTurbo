@@ -1,29 +1,52 @@
-# Apple Silicon override -- the only way to use the GPU on a Mac.
+# Apple Silicon override -- puts the GPU behind the normal compose interface.
 #
-#   docker compose -f docker-compose.yml -f docker-compose.mac.yml up -d
+#   docker compose up -d      (.env pins this file, so plain compose is enough)
 #
-# macOS does not pass Metal through to Docker's Linux VM, so a containerised
-# model server is CPU-only on every Mac no matter how it is configured. This
-# override therefore scales the voicestudio container to zero and points the
-# app at a copy running natively on the host, where torch reaches Metal via
-# MPS and whisper via MLX. TTS drops from ~72s to ~4s, whisper from ~58s to
-# ~7s on an M-series chip.
+# MLX has no Linux build and macOS does not pass Metal through to Docker's
+# Linux VM, so the model itself cannot run in a container on a Mac -- that is a
+# platform limit, not a configuration one. What *can* be containerised is the
+# service boundary: the real OmniVoice/MLX server runs natively on the host
+# (LaunchAgent, `make mac-setup`) and this file puts a tiny socat front door in
+# front of it on the bridge network, published under the alias `voicestudio`.
 #
-# The host server is started by a LaunchAgent at login, so there is nothing
-# to run by hand. Install it once with:
+# The payoff is that nothing above this line changes shape per platform. webui
+# and api keep talking to http://voicestudio:8780 exactly as they do on Linux,
+# `docker compose ps` lists a voicestudio container, and the healthcheck goes
+# red when the host server is down. Only the last hop differs: on Linux it
+# lands in a container, on a Mac it lands on Metal.
 #
-#   make mac-setup
-#
-# Everything else -- build, restart, down -- stays plain docker compose.
+# TTS ~72s -> ~5.5s, whisper ~58s -> ~8.4s versus the CPU container.
 services:
+  # Parked behind a profile rather than scaled to zero: `replicas: 0` still
+  # makes `docker compose up` BUILD the 10.8GB torch image, which on a Mac is a
+  # long wait for a container that can never reach the GPU. An inactive profile
+  # excludes it from both build and start. It stays reachable for a Linux or
+  # NVIDIA host with:
+  #
+  #   docker compose --profile container-tts build voicestudio
   voicestudio:
-    # Built but never started: the host copy serves these requests instead.
-    deploy:
-      replicas: 0
+    profiles: ["container-tts"]
 
-  webui:
-    environment:
-      VOICESTUDIO_BASE_URL: "http://host.docker.internal:8780"
-  api:
-    environment:
-      VOICESTUDIO_BASE_URL: "http://host.docker.internal:8780"
+  # Front door for the host GPU server. socat is a ~5MB image doing one TCP
+  # forward; all model work happens on the host, on Metal.
+  voicestudio-host:
+    image: alpine/socat
+    # Distinct from the base file's container_name, which stays reserved for
+    # the real (unused here) image; the network alias below is what callers use.
+    container_name: "moneyprinterturbo-voicestudio-host"
+    command: "TCP-LISTEN:8780,fork,reuseaddr TCP:host.docker.internal:8780"
+    networks:
+      mpt-net:
+        # Claims the name the base compose file's env default already points
+        # at, so VOICESTUDIO_BASE_URL needs no per-platform override.
+        aliases:
+          - voicestudio
+    healthcheck:
+      # Probes the host server, not socat, so a dead LaunchAgent shows up as an
+      # unhealthy container instead of a connection refused deep in a render.
+      test: ["CMD", "nc", "-z", "-w2", "host.docker.internal", "8780"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
