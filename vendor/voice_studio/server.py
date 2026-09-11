@@ -9,28 +9,31 @@ lock because the heavy OmniVoice model is loaded once per process.
 
 Endpoints:
     GET  /health           -> liveness probe
-    GET  /voices           -> list bundled voice-design presets
+    GET  /voices           -> list bundled voice-design presets + cloned profiles
+    POST /profiles         -> clone a voice from an uploaded sample (multipart)
     POST /generate         -> synthesize WAV (JSON: text, voice, speed?)
     POST /transcribe       -> transcribe raw audio bytes (Metal/MLX whisper)
 
-The legacy profile-management endpoints (/profiles, /tts) used to live
-here; they are gone by design. Voice cloning is still possible via the
-omnivoice Python API directly when callers need it, but MoneyPrinterTurbo
-only consumes the bundled presets here.
+Voice cloning works by turning a reference sample into a reusable
+``VoiceClonePrompt`` (``*.pt``) stored under ``voice_profiles/``; a profile
+name then behaves like a preset in ``/generate`` and ``/voices``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import uuid
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -63,6 +66,45 @@ VOICE_PRESETS: dict[str, str] = {
     "casual": "female, young adult, moderate pitch",
     "energetic": "male, young adult, high pitch",
 }
+
+# Cloned voices live as `<name>.pt` (a saved VoiceClonePrompt), an optional
+# `<name>.<ext>` audio sample, and a `<name>.json` metadata file in the
+# profiles directory. The directory doubles as the source of truth for
+# profile names -- every `<name>.pt` is a usable voice. Pointed at the
+# `voicestudio_profiles` named volume in docker-compose so clones survive
+# container rebuilds.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROFILES_DIR = os.environ.get(
+    "VOICESTUDIO_PROFILES_DIR", os.path.join(BASE_DIR, "voice_profiles")
+)
+
+# Profiles show up in the same drop-down as the presets, so names follow the
+# same lowercase-ASCII convention and stay safe as `voicestudio:<name>` ids
+# and as filenames. Spaces become underscores; anything else is dropped.
+_MAX_PROFILE_NAME_LEN = 48
+
+
+def _normalize_profile_name(name: str) -> str:
+    """Reduce a user-supplied profile name to a safe, case-folded slug."""
+    normalized = re.sub(r"[^a-z0-9_\-]+", "_", (name or "").strip().lower())
+    return normalized.strip("_")[:_MAX_PROFILE_NAME_LEN]
+
+
+def _list_profiles() -> list[str]:
+    """Return sorted profile names found in the profiles directory."""
+    if not os.path.isdir(PROFILES_DIR):
+        return []
+    return sorted(
+        name[: -len(".pt")]
+        for name in os.listdir(PROFILES_DIR)
+        if name.endswith(".pt")
+    )
+
+
+def _profile_prompt_path(voice: str) -> Optional[str]:
+    """Return the saved prompt path for a profile voice, or None if absent."""
+    path = os.path.join(PROFILES_DIR, f"{voice}.pt")
+    return path if os.path.isfile(path) else None
 
 
 def _pick_device(torch):
@@ -128,18 +170,91 @@ def health() -> dict:
 
 @app.get("/voices")
 def list_voices() -> dict:
-    """Return every bundled voice-design preset as ``name -> instruct``.
+    """Return every bundled voice-design preset plus any cloned profiles.
 
-    MoneyPrinterTurbo's WebUI shows the name as the option label; the
-    instruct string stays on the server so callers never need to know how
-    OmniVoice phrases voice descriptions internally.
+    Each entry is ``{name, instruct}`` where ``instruct`` is empty for
+    profile voices.  MoneyPrinterTurbo's WebUI shows the name as the option
+    label; the instruct string stays on the server so callers never need to
+    know how OmniVoice phrases voice descriptions internally.
     """
-    return {
-        "voices": [
-            {"name": name, "instruct": instruct}
-            for name, instruct in VOICE_PRESETS.items()
-        ]
-    }
+    entries = [
+        {"name": name, "instruct": instruct}
+        for name, instruct in VOICE_PRESETS.items()
+    ]
+    for name in _list_profiles():
+        entries.append({"name": name, "instruct": ""})
+    return {"voices": entries}
+
+
+@app.post("/profiles", status_code=201)
+async def create_profile(
+    name: str = Form(...),
+    audio: UploadFile = File(...),
+    ref_text: Optional[str] = Form(None),
+):
+    """Clone a voice from an uploaded audio sample and persist it as a profile.
+
+    The sample is stored next to its ``VoiceClonePrompt`` (``<name>.pt``) in
+    ``PROFILES_DIR`` so it survives restarts (the compose service mounts a
+    named volume there). ``ref_text`` is optional: when omitted the prompt is
+    auto-transcribed with OmniVoice's ASR model. Returns the normalized
+    ``name`` so callers can immediately reference ``voicestudio:<name>``.
+    """
+    profile_name = _normalize_profile_name(name)
+    if not profile_name:
+        raise HTTPException(
+            status_code=400, detail="profile name must be non-empty"
+        )
+    if _profile_prompt_path(profile_name) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"voice profile '{profile_name}' already exists",
+        )
+
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="audio cannot be empty")
+    if len(audio_bytes) > 200 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="audio file too large")
+
+    os.makedirs(PROFILES_DIR, exist_ok=True)
+    ext = os.path.splitext(audio.filename or "")[1].lower() or ".wav"
+    if not re.match(r"^\.[a-z0-9]{1,5}$", ext):
+        ext = ".wav"
+    audio_path = os.path.join(PROFILES_DIR, f"{profile_name}{ext}")
+    prompt_path = os.path.join(PROFILES_DIR, f"{profile_name}.pt")
+    meta_path = os.path.join(PROFILES_DIR, f"{profile_name}.json")
+
+    try:
+        with open(audio_path, "wb") as fh:
+            fh.write(audio_bytes)
+        with _tts_lock:
+            model = _load_model()
+            prompt = model.create_voice_clone_prompt(
+                audio_path, ref_text=ref_text or None
+            )
+            prompt.save(prompt_path)
+        metadata = {
+            "name": profile_name,
+            "audio_file": audio_path,
+            "prompt_file": prompt_path,
+            "created_at": time.time(),
+        }
+        with open(meta_path, "w", encoding="utf-8") as fh:
+            json.dump(metadata, fh, indent=2)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        for path in (audio_path, prompt_path, meta_path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        raise HTTPException(
+            status_code=500, detail=f"voice profile creation failed: {exc}"
+        ) from exc
+
+    return {"ok": True, "name": profile_name, "voices": _list_profiles()}
 
 
 @app.post("/generate")
@@ -149,19 +264,27 @@ def generate_audio(request: GenerateRequest):
         raise HTTPException(status_code=400, detail="text cannot be empty")
     voice = (request.voice or "").strip().lower()
     instruct = VOICE_PRESETS.get(voice)
+    profile_prompt = None
     if not instruct:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"unknown voice '{voice}'; available: "
-                + ", ".join(sorted(VOICE_PRESETS.keys()))
-            ),
-        )
+        profile_path = _profile_prompt_path(voice)
+        if profile_path is None:
+            available = ", ".join(sorted(VOICE_PRESETS.keys()) + _list_profiles())
+            raise HTTPException(
+                status_code=404,
+                detail=f"unknown voice '{voice}'; available: {available}",
+            )
+        from omnivoice.models.omnivoice import VoiceClonePrompt
+
+        profile_prompt = VoiceClonePrompt.load(profile_path)
 
     try:
         with _tts_lock:
             model = _load_model()
-            generate_kwargs = {"text": text, "instruct": instruct}
+            generate_kwargs: dict = {"text": text}
+            if instruct:
+                generate_kwargs["instruct"] = instruct
+            else:
+                generate_kwargs["voice_clone_prompt"] = profile_prompt
             if request.speed is not None and request.speed > 0:
                 generate_kwargs["speed"] = float(request.speed)
             waveforms = model.generate(**generate_kwargs)
@@ -176,7 +299,7 @@ def generate_audio(request: GenerateRequest):
     # 24 kHz. Persist them as a temporary WAV the response can stream, then
     # clean up. Sampling rate is fixed by the model and not user-tunable.
     filename = f"{uuid.uuid4().hex}.wav"
-    out_path = os.path.join("/tmp", filename)
+    out_path = os.path.join(tempfile.gettempdir(), filename)
     try:
         import torch
         import soundfile as sf
@@ -219,7 +342,7 @@ async def transcribe(request: Request, word_timestamps: bool = True):
         raise HTTPException(status_code=400, detail="empty audio body")
 
     # mlx_whisper decodes via ffmpeg, which needs a real file on disk.
-    tmp_path = os.path.join("/tmp", f"{uuid.uuid4().hex}.audio")
+    tmp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}.audio")
     worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whisper_worker.py")
     try:
         with open(tmp_path, "wb") as fh:

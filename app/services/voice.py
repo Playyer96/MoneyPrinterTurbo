@@ -429,18 +429,51 @@ def get_voicestudio_voices() -> list[str]:
 def create_voicestudio_profile(
     profile_name: str, audio_bytes: bytes, original_filename: str
 ) -> tuple[bool, str]:
-    """Backwards-compat stub kept for the WebUI import surface.
+    """Clone a voice on the local OmniVoice bridge from an uploaded sample.
 
-    The voice-design bridge no longer creates per-voice profile files; users
-    pick one of the bundled voice presets. Keep the symbol so the WebUI
-    module keeps importing; downstream code paths treat the failure return
-    the same way as a server outage.
+    The sample is POSTed as a multipart upload to ``{base_url}/profiles``.
+    The server stores the reference audio, auto-transcribes it (or uses the
+    optional transcript) and persists a reusable ``VoiceClonePrompt`` under
+    its ``voice_profiles/`` directory. On success the profile shows up in the
+    ``/voices`` catalog as ``voicestudio:<name>`` for the TTS drop-down.
+    Returns ``(ok, message_or_name)`` mirroring the WebUI contract.
     """
-    _ = (profile_name, audio_bytes, original_filename)
-    return False, (
-        "voice profile cloning is not available in this build; pick one of "
-        "the bundled voice presets instead"
+    profile_name = (profile_name or "").strip()
+    if not profile_name:
+        return False, "profile name must be non-empty"
+    if not audio_bytes:
+        return False, "audio sample cannot be empty"
+    base_url = get_voicestudio_base_url()
+    try:
+        response = requests.post(
+            f"{base_url}/profiles",
+            data={"name": profile_name},
+            files={
+                "audio": (
+                    original_filename or "voice_sample.wav",
+                    audio_bytes,
+                    "application/octet-stream",
+                )
+            },
+            timeout=1800,
+        )
+    except Exception as exc:
+        logger.warning(f"voicestudio profile creation failed: {exc}")
+        return False, f"voicestudio server unreachable: {exc}"
+
+    if response.status_code == 201 or response.status_code == 200:
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = {}
+        name = detail.get("name") or profile_name
+        logger.success(f"voicestudio profile created: {name}")
+        return True, name
+    logger.warning(
+        f"voicestudio profile creation failed with status "
+        f"{response.status_code}: {response.text[:200]}"
     )
+    return False, response.text[:200]
 
 
 _AZURE_VOICES_DATA_FILE = os.path.join(

@@ -21,8 +21,11 @@ FROM python:3.11-slim-bookworm
 WORKDIR /voicestudio
 
 # ffmpeg is required by core.py's audio decoding paths (pydub/soundfile).
+# gcc/g++ are required by Triton: on the CUDA path torch JIT-compiles its
+# native kernels (e.g. the qwen3 RoPE matmul) at first forward pass, which
+# fails without a C compiler in the slim image.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg \
+ && apt-get install -y --no-install-recommends ffmpeg gcc g++ make binutils \
  && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps. requirements.txt includes fastapi + uvicorn so the
