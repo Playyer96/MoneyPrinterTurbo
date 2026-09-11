@@ -448,6 +448,9 @@ subtitle_provider = "edge"
 # "h264_mf", "h264_videotoolbox", or "auto" to pick the first available
 # hardware encoder for the current platform (videotoolbox on macOS, nvenc on
 # Linux/Windows NVIDIA, qsv on Intel iGPU, amf on AMD).
+# The selected value must be present in `ffmpeg -encoders` for the resolved
+# ffmpeg binary; on Linux/Docker without an NVENC-enabled ffmpeg, "auto"
+# resolves to libx264.
 # video_codec = "auto"
 
 # -----------------------------------------------------------------------------

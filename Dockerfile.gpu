@@ -28,10 +28,16 @@ COPY docker/pick-mirror.py /usr/local/bin/pick-mirror.py
 # distro-provided blinker is optional, so the `|| echo` is scoped inside its
 # own parentheses -- a trailing `|| true` would turn an apt, PPA, Python or
 # pip failure into a successful build producing an unusable image.
+#
+# ffmpeg from Ubuntu apt is built without --enable-nvenc, so the GPU image
+# would still fall back to libx264 on every clip. BtbN's GPL static build
+# links dynamically against the nvidia/cuda base image's libnvidia-encode*,
+# which makes h264_nvenc (and h264_qsv, h264_amf) usable inside the
+# container. xz-utils is added only for extracting the .tar.xz release.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common \
         git \
-        ffmpeg \
+        xz-utils \
         curl \
         && add-apt-repository ppa:deadsnakes/ppa \
         && apt-get update && apt-get install -y --no-install-recommends \
@@ -44,7 +50,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         && python3.11 -m pip install --upgrade pip \
         && (apt-get remove -y python3-blinker || \
             echo "python3-blinker removal skipped; continuing") \
-        && rm -rf /var/lib/apt/lists/*
+        && rm -rf /var/lib/apt/lists/* \
+        && mkdir -p /opt/ffmpeg-static \
+        && curl -fsSL \
+           https://github.com/BtbN/ffmpeg-builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
+           -o /tmp/ffmpeg.tar.xz \
+        && tar -xJf /tmp/ffmpeg.tar.xz -C /opt/ffmpeg-static --strip-components=1 \
+        && ln -sf /opt/ffmpeg-static/bin/ffmpeg /usr/local/bin/ffmpeg \
+        && ln -sf /opt/ffmpeg-static/bin/ffprobe /usr/local/bin/ffprobe \
+        && rm /tmp/ffmpeg.tar.xz \
+        && /usr/local/bin/ffmpeg -version | head -1
 
 # Copy only the requirements.txt first to leverage Docker cache
 COPY requirements.txt ./

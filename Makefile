@@ -13,6 +13,7 @@
 # server and `make up` is just `docker compose up -d`.
 
 PLIST := $(HOME)/Library/LaunchAgents/com.moneyprinterturbo.voicestudio.plist
+FFMPEG_PROXY_PLIST := $(HOME)/Library/LaunchAgents/com.moneyprinterturbo.ffmpeg-proxy.plist
 REPO  := $(shell pwd)
 UID   := $(shell id -u)
 
@@ -64,20 +65,63 @@ mac-setup:
 	@echo "waiting for the GPU server..."
 	@for i in $$(seq 1 40); do \
 		curl -sf --max-time 2 http://127.0.0.1:8780/health >/dev/null && \
-			{ echo "GPU server ready on :8780 (starts automatically at login)"; exit 0; }; \
+			{ echo "GPU server ready on :8780 (starts automatically at login)"; break; }; \
 		sleep 1; done; \
-		echo "no response on :8780; see storage/logs/voicestudio.log" >&2; exit 1
+	if ! curl -sf --max-time 2 http://127.0.0.1:8780/health >/dev/null; then \
+		echo "no response on :8780; see storage/logs/voicestudio.log" >&2; exit 1; \
+	fi
+
+	# ffmpeg host proxy: lets containers on this Mac reach the host's
+	# VideoToolbox-enabled ffmpeg. Loopback only; the container talks to it
+	# via docker-compose.mac.yml's socat bridge. Same venv Python because
+	# the proxy only uses the stdlib.
+	@printf '%s\n' \
+	  '<?xml version="1.0" encoding="UTF-8"?>' \
+	  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+	  '<plist version="1.0"><dict>' \
+	  '  <key>Label</key><string>com.moneyprinterturbo.ffmpeg-proxy</string>' \
+	  '  <key>ProgramArguments</key><array>' \
+	  '    <string>$(REPO)/.venv/bin/python</string>' \
+	  '    <string>$(REPO)/scripts/ffmpeg_mac_proxy.py</string>' \
+	  '  </array>' \
+	  '  <key>EnvironmentVariables</key><dict>' \
+	  '    <key>MPT_FFMPEG_PROXY_HOST</key><string>127.0.0.1</string>' \
+	  '    <key>MPT_FFMPEG_PROXY_PORT</key><string>8781</string>' \
+	  '    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>' \
+	  '  </dict>' \
+	  '  <key>WorkingDirectory</key><string>$(REPO)</string>' \
+	  '  <key>RunAtLoad</key><true/>' \
+	  '  <key>KeepAlive</key><true/>' \
+	  '  <key>ProcessType</key><string>Interactive</string>' \
+	  '  <key>LowPriorityIO</key><false/>' \
+	  '  <key>StandardOutPath</key><string>$(REPO)/storage/logs/ffmpeg-mac-proxy.log</string>' \
+	  '  <key>StandardErrorPath</key><string>$(REPO)/storage/logs/ffmpeg-mac-proxy.log</string>' \
+	  '</dict></plist>' > "$(FFMPEG_PROXY_PLIST)"
+	@launchctl bootout gui/$(UID)/com.moneyprinterturbo.ffmpeg-proxy 2>/dev/null || true
+	@sleep 2
+	@launchctl bootstrap gui/$(UID) "$(FFMPEG_PROXY_PLIST)"
+	@for i in $$(seq 1 20); do \
+		curl -sf --max-time 2 http://127.0.0.1:8781/health >/dev/null && \
+			{ echo "ffmpeg host proxy ready on :8781"; break; }; \
+		sleep 1; done; \
+	if ! curl -sf --max-time 2 http://127.0.0.1:8781/health >/dev/null; then \
+		echo "no response on :8781; see storage/logs/ffmpeg-mac-proxy.log" >&2; exit 1; \
+	fi
 
 mac-teardown:
 	@launchctl bootout gui/$(UID)/com.moneyprinterturbo.voicestudio 2>/dev/null || true
-	@rm -f "$(PLIST)"
-	@echo "GPU server removed; it will not start at login anymore"
+	@launchctl bootout gui/$(UID)/com.moneyprinterturbo.ffmpeg-proxy 2>/dev/null || true
+	@rm -f "$(PLIST)" "$(FFMPEG_PROXY_PLIST)"
+	@echo "GPU server and ffmpeg proxy removed; they will not start at login anymore"
 
 mac-status:
 	@launchctl print gui/$(UID)/com.moneyprinterturbo.voicestudio 2>/dev/null \
-		| grep -E "state|pid" || echo "LaunchAgent not installed"
-	@curl -sf --max-time 2 http://127.0.0.1:8780/health || echo "(server not answering)"
+		| grep -E "state|pid" || echo "voicestudio: LaunchAgent not installed"
+	@curl -sf --max-time 2 http://127.0.0.1:8780/health || echo "(voicestudio: server not answering)"
 	@grep -i "loading OmniVoice" storage/logs/voicestudio.log 2>/dev/null | tail -1 || true
+	@launchctl print gui/$(UID)/com.moneyprinterturbo.ffmpeg-proxy 2>/dev/null \
+		| grep -E "state|pid" || echo "ffmpeg-proxy: LaunchAgent not installed"
+	@curl -sf --max-time 2 http://127.0.0.1:8781/health || echo "(ffmpeg-proxy: server not answering)"
 
 # --- the whole stack, GPU included -------------------------------------------
 

@@ -346,6 +346,27 @@ transcription per video. Remove it again with `make mac-teardown`.
 Note that whisper stays on the CPU under ROCm: faster-whisper runs on
 CTranslate2, which has CUDA and CPU backends only.
 
+Hardware video encoding (`h264_nvenc` on NVIDIA, `h264_qsv` on Intel,
+`h264_amf` on AMD) follows the same per-platform priority list as the ML
+stack above. The `docker-compose.gpu.yml` image installs BtbN's GPL static
+ffmpeg so `h264_nvenc` is available inside the container (the Ubuntu apt
+ffmpeg is built without NVENC). The CPU image and host installs that come
+without an NVENC-capable ffmpeg transparently fall back to `h264_videotoolbox`
+on macOS hosts or to `libx264` everywhere else — see `video_codec` in
+`config.toml`.
+
+Apple Silicon Docker is the exception: the Linux VM that Docker Desktop runs
+on a Mac host has no VideoToolbox framework, so even the BtbN build lists no
+`h264_videotoolbox`. `make mac-setup` installs a second LaunchAgent
+(`scripts/ffmpeg_mac_proxy.py`) that forwards every ffmpeg call from inside
+the container to the host's Homebrew ffmpeg over loopback, with bind-mount
+path translation. The companion `ffmpeg-proxy-host` socat in
+`docker-compose.mac.yml` exposes the proxy on `ffmpeg-mac-proxy:8781`, and
+`get_ffmpeg_binary()` returns `scripts/ffmpeg_mac_wrapper.py` whenever it
+sees that alias and `/.dockerenv`. Outside Mac Docker (native macOS, Linux
+hosts, non-Mac Docker) the wrapper path is never returned, so the normal
+ffmpeg lookup is untouched.
+
 #### ② Access the WebUI
 
 Open your browser and visit http://127.0.0.1:8501

@@ -23,6 +23,7 @@ from moviepy import (
     VideoFileClip,
     afx,
 )
+from moviepy.video.io import ffmpeg_writer as moviepy_ffmpeg_writer
 from moviepy.video.tools.subtitles import SubtitlesClip
 from PIL import Image, ImageDraw, ImageFont
 
@@ -40,6 +41,10 @@ from app.services import guardrails, subtitle_styles
 from app.services import bgm as bgm_service
 from app.services.utils import video_effects
 from app.utils import file_security, utils
+
+# MoviePy readers keep using the container binary, which can stream decoded
+# frames locally. Only writers use the host bridge needed for Mac hardware.
+moviepy_ffmpeg_writer.FFMPEG_BINARY = utils.get_ffmpeg_binary()
 
 class SubClippedVideoClip:
     def __init__(
@@ -381,9 +386,7 @@ def _get_configured_video_codec() -> str:
     purpose: opening it to arbitrary FFmpeg parameters would let a typo produce
     an unpredictable output format, or fail the task at a much later stage.
     """
-    configured_codec = str(
-        config.app.get("video_codec", _DEFAULT_VIDEO_CODEC) or _DEFAULT_VIDEO_CODEC
-    ).strip()
+    configured_codec = str(config.app.get("video_codec", "auto") or "auto").strip()
     if configured_codec not in _SUPPORTED_VIDEO_CODECS:
         logger.warning(
             f"unsupported video codec configured: {configured_codec}, "
@@ -393,15 +396,26 @@ def _get_configured_video_codec() -> str:
     return configured_codec
 
 
-@lru_cache(maxsize=16)
+# Probe cache holds only positive results: a transient failure (PATH blip,
+# subprocess timeout, locked file) on the first call would otherwise stick
+# a False here for the lifetime of the process and turn every clip in a long
+# render into libx264. False results are re-probed each call so a recovery on
+# a later clip is automatic.
+_TRUE_FFMPEG_ENCODERS: set[tuple[str, str]] = set()
+
+
 def _ffmpeg_encoder_exists(ffmpeg_binary: str, codec: str) -> bool:
     """
     Check whether this FFmpeg build advertises the given encoder.
 
-    That only proves the encoder was compiled in, not that this machine's
-    hardware and drivers can actually use it, so a real encoding failure still
-    falls back to libx264.
+    Encoding a True result only proves the encoder was compiled in, not that
+    this machine's hardware and drivers can actually use it, so a real
+    encoding failure still falls back to libx264.
     """
+    cache_key = (ffmpeg_binary, codec)
+    if cache_key in _TRUE_FFMPEG_ENCODERS:
+        return True
+
     try:
         result = subprocess.run(
             [ffmpeg_binary, "-hide_banner", "-encoders"],
@@ -412,18 +426,34 @@ def _ffmpeg_encoder_exists(ffmpeg_binary: str, codec: str) -> bool:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.warning(
-            "failed to inspect ffmpeg encoders, "
-            f"fallback to {_DEFAULT_VIDEO_CODEC}: {str(exc)}"
+            f"ffmpeg encoder probe failed for {ffmpeg_binary}, "
+            f"fallback to {_DEFAULT_VIDEO_CODEC}: {exc}"
         )
         return False
 
     if result.returncode != 0:
+        stderr_excerpt = (result.stderr or result.stdout or "").strip()[:200]
         logger.warning(
-            "failed to inspect ffmpeg encoders, "
-            f"fallback to {_DEFAULT_VIDEO_CODEC}: {(result.stderr or result.stdout or '').strip()}"
+            f"ffmpeg encoder probe failed (rc={result.returncode}) for "
+            f"{ffmpeg_binary}, fallback to {_DEFAULT_VIDEO_CODEC}: {stderr_excerpt}"
         )
         return False
-    return codec in result.stdout
+    if codec in result.stdout:
+        _TRUE_FFMPEG_ENCODERS.add(cache_key)
+        return True
+    return False
+
+
+def clear_ffmpeg_encoder_cache() -> None:
+    """
+    Drop cached "encoder present" results.
+
+    Tests and the runtime fallback path call this when a True probe later
+    turned out to be wrong (e.g. the encoder was advertised but the encode
+    failed for a hardware/driver reason). The next clip re-probes so a
+    recoverable transient does not stick for the rest of the task.
+    """
+    _TRUE_FFMPEG_ENCODERS.clear()
 
 
 def _get_effective_video_codec(preferred_codec: str | None = None) -> str:
@@ -529,6 +559,10 @@ def _fallback_write_videofile(clip, output_file: str, failed_codec: str, reason:
     """
     kwargs.pop("ffmpeg_params", None)
     clip.write_videofile(output_file, codec=_DEFAULT_VIDEO_CODEC, **kwargs)
+    # The hardware encoder was advertised by ffmpeg but failed at encode time;
+    # drop the positive probe so the next clip re-probes. A transient GPU
+    # driver glitch shouldn't stick for the rest of the render.
+    clear_ffmpeg_encoder_cache()
     _disable_runtime_video_codec(failed_codec, reason)
     return _DEFAULT_VIDEO_CODEC
 
@@ -597,7 +631,10 @@ def concat_video_clips_with_ffmpeg(
     concat_list_file = os.path.join(output_dir, "ffmpeg-concat-list.txt")
     with open(concat_list_file, "w", encoding="utf-8") as fp:
         for clip_file in clip_files:
-            fp.write(f"file '{_format_ffmpeg_concat_path(clip_file)}'\n")
+            relative_path = os.path.relpath(
+                os.path.abspath(clip_file), os.path.abspath(output_dir)
+            ).replace("\\", "/")
+            fp.write(f"file '{_escape_ffmpeg_concat_path(relative_path)}'\n")
 
     def build_command(codec: str) -> list[str]:
         command = [

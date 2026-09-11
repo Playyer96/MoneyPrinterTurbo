@@ -55,13 +55,13 @@ class TestVideoService(unittest.TestCase):
         self.original_app_config = dict(config.app)
         self.test_img_path = os.path.join(resources_dir, "1.png")
         vd._runtime_disabled_video_codecs.clear()
-        vd._ffmpeg_encoder_exists.cache_clear()
+        vd.clear_ffmpeg_encoder_cache()
 
     def tearDown(self):
         config.app.clear()
         config.app.update(self.original_app_config)
         vd._runtime_disabled_video_codecs.clear()
-        vd._ffmpeg_encoder_exists.cache_clear()
+        vd.clear_ffmpeg_encoder_cache()
 
     def test_subtitle_spring_animation_keeps_color_and_mask_aligned(self):
         """
@@ -561,15 +561,15 @@ class TestVideoService(unittest.TestCase):
         with patch.object(vd, "_detect_hardware_codec", return_value=None):
             self.assertEqual(vd._get_effective_video_codec(), "libx264")
 
-    def test_get_configured_video_codec_uses_stable_default_when_unset(self):
+    def test_get_configured_video_codec_auto_detects_when_unset(self):
         """
         The WebUI's "default" mode does not persist video_codec. With the
-        setting absent the backend must still return libx264 explicitly, rather
-        than leaving an empty value for MoviePy or FFmpeg to interpret.
+        setting absent, the backend must probe for hardware and retain libx264
+        as the runtime fallback when no accelerated encoder works.
         """
         config.app.pop("video_codec", None)
 
-        self.assertEqual(vd._get_configured_video_codec(), "libx264")
+        self.assertEqual(vd._get_configured_video_codec(), "auto")
 
     def test_get_configured_video_codec_preserves_explicit_libx264(self):
         """
@@ -593,6 +593,56 @@ class TestVideoService(unittest.TestCase):
             side_effect=OSError("permission denied"),
         ):
             self.assertFalse(vd._ffmpeg_encoder_exists("C:/ffmpeg/bin/ffmpeg.exe", "h264_nvenc"))
+
+    def test_ffmpeg_encoder_exists_recovers_from_transient_probe_failure(self):
+        """
+        The first probe of a long render can hit a transient subprocess
+        failure (locked file, Defender scan, PATH blip). Caching that False
+        for the lifetime of the process turns every subsequent clip into a
+        CPU encode, which is what motivated the positive-only cache. After a
+        probe failure, a later probe must still see the encoder.
+        """
+        ok_result = types.SimpleNamespace(
+            returncode=0,
+            stdout=" V....D h264_videotoolbox    VideoToolbox H.264 Encoder\n",
+            stderr="",
+        )
+        # First call: subprocess raises (transient). Second call: succeeds.
+        # We patch with a side_effect sequence: first OSError, then OK.
+        with patch.object(
+            vd.subprocess,
+            "run",
+            side_effect=[OSError("transient"), ok_result],
+        ):
+            first = vd._ffmpeg_encoder_exists("/opt/homebrew/bin/ffmpeg", "h264_videotoolbox")
+            second = vd._ffmpeg_encoder_exists("/opt/homebrew/bin/ffmpeg", "h264_videotoolbox")
+        self.assertFalse(first)
+        self.assertTrue(second)
+
+    def test_ffmpeg_encoder_exists_does_not_cache_negative_results(self):
+        """
+        Negative probe results must not be cached: a 296-clip render that
+        legitimately lacks the encoder should not pay a subprocess round-trip
+        per clip, but it must also not pin the answer in case a later probe
+        would succeed (see the recovery test above). In practice both look
+        the same to the caller — False — but the assertion that subprocess.run
+        is called twice proves the cache only holds positive results.
+        """
+        missing_result = types.SimpleNamespace(
+            returncode=0,
+            stdout=" V....D libx264    libx264 H.264 encoder (codec h264)\n",
+            stderr="",
+        )
+        with patch.object(
+            vd.subprocess,
+            "run",
+            return_value=missing_result,
+        ) as run_mock:
+            first = vd._ffmpeg_encoder_exists("/opt/homebrew/bin/ffmpeg", "h264_videotoolbox")
+            second = vd._ffmpeg_encoder_exists("/opt/homebrew/bin/ffmpeg", "h264_videotoolbox")
+        self.assertFalse(first)
+        self.assertFalse(second)
+        self.assertEqual(run_mock.call_count, 2)
 
     def test_write_videofile_falls_back_after_runtime_encoder_failure(self):
         """
@@ -665,6 +715,28 @@ class TestVideoService(unittest.TestCase):
                 ),
                 "C:/Users/Test User'\\''s Videos/clip.mp4",
             )
+
+    def test_concat_manifest_uses_paths_relative_to_its_directory(self):
+        manifest = ""
+
+        def fake_run(command, **kwargs):
+            nonlocal manifest
+            manifest_path = command[command.index("-i") + 1]
+            manifest = Path(manifest_path).read_text(encoding="utf-8")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_file = os.path.join(temp_dir, "clip.mp4")
+            Path(clip_file).write_bytes(b"fake")
+            with (
+                patch.object(vd, "_get_effective_video_codec", return_value="libx264"),
+                patch.object(vd.subprocess, "run", side_effect=fake_run),
+            ):
+                vd.concat_video_clips_with_ffmpeg(
+                    [clip_file], os.path.join(temp_dir, "out.mp4"), 1, temp_dir
+                )
+
+        self.assertEqual(manifest, "file 'clip.mp4'\n")
 
     def test_concat_video_clips_falls_back_after_runtime_encoder_failure(self):
         """

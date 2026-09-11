@@ -16,6 +16,21 @@
 # lands in a container, on a Mac it lands on Metal.
 #
 # TTS ~72s -> ~5.5s, whisper ~58s -> ~8.4s versus the CPU container.
+#
+# The ffmpeg-proxy-host service below adds hardware video encoding on top:
+# without it, ffmpeg inside the container has no h264_videotoolbox. The env
+# override below turns on the wrapper script (scripts/ffmpeg_mac_wrapper.py)
+# for webui and api only -- voicestudio does not encode video.
+#
+# service-env-mac duplicates the base compose's *service-env so the YAML
+# merge stays self-contained (cross-file anchors do not resolve).
+x-service-env-mac: &service-env-mac
+  VOICESTUDIO_BASE_URL: "${VOICESTUDIO_BASE_URL:-http://voicestudio:8780}"
+  LIGHTPANDA_URL: "${LIGHTPANDA_URL:-ws://lightpanda:9222}"
+  WEB_SEARCH_PROVIDER: "${WEB_SEARCH_PROVIDER:-searxng}"
+  SEARXNG_URL: "${SEARXNG_URL:-http://searxng:8080}"
+  FFMPEG_MAC_PROXY_URL: "http://ffmpeg-mac-proxy:8781"
+
 services:
   # Parked behind a profile rather than scaled to zero: `replicas: 0` still
   # makes `docker compose up` BUILD the 10.8GB torch image, which on a Mac is a
@@ -50,3 +65,34 @@ services:
       retries: 3
       start_period: 5s
     restart: unless-stopped
+
+  # Front door for the host ffmpeg proxy (scripts/ffmpeg_mac_proxy.py). Same
+  # pattern as voicestudio-host: a 5MB socat that forwards a container port
+  # to a LaunchAgent on the host. Without this the app inside the container
+  # sees ffmpeg from Ubuntu apt, which is built without h264_videotoolbox.
+  ffmpeg-proxy-host:
+    image: alpine/socat
+    container_name: "moneyprinterturbo-ffmpeg-proxy-host"
+    command: "TCP-LISTEN:8781,fork,reuseaddr TCP:host.docker.internal:8781"
+    networks:
+      mpt-net:
+        # The app's get_ffmpeg_binary() reaches this alias on Linux+macOS
+        # via the FFMPEG_MAC_PROXY_URL env var set in x-service-env below.
+        aliases:
+          - ffmpeg-mac-proxy
+    healthcheck:
+      test: ["CMD", "nc", "-z", "-w2", "host.docker.internal", "8781"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  # The webui and api services inherit env vars from the base file; on Mac
+  # we replace them with *service-env-mac, which is the base vars plus
+  # FFMPEG_MAC_PROXY_URL. Docker compose does not merge dict-style
+  # environment: blocks across files, so the explicit override is required.
+  webui:
+    environment: *service-env-mac
+  api:
+    environment: *service-env-mac

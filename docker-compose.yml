@@ -40,6 +40,9 @@ x-common-volumes: &common-volumes
 networks:
   mpt-net:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.85.0/24
 
 # Named volumes keep the downloaded models, voice profiles and generated
 # audio across container restarts and re-creates, and stop the bind-mounted
@@ -163,7 +166,10 @@ services:
     container_name: "moneyprinterturbo-webui"
     environment: *service-env
     networks:
-      - mpt-net
+      mpt-net:
+        # Keep OrbStack's automatic domain valid while Compose replaces this
+        # container; otherwise the old address can be reused by another service.
+        ipv4_address: 172.30.85.10
     ports:
       - "127.0.0.1:8501:8501"
     command: [ "streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=127.0.0.1", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False" ]
