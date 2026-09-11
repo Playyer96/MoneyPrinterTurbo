@@ -13,6 +13,8 @@ from uuid import UUID, uuid4
 
 from loguru import logger
 
+from app.services import subtitle_styles
+
 if TYPE_CHECKING:
     from app.models.schema import MaterialInfo, VideoParams
 
@@ -607,6 +609,72 @@ Batch manifests:
             "disabled when unset)"
         ),
     )
+    subtitle_group.add_argument(
+        "--subtitle-preset",
+        choices=list(subtitle_styles.SUBTITLE_PRESETS.keys()),
+        default=None,
+        help="viral subtitle preset style (e.g. tiktok_yellow, hormozi, mrbeast, capcut_box, cyber_neon)",
+    )
+    subtitle_group.add_argument(
+        "--subtitle-animation",
+        choices=list(subtitle_styles.SUPPORTED_SUBTITLE_ANIMATIONS),
+        default=None,
+        help="subtitle entry animation (none, pop_spring, scale_up, fade, slide_up, shake)",
+    )
+    subtitle_group.add_argument(
+        "--subtitle-casing",
+        choices=["as_is", "uppercase", "lowercase", "capitalize"],
+        default=None,
+        help="subtitle text casing (as_is, uppercase, lowercase, capitalize)",
+    )
+
+    title_group = parser.add_argument_group("video title / hook banner")
+    title_group.add_argument(
+        "--title-enabled",
+        default=None,
+        action=argparse.BooleanOptionalAction,
+        help="overlay on-screen viral title / hook banner (e.g. for TikTok/Shorts)",
+    )
+    title_group.add_argument(
+        "--title-text",
+        default=None,
+        help="custom video title text; falls back to video_subject when unset",
+    )
+    title_group.add_argument(
+        "--title-style",
+        choices=list(subtitle_styles.TITLE_STYLES.keys()),
+        default=None,
+        help="title visual style (tiktok_yellow, red_banner, capcut_black, neon_cyan, minimalist_white, golden_luxury, comic_punch)",
+    )
+    title_group.add_argument(
+        "--title-position",
+        choices=list(subtitle_styles.SUPPORTED_TITLE_POSITIONS),
+        default=None,
+        help="title overlay position (top, center, bottom, custom; default: top)",
+    )
+    title_group.add_argument(
+        "--title-duration",
+        choices=list(subtitle_styles.SUPPORTED_TITLE_DURATIONS),
+        default=None,
+        help="title overlay duration: intro (first 4s with fade-out) or full (entire video)",
+    )
+    title_group.add_argument(
+        "--title-animation",
+        choices=list(subtitle_styles.SUPPORTED_SUBTITLE_ANIMATIONS),
+        default=None,
+        help="title entry animation (none, pop_spring, scale_up, fade, slide_up, shake)",
+    )
+    title_group.add_argument(
+        "--title-font-name",
+        default=None,
+        help="font filename for title overlay",
+    )
+    title_group.add_argument(
+        "--title-font-size",
+        type=_positive_int,
+        default=None,
+        help="font size for title overlay",
+    )
 
     execution_group = parser.add_argument_group("execution")
     execution_mode = execution_group.add_mutually_exclusive_group()
@@ -864,16 +932,54 @@ def build_video_params(args: argparse.Namespace) -> VideoParams:
         "font_name",
         "subtitle_position",
         "custom_position",
+        "subtitle_animation",
+        "subtitle_casing",
         "text_fore_color",
         "font_size",
         "stroke_color",
         "stroke_width",
         "rounded_subtitle_background",
+        "title_enabled",
+        "title_text",
+        "title_style",
+        "title_position",
+        "title_duration",
+        "title_animation",
+        "title_font_name",
+        "title_font_size",
     ]
     for name in optional_arg_names:
-        value = getattr(args, name)
+        value = getattr(args, name, None)
         if value is not None:
             params_kwargs[name] = value
+
+    if getattr(args, "subtitle_preset", None):
+        params_kwargs["subtitle_style_preset"] = args.subtitle_preset
+        preset = subtitle_styles.get_subtitle_preset(args.subtitle_preset)
+        if preset and args.subtitle_preset != "custom":
+            preset_map = {
+                "font_name": preset.get("font_name"),
+                "text_fore_color": preset.get("text_fore_color"),
+                "font_size": preset.get("font_size"),
+                "stroke_color": preset.get("stroke_color"),
+                "stroke_width": preset.get("stroke_width"),
+                "subtitle_animation": preset.get("subtitle_animation"),
+                "subtitle_casing": preset.get("subtitle_casing"),
+            }
+            for k, v in preset_map.items():
+                if getattr(args, k, None) is None and v is not None:
+                    params_kwargs[k] = v
+            if (
+                getattr(args, "subtitle_background_enabled", None) is None
+                and preset.get("subtitle_background_enabled")
+            ):
+                params_kwargs["text_background_color"] = preset.get(
+                    "subtitle_background_color", "#000000"
+                )
+                if getattr(args, "rounded_subtitle_background", None) is None:
+                    params_kwargs["rounded_subtitle_background"] = bool(
+                        preset.get("rounded_subtitle_background")
+                    )
 
     # Without an explicit command-line argument, fall back to the value saved by
     # the WebUI. Only fields not already set above are filled in; when no saved

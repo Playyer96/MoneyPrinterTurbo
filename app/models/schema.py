@@ -55,9 +55,23 @@ class VideoFitMode(str, Enum):
 
 
 SubtitleDisplayMode = Literal["sentence", "word_by_word"]
-SubtitleAnimation = Literal["none", "pop_spring"]
+SubtitleAnimation = Literal[
+    "none",
+    "pop_spring",
+    "scale_up",
+    "fade",
+    "slide_up",
+    "shake",
+]
 _SUBTITLE_DISPLAY_MODES = ("sentence", "word_by_word")
-_SUBTITLE_ANIMATIONS = ("none", "pop_spring")
+_SUBTITLE_ANIMATIONS = (
+    "none",
+    "pop_spring",
+    "scale_up",
+    "fade",
+    "slide_up",
+    "shake",
+)
 
 
 def _get_valid_ui_choice(key: str, allowed_values: tuple[str, ...], default: str) -> str:
@@ -153,6 +167,10 @@ class VideoParams(BaseModel):
     subtitle_animation: SubtitleAnimation = _get_valid_ui_choice(
         "subtitle_animation", _SUBTITLE_ANIMATIONS, "none"
     )
+    subtitle_style_preset: Optional[str] = config.ui.get(
+        "subtitle_style_preset", "custom"
+    )
+    subtitle_casing: Optional[str] = config.ui.get("subtitle_casing", "as_is")
     custom_position: float = config.ui.get("custom_position", 70.0)
     font_name: Optional[str] = "STHeitiMedium.ttc"
     text_fore_color: Optional[str] = "#FFFFFF"
@@ -166,6 +184,16 @@ class VideoParams(BaseModel):
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
     custom_system_prompt: str = Field(default="", max_length=8000)
+
+    # Video title / hook banner overlay settings
+    title_enabled: bool = False
+    title_text: Optional[str] = ""
+    title_style: Optional[str] = "tiktok_yellow"
+    title_position: Optional[str] = "top"
+    title_duration: Optional[str] = "intro"
+    title_animation: Optional[str] = "pop_spring"
+    title_font_name: Optional[str] = None
+    title_font_size: Optional[int] = None
 
     # Series mode: turn one subject into an ordered set of chapter videos.
     # ``series_parts`` is the single count input: 0 lets the model decide how
@@ -196,6 +224,8 @@ class SubtitleRequest(BaseModel):
     subtitle_animation: SubtitleAnimation = _get_valid_ui_choice(
         "subtitle_animation", _SUBTITLE_ANIMATIONS, "none"
     )
+    subtitle_style_preset: Optional[str] = "custom"
+    subtitle_casing: Optional[str] = "as_is"
     font_name: Optional[str] = "STHeitiMedium.ttc"
     text_fore_color: Optional[str] = "#FFFFFF"
     text_background_color: Union[bool, str] = False
@@ -222,7 +252,7 @@ class AudioRequest(BaseModel):
 class VideoScriptParams:
     """
     {
-      "video_subject": "春天的花海",
+      "video_subject": "Spring flowers in bloom",
       "video_language": "",
       "paragraph_number": 1,
       "video_script_prompt": "",
@@ -230,7 +260,7 @@ class VideoScriptParams:
     }
     """
 
-    video_subject: Optional[str] = "春天的花海"
+    video_subject: Optional[str] = "Spring flowers in bloom"
     video_language: Optional[str] = ""
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
@@ -247,9 +277,9 @@ class VideoTermsParams:
     }
     """
 
-    video_subject: Optional[str] = "春天的花海"
+    video_subject: Optional[str] = "Spring flowers in bloom"
     video_script: Optional[str] = (
-        "春天的花海，如诗如画般展现在眼前。万物复苏的季节里，大地披上了一袭绚丽多彩的盛装。金黄的迎春、粉嫩的樱花、洁白的梨花、艳丽的郁金香……"
+        "The spring sea of flowers unfolds like a picturesque painting before our eyes. In the season of rebirth, nature puts on a vibrant and colorful gown. Golden forsythia, soft pink cherry blossoms, pure white pear blossoms, and radiant tulips bloom together in harmony..."
     )
     amount: Optional[int] = 5
     match_materials_to_script: bool = False
@@ -479,7 +509,7 @@ class VideoScriptResponse(BaseResponse):
                 "status": 200,
                 "message": "success",
                 "data": {
-                    "video_script": "春天的花海，是大自然的一幅美丽画卷。在这个季节里，大地复苏，万物生长，花朵争相绽放，形成了一片五彩斑斓的花海..."
+                    "video_script": "The spring sea of flowers is nature's beautiful canvas. In this season, the earth revives, all living things grow, and flowers bloom in competition, creating a magnificent tapestry of colors..."
                 },
             },
         }
