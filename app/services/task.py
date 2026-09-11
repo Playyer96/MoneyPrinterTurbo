@@ -1,12 +1,33 @@
-import math
+"""Task entry point and cross-platform publishing helpers.
+
+The single-video and series pipelines live under ``app.services.pipeline``
+(``pipeline/stages.py`` for shared per-stage logic, ``pipeline/single.py``
+for a single video, ``pipeline/series.py`` for a multi-chapter series,
+``pipeline/__init__.py`` for the ``start`` dispatcher). This module keeps
+two responsibilities that do not belong inside either pipeline:
+
+- Re-exports so external callers (``app.controllers.v1.video``,
+  ``app.services.webui_task``, ``cli.py``, ``webui/Main.py``) keep
+  importing the task module as a single entry point for ``start``,
+  ``is_task_busy``, ``const``, and the individual pipeline stages.
+- Cross-platform publishing: thread pool, Future registry, startup
+  recovery, and per-platform state writes. This runs after video
+  generation completes, so it is orthogonal to the single/series split.
+
+Pipeline internals call back into this module's re-exported names (instead
+of calling ``pipeline.stages`` directly) so that patching ``tm.generate_script``
+et al. in tests keeps intercepting pipeline calls, the way it did before the
+single/series split.
+"""
+
+from __future__ import annotations
+
 import os
-import re
 import socket
 import threading
 import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from functools import partial
-from os import path
 from uuid import uuid4
 
 from loguru import logger
@@ -14,8 +35,8 @@ from loguru import logger
 from app.config import config
 from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
-from app.services import bgm as bgm_service
 from app.services import (
+    bgm as bgm_service,
     elevenlabs_music,
     llm,
     loomloom,
@@ -32,8 +53,72 @@ from app.services import (
 )
 from app.services import upload_post
 from app.services import state as sm
+from app.services.pipeline import stages
+from app.services.pipeline import series as _series_pipeline
+from app.services.pipeline import single as _single_pipeline
+from app.services.pipeline import start as start
 from app.utils import file_security, utils
 
+# ---------------------------------------------------------------------------
+# Re-exports for backward compatibility.
+#
+# Earlier code (and existing tests) imported these as ``tm.<name>``. Routing
+# everything through ``app.services.pipeline`` keeps one canonical home for
+# the stage logic while this module stays the public entry point that
+# callers already import. The ``from app.services import ...`` block above
+# also keeps every service module reachable as ``tm.<module>`` for tests
+# that patch attributes on the module itself (``patch.object(tm.voice, ...)``),
+# which works regardless of aliasing since modules are shared singletons.
+# ---------------------------------------------------------------------------
+generate_script = stages.generate_script
+generate_terms = stages.generate_terms
+generate_audio = stages.generate_audio
+generate_subtitle = stages.generate_subtitle
+generate_final_videos = stages.generate_final_videos
+get_video_materials = stages.get_video_materials
+save_script_data = stages.save_script_data
+resolve_custom_audio_file = stages.resolve_custom_audio_file
+get_video_music_prompt = stages.get_video_music_prompt
+mark_task_failed = stages.mark_task_failed
+_mark_task_failed = stages.mark_task_failed
+_run_pipeline = _single_pipeline.run_single_video
+_run_series = _series_pipeline.run_series_video
+_resolve_series_outline = _series_pipeline.resolve_series_outline
+_build_series_part_prompt = _series_pipeline.build_series_part_prompt
+_build_series_part_params = _series_pipeline.build_series_part_params
+_VIDEO_MUSIC_PROVIDERS = stages._VIDEO_MUSIC_PROVIDERS
+_LOOMLOOM_STATE_WRITE_ATTEMPTS = stages._LOOMLOOM_STATE_WRITE_ATTEMPTS
+_LOOMLOOM_STATE_RETRY_DELAY_SECONDS = stages._LOOMLOOM_STATE_RETRY_DELAY_SECONDS
+
+
+def is_task_busy(task: dict | None) -> bool:
+    """Return True while the task is still generating or publishing; shared by every delete entry point."""
+    if not task:
+        return False
+
+    state = task.get("state")
+    try:
+        state = int(state)
+    except (TypeError, ValueError):
+        pass
+
+    # Both video generation and cross-platform publishing can keep reading
+    # the task directory. Treating both as busy avoids API/WebUI disagreeing
+    # on whether a delete is allowed.
+    return (
+        state == const.TASK_STATE_PROCESSING
+        or task.get("cross_post_state") in _ACTIVE_CROSS_POST_STATES
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform publishing helpers.
+#
+# These do not belong to either the single-video or the series pipeline, so
+# they stay here. Anything that wants to schedule a cross-post must call
+# ``_schedule_cross_post``; the Future registry below is the source of truth
+# for "is there a still-running cross-post job for this task in this process".
+# ---------------------------------------------------------------------------
 
 # Cross-post requests can take several minutes to complete, so they must not
 # occupy video-generation concurrency slots. A fixed-size thread pool keeps
@@ -57,8 +142,6 @@ _ACTIVE_CROSS_POST_STATES = {
 }
 _CROSS_POST_STATE_WRITE_ATTEMPTS = 3
 _CROSS_POST_STATE_RETRY_DELAY_SECONDS = 0.1
-_LOOMLOOM_STATE_WRITE_ATTEMPTS = 3
-_LOOMLOOM_STATE_RETRY_DELAY_SECONDS = 0.1
 _INTERRUPTED_CROSS_POST_ERROR = (
     "cross-posting was interrupted before the process completed"
 )
@@ -68,61 +151,6 @@ _CROSS_POST_SOCIAL_PLATFORMS = {
     "instagram": "instagram_reels",
     "facebook": "facebook_reels",
 }
-# Video music providers only need to implement ``is_enabled`` and
-# ``generate_bgm``. Provider differences are isolated to file extensions,
-# domain exceptions, and WebUI warning codes; task orchestration, zero-volume
-# short-circuit, and failure fallback all reuse the same path to avoid
-# duplicating these flows for each new provider.
-_VIDEO_MUSIC_PROVIDERS = {
-    "sonilo": {
-        "service": sonilo,
-        "error_type": sonilo.SoniloError,
-        "suffix": ".m4a",
-        "warning_code": "sonilo_bgm_failed",
-        "display_name": "Sonilo",
-    },
-    "elevenlabs": {
-        "service": elevenlabs_music,
-        "error_type": elevenlabs_music.ElevenLabsMusicError,
-        "suffix": ".mp3",
-        "warning_code": "elevenlabs_bgm_failed",
-        "display_name": "ElevenLabs",
-    },
-}
-
-
-def _get_video_music_prompt(params: VideoParams) -> str:
-    """
-    Read the prompt actually used by the current video music provider.
-
-    New tasks use the provider-agnostic field; old Sonilo CLI params and
-    historical tasks may only have ``sonilo_bgm_prompt``, so only fall back
-    to the old field when the Sonilo-agnostic field is empty.
-    """
-    prompt = str(params.video_music_prompt or "").strip()
-    if params.bgm_type == "sonilo" and not prompt:
-        prompt = str(params.sonilo_bgm_prompt or "").strip()
-    return prompt
-
-
-def is_task_busy(task: dict | None) -> bool:
-    """Return True while the task is still generating or publishing; shared by every delete entry point."""
-    if not task:
-        return False
-
-    state = task.get("state")
-    try:
-        state = int(state)
-    except (TypeError, ValueError):
-        pass
-
-    # Both video generation and cross-platform publishing can keep reading
-    # the task directory. Treating both as busy avoids API/WebUI disagreeing
-    # on whether a delete is allowed.
-    return (
-        state == const.TASK_STATE_PROCESSING
-        or task.get("cross_post_state") in _ACTIVE_CROSS_POST_STATES
-    )
 
 
 def _register_cross_post_future(task_id: str, future: Future) -> None:
@@ -246,763 +274,6 @@ def _is_cross_post_owner_alive(owner: str | None) -> bool:
         )
         return True
     return True
-
-
-def _mark_task_failed(
-    task_id: str,
-    stage: str,
-    error: str,
-    details: dict | None = None,
-) -> dict:
-    """Record structured failure info and preserve progress reached before the task failed."""
-    existing_task = None
-    try:
-        existing_task = sm.state.get_task(task_id)
-    except Exception as exc:
-        logger.warning(f"failed to read task state before failure update: {exc}")
-
-    # Concrete service functions usually have more accurate error reasons than
-    # the orchestration layer. Subsequent empty-result checks must not overwrite
-    # them with generic messages, or API callers would still only see vague info.
-    if (
-        existing_task
-        and existing_task.get("state") == const.TASK_STATE_FAILED
-        and existing_task.get("error")
-    ):
-        return existing_task
-
-    message = str(error or "unknown task error").strip()
-    progress = int((existing_task or {}).get("progress", 0) or 0)
-    logger.error(f"task failed, task_id: {task_id}, stage: {stage}, error: {message}")
-    failure = {
-        "task_id": task_id,
-        "state": const.TASK_STATE_FAILED,
-        "progress": progress,
-        "failed_stage": stage,
-        "error": message,
-    }
-    # Some external tasks already created remote IDs useful for recovery or
-    # troubleshooting. Failure state needs to preserve these non-sensitive fields
-    # but must not allow callers to overwrite the unified state, progress, and
-    # error structure.
-    failure_details = {
-        key: value for key, value in dict(details or {}).items() if key not in failure
-    }
-    failure.update(failure_details)
-    sm.state.update_task(
-        task_id,
-        state=failure["state"],
-        progress=failure["progress"],
-        failed_stage=failure["failed_stage"],
-        error=failure["error"],
-        **failure_details,
-    )
-    return failure
-
-
-def generate_script(task_id, params):
-    logger.info("\n\n## generating video script")
-    video_script = params.video_script.strip()
-    if not video_script:
-        video_script = llm.generate_script(
-            video_subject=params.video_subject,
-            language=params.video_language,
-            paragraph_number=params.paragraph_number,
-            video_script_prompt=params.video_script_prompt,
-            custom_system_prompt=params.custom_system_prompt,
-        )
-    else:
-        logger.debug(f"video script: \n{video_script}")
-
-    if not video_script:
-        _mark_task_failed(task_id, "script", "failed to generate video script")
-        return None
-
-    return video_script
-
-
-def generate_terms(task_id, params, video_script):
-    logger.info("\n\n## generating video terms")
-    video_terms = params.video_terms
-    if not video_terms:
-        # When material matching follows script order, keywords themselves must
-        # also be generated in script narrative order; otherwise even sequential
-        # download and sequential concatenation can only reuse one set of global
-        # theme keywords, failing to fix "footage appearing before its content".
-        video_terms = llm.generate_terms(
-            video_subject=params.video_subject,
-            video_script=utils.remove_pause_tags(video_script),
-            amount=8 if params.match_materials_to_script else 5,
-            match_script_order=params.match_materials_to_script,
-        )
-    else:
-        if isinstance(video_terms, str):
-            video_terms = [term.strip() for term in re.split(r"[,，]", video_terms)]
-        elif isinstance(video_terms, list):
-            video_terms = [term.strip() for term in video_terms]
-        else:
-            raise ValueError("video_terms must be a string or a list of strings.")
-
-        logger.debug(f"video terms: {utils.to_json(video_terms)}")
-
-    if not video_terms:
-        _mark_task_failed(
-            task_id,
-            "terms",
-            "failed to generate video search terms",
-        )
-        return None
-
-    # Optional TwelveLabs Marengo semantic reranking: when disabled returns
-    # original order with no side effects. In sequential matching mode keyword
-    # order IS the script narrative order and must be preserved, so skip.
-    if not params.match_materials_to_script:
-        video_terms = twelvelabs.rerank_terms_by_subject(
-            video_subject=params.video_subject,
-            search_terms=video_terms,
-        )
-
-    return video_terms
-
-
-def save_script_data(task_id, video_script, video_terms, params):
-    script_data = {
-        "script": video_script,
-        "search_terms": video_terms,
-        "params": params,
-    }
-    task_artifacts.write_script_data(task_id, script_data)
-
-
-def resolve_custom_audio_file(
-    task_id: str,
-    custom_audio_file: str | None,
-    *,
-    allow_server_file_input: bool = False,
-) -> str:
-    requested_file = (custom_audio_file or "").strip()
-    if not requested_file:
-        return ""
-
-    task_dir = utils.task_dir(task_id)
-    try:
-        return file_security.resolve_path_within_directory(
-            task_dir,
-            requested_file,
-        )
-    except ValueError as exc:
-        task_dir_error = exc
-
-    # A missing path that otherwise stays inside the task directory is safe to
-    # report precisely. Paths outside that boundary use the same generic error
-    # regardless of whether they exist, so callers cannot probe the host filesystem.
-    if str(task_dir_error) == "file does not exist":
-        raise task_dir_error
-
-    # HTTP requests and other untrusted callers must never turn a submitted path
-    # into a server-side file read. WebUI uploads already live in the task directory;
-    # only the local CLI explicitly opts into resolving files elsewhere on the host.
-    if not allow_server_file_input:
-        raise ValueError(
-            "custom audio file must be stored within the current task directory"
-        ) from task_dir_error
-
-    server_audio_file = path.realpath(
-        requested_file
-        if path.isabs(requested_file)
-        else path.join(utils.root_dir(), requested_file)
-    )
-    if not path.isabs(requested_file):
-        project_root = path.realpath(utils.root_dir())
-        try:
-            if path.commonpath([project_root, server_audio_file]) != project_root:
-                raise ValueError(
-                    "relative custom audio paths must stay within the project directory"
-                )
-        except ValueError as exc:
-            raise ValueError(
-                "custom audio file must be task-local or an existing server-side file"
-            ) from exc
-
-    if not path.isfile(server_audio_file):
-        raise ValueError(
-            "custom audio file does not exist or is not a file"
-        ) from task_dir_error
-
-    return server_audio_file
-
-
-def _resolve_reusable_voice_preview(
-    task_id: str,
-    params,
-    video_script: str,
-    voice_preview: dict | None,
-) -> tuple[str, float, object] | None:
-    """
-    Validate and parse the full voice preview cache submitted by the WebUI.
-
-    This payload is not a public API parameter and can only come from the WebUI
-    in the current process. Even so, background tasks re-verify the script and
-    all voice parameters, and restrict audio to the current task directory;
-    any mismatch falls back to plain TTS to prevent stale previews from
-    contaminating the final output.
-    """
-    if not voice_preview:
-        return None
-
-    expected_values = {
-        "script": str(video_script or "").strip(),
-        "voice_name": params.voice_name,
-        "voice_rate": float(params.voice_rate),
-        "voice_volume": float(params.voice_volume),
-    }
-    if not math.isclose(float(params.voice_volume), 1.0) or any(
-        voice_preview.get(key) != value for key, value in expected_values.items()
-    ):
-        logger.info(
-            f"skip stale voice preview cache, task_id: {task_id}, "
-            "reason: voice parameters changed"
-        )
-        return None
-
-    preview_file = path.realpath(str(voice_preview.get("audio_file") or ""))
-    task_root = path.realpath(utils.task_dir(task_id))
-    try:
-        preview_is_task_local = path.commonpath([task_root, preview_file]) == task_root
-    except ValueError:
-        preview_is_task_local = False
-
-    duration = voice_preview.get("duration")
-    sub_maker = voice_preview.get("sub_maker")
-    if (
-        not preview_is_task_local
-        or not path.isfile(preview_file)
-        or not isinstance(duration, (int, float))
-        or not math.isfinite(duration)
-        or duration <= 0
-        or sub_maker is None
-    ):
-        logger.warning(
-            f"skip invalid voice preview cache, task_id: {task_id}, "
-            f"audio_file: {preview_file or '<empty>'}"
-        )
-        return None
-
-    logger.info(
-        f"using full voice preview audio, task_id: {task_id}, duration: {duration:.2f}s"
-    )
-    return preview_file, math.ceil(duration), sub_maker
-
-
-def generate_audio(
-    task_id,
-    params,
-    video_script,
-    voice_preview=None,
-    *,
-    allow_server_file_input: bool = False,
-):
-    """
-    Generate audio for the video script.
-    If a custom audio file is provided, it will be used directly.
-    There will be no subtitle maker object returned in this case.
-    Otherwise, TTS will be used to generate the audio.
-    Returns:
-        - audio_file: path to the generated or provided audio file
-        - audio_duration: duration of the audio in seconds
-        - sub_maker: subtitle maker object if TTS is used, None otherwise
-    """
-    logger.info("\n\n## generating audio")
-    # The /audio and /subtitle request models do not include custom_audio_file;
-    # handle it here for compatibility so direct callers do not get AttributeError.
-    requested_custom_audio_file = getattr(params, "custom_audio_file", None)
-    try:
-        custom_audio_file = resolve_custom_audio_file(
-            task_id,
-            requested_custom_audio_file,
-            allow_server_file_input=allow_server_file_input,
-        )
-    except ValueError as exc:
-        _mark_task_failed(
-            task_id,
-            "audio",
-            f"invalid custom audio file: {exc}",
-        )
-        return None, None, None
-
-    if not custom_audio_file:
-        reusable_preview = _resolve_reusable_voice_preview(
-            task_id,
-            params,
-            video_script,
-            voice_preview,
-        )
-        if reusable_preview:
-            return reusable_preview
-
-        logger.info("no custom audio file provided, using TTS to generate audio.")
-        audio_file = path.join(utils.task_dir(task_id), "audio.mp3")
-        sub_maker = voice.tts(
-            text=video_script,
-            voice_name=voice.parse_voice_name(params.voice_name),
-            voice_rate=params.voice_rate,
-            voice_file=audio_file,
-        )
-        if sub_maker is None:
-            # The real failure reason (e.g. quota, auth, bad voice) is already
-            # logged by the voice provider. Surface a hint pointing the user
-            # at the application logs so they can distinguish quota / auth /
-            # connectivity failures from "wrong voice name".
-            _mark_task_failed(
-                task_id,
-                "audio",
-                "failed to synthesize audio; verify the selected voice, "
-                "TTS API key, and quota. See the application log for the "
-                "exact provider error.",
-            )
-            return None, None, None
-        # Measure the real written audio_file, not sub_maker.cues[-1].end:
-        # the latter is the last WORD BOUNDARY, and TTS leaves a fixed tail
-        # past it (Edge TTS: ~0.88s at any length - 19% of a 7-word clip but
-        # 1.4% of a 153-word one, so short scripts suffer most). The
-        # under-count sizes paid generate_bgm() calls, is reported as
-        # audio_duration to the API/WebUI, and under-sources
-        # download_videos() material, scaled by video_count.
-        file_duration = voice.get_audio_duration(audio_file)
-        audio_duration = math.ceil(
-            file_duration if file_duration > 0 else voice.get_audio_duration(sub_maker)
-        )
-        if audio_duration == 0:
-            _mark_task_failed(task_id, "audio", "generated audio duration is zero")
-            return None, None, None
-        return audio_file, audio_duration, sub_maker
-    else:
-        logger.info(f"using custom audio file: {custom_audio_file}")
-        audio_duration = voice.get_audio_duration(custom_audio_file)
-        if audio_duration == 0:
-            _mark_task_failed(
-                task_id,
-                "audio",
-                "custom audio duration is zero",
-            )
-            return None, None, None
-        return custom_audio_file, audio_duration, None
-
-
-def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
-    """
-    Generate subtitle for the video script.
-    If subtitle generation is disabled or no subtitle maker is provided, it will return an empty string.
-    Otherwise, it will generate the subtitle using the specified provider.
-    Returns:
-        - subtitle_path: path to the generated subtitle file
-    """
-    logger.info("\n\n## generating subtitle")
-    if not params.subtitle_enabled:
-        return ""
-
-    subtitle_path = path.join(utils.task_dir(task_id), "subtitle.srt")
-    subtitle_provider = config.app.get("subtitle_provider", "edge").strip().lower()
-    logger.info(f"\n\n## generating subtitle, provider: {subtitle_provider}")
-
-    if not subtitle_provider:
-        logger.info("subtitle provider is empty, skip subtitle generation")
-        return ""
-
-    if sub_maker is None and subtitle_provider != "whisper":
-        # Custom audio does not go through TTS, so there is no sub_maker
-        # timeline from Edge/Azure TTS. Only Whisper can transcribe subtitles
-        # directly from audio files; other subtitle providers keep their
-        # original behavior to avoid generating incorrect empty timelines.
-        logger.warning(
-            "subtitle maker is missing, skip subtitle generation for provider: "
-            f"{subtitle_provider}"
-        )
-        return ""
-
-    # `subtitle_provider=edge` effectively means "use the word-level timeline
-    # returned by TTS", but only Azure v1/v2 actually returns WordBoundary;
-    # providers like Gemini/ElevenLabs/Fish Audio/Kokoro/Chatterbox/MiniMax/MiMo/
-    # SiliconFlow estimate duration linearly by character count via
-    # `populate_legacy_submaker_with_full_text`, which causes whole-segment
-    # drift when used as subtitle timeline. Detecting an estimated timeline here
-    # auto-switches to Whisper so any TTS gets properly synced subtitles under
-    # default config.
-    if (
-        subtitle_provider == "edge"
-        and subtitle_provider != "whisper"
-        and not voice.has_real_word_timestamps(sub_maker)
-    ):
-        logger.warning(
-            "TTS provider did not return real word-level timestamps; "
-            "falling back to whisper for accurate subtitle alignment"
-        )
-        subtitle_provider = "whisper"
-
-    is_word_level = getattr(params, "subtitle_display_mode", "sentence") == "word_by_word"
-
-    if subtitle_provider == "edge":
-        voice.create_subtitle(
-            text=video_script,
-            sub_maker=sub_maker,
-            subtitle_file=subtitle_path,
-            word_level=is_word_level,
-        )
-        if not os.path.exists(subtitle_path):
-            # Edge subtitles occasionally fail to produce output when the timeline
-            # cannot match the script. Auto-switching to Whisper is not done here
-            # because the first failure would download a GB-scale model without
-            # user knowledge. Only explicitly configured Whisper is allowed to load
-            # the model; Edge failures leave a subtitle-less video and log the
-            # reason, avoiding unexpected network and disk overhead.
-            logger.warning(
-                "edge subtitle generation did not produce a subtitle file; "
-                "skip subtitles without falling back to whisper"
-            )
-            return ""
-
-    if subtitle_provider == "whisper":
-        subtitle.create(
-            audio_file=audio_file,
-            subtitle_file=subtitle_path,
-            word_level=is_word_level,
-        )
-        if not is_word_level:
-            logger.info("\n\n## correcting subtitle")
-            subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
-
-    subtitle_lines = subtitle.file_to_subtitles(subtitle_path)
-    if not subtitle_lines:
-        logger.warning(f"subtitle file is invalid: {subtitle_path}")
-        return ""
-
-    return subtitle_path
-
-
-def get_video_materials(
-    task_id,
-    params,
-    video_terms,
-    audio_duration,
-    loomloom_video_request: loomloom.LoomLoomConfirmedVideoRequest | None = None,
-):
-    if params.video_source == "local":
-        logger.info("\n\n## preprocess local materials")
-        materials = video.preprocess_video(
-            materials=params.video_materials, clip_duration=params.video_clip_duration
-        )
-        if not materials:
-            _mark_task_failed(
-                task_id,
-                "materials",
-                "no valid local video materials were found",
-            )
-            return None
-        return [material_info.url for material_info in materials]
-    elif params.video_source == "loomloom":
-        if not isinstance(
-            loomloom_video_request, loomloom.LoomLoomConfirmedVideoRequest
-        ):
-            _mark_task_failed(
-                task_id,
-                "materials",
-                "LoomLoom video generation requires a confirmed quote",
-            )
-            return None
-
-        request = loomloom_video_request
-        logger.info(
-            "\n\n## generating "
-            f"{len(request.batch.input_rows)} video materials with LoomLoom"
-        )
-        run_id = ""
-        try:
-            request.validate()
-            backend = loomloom.LoomLoomVideoBackend(request.settings)
-            execution = backend.execute(
-                request.batch,
-                client_request_id=request.client_request_id,
-                listing_version_id=request.listing_version_id,
-                confirm=True,
-            )
-            run_id = execution.run_id
-            # execute returning means the paid task has been accepted by the remote.
-            # The run ID must be written to the process log first, so that even if
-            # Redis or other state backend becomes unavailable later, operators can
-            # still locate the task on the platform side via the logs; the unique
-            # identifier must not exist only in a local variable.
-            logger.info(
-                "LoomLoom paid video run created: "
-                f"task_id={task_id}, run_id={run_id}, "
-                f"listing_version_id={request.listing_version_id}"
-            )
-            # As soon as a paid task is created, immediately record the remote ID.
-            # Even if subsequent polling times out, logs and task state can still
-            # help users or platform support locate and recover already-generated
-            # artifacts. State backend failures can only reduce observability;
-            # they cannot interrupt already-billing remote tasks and artifact downloads.
-            _record_loomloom_run_reference(
-                task_id=task_id,
-                run_id=run_id,
-                listing_version_id=request.listing_version_id,
-            )
-            backend.wait_for_run(run_id)
-            return list(
-                backend.download_video_results(
-                    run_id,
-                    utils.task_dir(task_id),
-                )
-            )
-        except (loomloom.LoomLoomError, ValueError) as exc:
-            _mark_task_failed(
-                task_id,
-                "materials",
-                str(exc),
-                details={
-                    "loomloom_run_id": run_id,
-                    "loomloom_listing_version_id": request.listing_version_id,
-                },
-            )
-            return None
-    else:
-        logger.info(f"\n\n## downloading videos from {params.video_source}")
-        # Sequential matching mode only applies when the user explicitly enables it.
-        # Here we force material downloads to poll in keyword order to prevent
-        # early keywords from downloading too much material and pushing later
-        # script topics off the final timeline.
-        try:
-            downloaded_videos = material.download_videos(
-                task_id=task_id,
-                search_terms=video_terms,
-                source=params.video_source,
-                video_aspect=params.video_aspect,
-                video_concat_mode=(
-                    VideoConcatMode.sequential
-                    if params.match_materials_to_script
-                    else params.video_concat_mode
-                ),
-                audio_duration=audio_duration * params.video_count,
-                max_clip_duration=params.video_clip_duration,
-                match_script_order=params.match_materials_to_script,
-            )
-        except volcengine_seedance.VolcEngineSeedanceError as exc:
-            # Both unconfirmed state and "generated but download failed" correspond
-            # to a remote task recoverable from the Ark console. Write failure state
-            # uniformly from the task_id carried in the exception, avoiding
-            # different exception branches each maintaining their own recovery info
-            # and missing it again in future extensions.
-            remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
-            details = (
-                {"volcengine_seedance_task_id": remote_task_id}
-                if remote_task_id
-                else None
-            )
-            _mark_task_failed(
-                task_id,
-                "materials",
-                str(exc),
-                details=details,
-            )
-            return None
-        except ofox.OFoxError as exc:
-            # Same recovery semantics as Ark: both unconfirmed state and "generated
-            # but download failed" correspond to a remote task recoverable from the
-            # OFox console; write failure state uniformly from the task_id in the exception.
-            remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
-            details = (
-                {"ofox_task_id": remote_task_id} if remote_task_id else None
-            )
-            _mark_task_failed(
-                task_id,
-                "materials",
-                str(exc),
-                details=details,
-            )
-            return None
-        except metaso_minimax.MetasoMiniMaxError as exc:
-            # Metaso tasks use different recovery entry points and field names than
-            # Ark tasks and cannot be merged into a single vague remote_task_id.
-            # Keeping the explicit Provider prefix allows API, WebUI, and ops logs
-            # to directly locate the corresponding platform.
-            remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
-            details = (
-                {"metaso_minimax_task_id": remote_task_id} if remote_task_id else None
-            )
-            _mark_task_failed(
-                task_id,
-                "materials",
-                str(exc),
-                details=details,
-            )
-            return None
-        if not downloaded_videos:
-            _mark_task_failed(
-                task_id,
-                "materials",
-                f"failed to download video materials from {params.video_source}",
-            )
-            return None
-        return downloaded_videos
-
-
-def _record_loomloom_run_reference(
-    *, task_id: str, run_id: str, listing_version_id: str
-) -> bool | None:
-    """
-    Best-effort persistence of a created paid LoomLoom Run; do not let state
-    failures interrupt the remote task.
-
-    Returns True on success, False if the task record no longer exists, and
-    None if the state backend remains unavailable after finite retries.
-    Callers should continue polling and downloading regardless of which result
-    they receive, because execute has already produced external billing side
-    effects; stopping the local flow only makes artifacts harder to recover.
-    """
-    fields = {
-        "loomloom_run_id": run_id,
-        "loomloom_listing_version_id": listing_version_id,
-    }
-    for attempt in range(1, _LOOMLOOM_STATE_WRITE_ATTEMPTS + 1):
-        try:
-            updated = sm.state.patch_task(task_id, **fields)
-        except Exception as exc:
-            if attempt >= _LOOMLOOM_STATE_WRITE_ATTEMPTS:
-                logger.exception(
-                    "failed to persist LoomLoom paid run after retries: "
-                    f"task_id={task_id}, run_id={run_id}, attempts={attempt}, "
-                    f"error={exc}"
-                )
-                return None
-            logger.warning(
-                "retry LoomLoom paid run state update: "
-                f"task_id={task_id}, run_id={run_id}, attempt={attempt}, "
-                f"error={exc}"
-            )
-            time.sleep(_LOOMLOOM_STATE_RETRY_DELAY_SECONDS)
-            continue
-
-        if updated is False:
-            logger.warning(
-                "could not persist LoomLoom paid run because task is missing: "
-                f"task_id={task_id}, run_id={run_id}"
-            )
-        return updated
-
-    return None
-
-
-def generate_final_videos(
-    task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration
-):
-    final_video_paths = []
-    combined_video_paths = []
-    warnings = []
-    video_music_provider = _VIDEO_MUSIC_PROVIDERS.get(params.bgm_type)
-    video_music_requested = (
-        video_music_provider is not None
-        and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
-    )
-    # Multi-video generation shuffles materials by default for variety; but
-    # "match materials to script order" seeks timeline stability and
-    # explainability, so when enabled all outputs use sequential concatenation.
-    if params.match_materials_to_script:
-        video_concat_mode = VideoConcatMode.sequential
-    elif params.video_count == 1:
-        video_concat_mode = params.video_concat_mode
-    else:
-        video_concat_mode = VideoConcatMode.random
-    video_transition_mode = params.video_transition_mode
-
-    _progress = 50
-    for i in range(params.video_count):
-        index = i + 1
-        combined_video_path = path.join(
-            utils.task_dir(task_id), f"combined-{index}.mp4"
-        )
-        logger.info(f"\n\n## combining video: {index} => {combined_video_path}")
-        video.combine_videos(
-            combined_video_path=combined_video_path,
-            video_paths=downloaded_videos,
-            audio_file=audio_file,
-            video_aspect=params.video_aspect,
-            video_fit_mode=params.video_fit_mode,
-            video_concat_mode=video_concat_mode,
-            video_transition_mode=video_transition_mode,
-            max_clip_duration=params.video_clip_duration,
-            threads=params.n_threads,
-            clip_speed=params.video_clip_speed,
-        )
-
-        _progress += 50 / params.video_count / 2
-        sm.state.update_task(task_id, progress=_progress)
-
-        final_video_path = path.join(utils.task_dir(task_id), f"final-{index}.mp4")
-
-        # In video music mode, explicitly disable default BGM parsing first to
-        # avoid stale bgm_file from old tasks being reused. Only generate a
-        # proxy and call the paid API when volume is greater than 0; zero
-        # volume is uniformly skipped.
-        bgm_file_override = "" if video_music_provider else None
-        if video_music_requested:
-            service = video_music_provider["service"]
-            display_name = video_music_provider["display_name"]
-            warning_code = video_music_provider["warning_code"]
-            generated_bgm_path = path.join(
-                utils.task_dir(task_id),
-                (f"{params.bgm_type}-bgm-{index}{video_music_provider['suffix']}"),
-            )
-            try:
-                service.generate_bgm(
-                    video_path=combined_video_path,
-                    output_path=generated_bgm_path,
-                    video_duration=audio_duration,
-                    prompt=_get_video_music_prompt(params),
-                )
-                bgm_file_override = generated_bgm_path
-            except video_music_provider["error_type"] as exc:
-                # When video, narration, and subtitles are all generated, a
-                # third-party music temporary failure should not waste the whole
-                # task. The current video explicitly disables BGM and returns
-                # the degraded result to WebUI to alert the user.
-                logger.warning(
-                    f"{display_name} BGM generation failed: task_id={task_id}, "
-                    f"video_index={index}, error={exc}"
-                )
-                bgm_file_override = ""
-                warnings.append({"code": warning_code, "video_index": index})
-
-        logger.info(f"\n\n## generating video: {index} => {final_video_path}")
-        bgm_mix_succeeded = video.generate_video(
-            video_path=combined_video_path,
-            audio_path=audio_file,
-            subtitle_path=subtitle_path,
-            output_file=final_video_path,
-            params=params,
-            bgm_file_override=bgm_file_override,
-        )
-        if (
-            video_music_provider is not None
-            and bgm_file_override
-            and not bgm_mix_succeeded
-        ):
-            # Third party returned successfully and passed FFmpeg validation,
-            # but MoviePy's final mixing may still fail due to runtime environment.
-            # Video service keeps the non-BGM output; when API generation fails
-            # the override is empty, so no duplicate warning is appended.
-            warnings.append(
-                {
-                    "code": video_music_provider["warning_code"],
-                    "video_index": index,
-                }
-            )
-
-        _progress += 50 / params.video_count / 2
-        sm.state.update_task(task_id, progress=_progress)
-
-        final_video_paths.append(final_video_path)
-        combined_video_paths.append(combined_video_path)
-
-    return final_video_paths, combined_video_paths, warnings
 
 
 def _patch_cross_post_state(task_id: str, **kwargs) -> bool | None:
@@ -1203,6 +474,16 @@ def _run_cross_post(
                     "success": False,
                     "error": "Upload-Post returned an invalid response",
                 }
+            elif result.get("success") and result.get("request_id"):
+                # The initial response only means "Upload-Post accepted the
+                # file"; actual TikTok/Instagram/YouTube publishing happens
+                # async. Poll for the real terminal outcome so cross_post_results
+                # reflects what the platforms actually reported, not just intake.
+                poll_result = upload_post.upload_post_service.poll_status(
+                    result["request_id"]
+                )
+                if isinstance(poll_result, dict):
+                    result = {**result, **poll_result}
             results.append(result)
 
         failures = [result for result in results if not result.get("success")]
@@ -1357,536 +638,77 @@ def _schedule_cross_post(
     return None
 
 
-def _run_pipeline(
-    task_id,
-    params: VideoParams,
-    stop_at: str = "video",
-    voice_preview: dict | None = None,
-    loomloom_video_request: loomloom.LoomLoomConfirmedVideoRequest | None = None,
-    allow_server_file_input: bool = False,
-):
-    logger.info(f"start task: {task_id}, stop_at: {stop_at}")
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
+def schedule_manual_cross_post(
+    task_id: str,
+    platforms: list[str] | None = None,
+    force: bool = False,
+) -> tuple[bool, str | None, int]:
+    """
+    Schedule a cross-post for an already-completed task outside the normal
+    auto-upload flow (the WebUI's manual "Publish" button, or the
+    POST .../publish HTTP endpoint).
 
-    if (
-        stop_at in {"materials", "video"}
-        and params.video_source == "volcengine_seedance"
-        and not volcengine_seedance.is_enabled()
-    ):
-        return _mark_task_failed(
-            task_id,
-            "preflight",
-            "Volcano Engine Seedance requires an Ark API key",
-        )
+    Returns ``(scheduled, error, status_code)`` so both callers can map the
+    outcome to a response without re-implementing these checks. ``force``
+    only overrides an active state that recovery would also treat as
+    orphaned (no Future in this process and no live owner process); it never
+    lets two real cross-post jobs run for the same task at once.
+    """
+    if not upload_post.upload_post_service.is_configured():
+        return False, "Upload-Post is not configured", 400
 
-    if (
-        stop_at in {"materials", "video"}
-        and params.video_source == "ofox"
-        and not ofox.is_enabled()
-    ):
-        return _mark_task_failed(
-            task_id,
-            "preflight",
-            "OFox video generation requires an OFox API key",
-        )
+    task = sm.state.get_task(task_id)
+    if not task:
+        return False, "task not found", 404
 
-    if (
-        stop_at in {"materials", "video"}
-        and params.video_source == "metaso_minimax"
-        and not metaso_minimax.is_enabled()
-    ):
-        return _mark_task_failed(
-            task_id,
-            "preflight",
-            "Metaso MiniMax requires an API key",
-        )
+    if task.get("state") != const.TASK_STATE_COMPLETE or not task.get("videos"):
+        return False, "video generation is not complete", 400
 
-    if (
-        stop_at in {"materials", "video"}
-        and params.video_source == "openai_image"
-        and not material.is_openai_image_enabled(
-            config.snapshot_config_with_pending(config.app)
-        )
-    ):
-        return _mark_task_failed(
-            task_id,
-            "preflight",
-            "OpenAI image source requires openai_image_base_url and "
-            "openai_image_model in config.toml (openai_image_api_keys is "
-            "optional for local gateways that need no auth)",
-        )
+    if task.get("cross_post_state") in _ACTIVE_CROSS_POST_STATES:
+        orphaned = not _is_cross_post_active_in_process(
+            task_id
+        ) and not _is_cross_post_owner_alive(task.get("cross_post_owner"))
+        if not (force and orphaned):
+            return False, "cross-post is already active for this task", 409
 
-    # Only the full video generation pipeline needs a video music provider.
-    # Block incomplete tasks missing a key early, before consuming LLM, TTS,
-    # and material service quotas; intermediate product endpoints can still
-    # be used independently.
-    video_music_provider = _VIDEO_MUSIC_PROVIDERS.get(params.bgm_type)
-    video_music_enabled = (
-        stop_at == "video"
-        and video_music_provider is not None
-        and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
+    resolved_platforms = (
+        list(platforms) if platforms else list(upload_post.upload_post_service.platforms)
     )
-    if video_music_enabled:
-        service = video_music_provider["service"]
-        display_name = video_music_provider["display_name"]
-        if not service.is_enabled():
-            return _mark_task_failed(
-                task_id,
-                "preflight",
-                f"{display_name} background music requires an API key",
-            )
+    if not resolved_platforms:
+        return False, "no platforms selected", 400
 
-        # WebUI limits input length, but API, CLI, and historical tasks can
-        # bypass front-end controls. Re-validate against provider limits before
-        # generating script, voice, and materials, so rejection by a third party
-        # only happens after full video synthesis would have been attempted.
-        # Service layer keeps the same validation as a last line of defense
-        # for direct calls.
-        music_prompt = _get_video_music_prompt(params)
-        max_prompt_length = int(getattr(service, "MAX_PROMPT_LENGTH", 0) or 0)
-        if max_prompt_length and len(music_prompt) > max_prompt_length:
-            return _mark_task_failed(
-                task_id,
-                "preflight",
-                (f"{display_name} music prompt exceeds {max_prompt_length} characters"),
-            )
-
-        # Providers may optionally offer non-billed account pre-checks. The
-        # check function should only throw deterministic errors; when network
-        # fluctuations or permission scope cannot be confirmed, the service
-        # layer logs a warning and proceeds with actual generation.
-        validate_access = getattr(service, "validate_generation_access", None)
-        if callable(validate_access):
-            try:
-                validate_access()
-            except video_music_provider["error_type"] as exc:
-                return _mark_task_failed(task_id, "preflight", str(exc))
-
-    # Only script/terms intermediate products do not need FFmpeg (they generate
-    # no audio or video). API, CLI, and WebUI all execute tasks through this
-    # shared entry point, so probe here once rather than duplicating checks at
-    # each entry, ensuring consistent behavior across all three paths. Placed
-    # after the music-key check to preserve that check's original "fail first"
-    # order and error messages.
-    if stop_at not in ("script", "terms") and not utils.check_ffmpeg_ready():
-        return _mark_task_failed(
-            task_id,
-            "preflight",
-            "ffmpeg is not available; install ffmpeg or set app.ffmpeg_path "
-            "in config.toml to a working ffmpeg executable",
-        )
-
-    # 1. Generate script
-    video_script = generate_script(task_id, params)
-    if not video_script or "Error: " in video_script:
-        error = (
-            video_script.removeprefix("Error: ").strip()
-            if isinstance(video_script, str) and "Error: " in video_script
-            else "failed to generate video script"
-        )
-        return _mark_task_failed(task_id, "script", error)
-
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=10)
-
-    if stop_at == "script":
-        sm.state.update_task(
-            task_id, state=const.TASK_STATE_COMPLETE, progress=100, script=video_script
-        )
-        return {"script": video_script}
-
-    # 2. Generate terms
-    video_terms = ""
-    if params.video_source != "local":
-        video_terms = generate_terms(task_id, params, video_script)
-        if not video_terms:
-            return _mark_task_failed(
-                task_id,
-                "terms",
-                "failed to generate video search terms",
-            )
-
-    save_script_data(task_id, video_script, video_terms, params)
-
-    if stop_at == "terms":
-        sm.state.update_task(
-            task_id, state=const.TASK_STATE_COMPLETE, progress=100, terms=video_terms
-        )
-        return {"script": video_script, "terms": video_terms}
-
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=20)
-
-    # 3. Generate audio
-    audio_file, audio_duration, sub_maker = generate_audio(
+    updated = _patch_cross_post_state(
         task_id,
-        params,
-        video_script,
-        voice_preview=voice_preview,
-        allow_server_file_input=allow_server_file_input,
+        cross_post_state=const.CROSS_POST_STATE_PENDING,
+        cross_post_results=None,
+        cross_post_error=None,
+        cross_post_owner=_cross_post_process_owner,
     )
-    if not audio_file:
-        return _mark_task_failed(
-            task_id,
-            "audio",
-            "failed to prepare narration audio",
-        )
+    if updated is not True:
+        if updated is False:
+            return False, "task not found", 404
+        return False, "failed to update task state", 500
 
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=30)
+    video_script = str(task.get("script") or "")
+    # ponytail: video_subject is never persisted to task state (it only lives
+    # transiently during generation, or inside script.json's params blob,
+    # which has no reader today); truncate the script as a stand-in title
+    # hint. Add a task_artifacts reader for the original subject if this
+    # produces noticeably worse captions in practice.
+    video_subject = video_script.strip()[:80] or task_id
 
-    if stop_at == "audio":
-        sm.state.update_task(
-            task_id,
-            state=const.TASK_STATE_COMPLETE,
-            progress=100,
-            audio_file=audio_file,
-        )
-        return {"audio_file": audio_file, "audio_duration": audio_duration}
-
-    # 4. Generate subtitle
-    subtitle_path = generate_subtitle(
-        task_id, params, video_script, sub_maker, audio_file
+    scheduling_error = _schedule_cross_post(
+        task_id=task_id,
+        video_paths=list(task.get("videos") or []),
+        params=VideoParams(video_subject=video_subject),
+        video_script=video_script,
+        platforms=resolved_platforms,
+        youtube_privacy_status=upload_post.upload_post_service.youtube_privacy_status,
     )
+    if scheduling_error:
+        return False, scheduling_error, 429
 
-    if stop_at == "subtitle":
-        sm.state.update_task(
-            task_id,
-            state=const.TASK_STATE_COMPLETE,
-            progress=100,
-            subtitle_path=subtitle_path,
-        )
-        return {"subtitle_path": subtitle_path}
-
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
-
-    # 5. Get video materials
-    downloaded_videos = get_video_materials(
-        task_id,
-        params,
-        video_terms,
-        audio_duration,
-        loomloom_video_request=loomloom_video_request,
-    )
-    if not downloaded_videos:
-        return _mark_task_failed(
-            task_id,
-            "materials",
-            "failed to prepare video materials",
-        )
-
-    if stop_at == "materials":
-        sm.state.update_task(
-            task_id,
-            state=const.TASK_STATE_COMPLETE,
-            progress=100,
-            materials=downloaded_videos,
-        )
-        return {"materials": downloaded_videos}
-
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=50)
-
-    # Only the full video generation pipeline needs to process video concat mode;
-    # this prevents /subtitle and /audio requests from accessing non-existent fields.
-    if type(params.video_concat_mode) is str:
-        params.video_concat_mode = VideoConcatMode(params.video_concat_mode)
-
-    # 6. Generate final videos
-    final_video_paths, combined_video_paths, generation_warnings = (
-        generate_final_videos(
-            task_id,
-            params,
-            downloaded_videos,
-            audio_file,
-            subtitle_path,
-            audio_duration,
-        )
-    )
-
-    if not final_video_paths:
-        return _mark_task_failed(
-            task_id,
-            "video",
-            "failed to generate final video",
-        )
-
-    logger.success(
-        f"task {task_id} finished, generated {len(final_video_paths)} videos."
-    )
-
-    # 7. Complete video generation first, then submit cross-platform publishing
-    # on demand. Third-party uploads can take several minutes and should not
-    # block video result return or retroactively affect already-generated output.
-    cross_post_enabled = (
-        upload_post.upload_post_service.is_configured()
-        and upload_post.upload_post_service.auto_upload
-    )
-    platforms = (
-        list(upload_post.upload_post_service.platforms) if cross_post_enabled else []
-    )
-    should_cross_post = cross_post_enabled and bool(platforms)
-    if cross_post_enabled and not platforms:
-        logger.warning(
-            f"skip cross-post because no platforms are configured, task_id: {task_id}"
-        )
-    cross_post_state = const.CROSS_POST_STATE_PENDING if should_cross_post else None
-
-    kwargs = {
-        "videos": final_video_paths,
-        "combined_videos": combined_video_paths,
-        "script": video_script,
-        "terms": video_terms,
-        "audio_file": audio_file,
-        "audio_duration": audio_duration,
-        "subtitle_path": subtitle_path,
-        "materials": downloaded_videos,
-        "cross_post_state": cross_post_state,
-        "cross_post_results": None,
-        "cross_post_error": None,
-        "cross_post_owner": _cross_post_process_owner if should_cross_post else None,
-        "warnings": generation_warnings or None,
-    }
-    sm.state.update_task(
-        task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
-    )
-
-    if should_cross_post:
-        scheduling_error = _schedule_cross_post(
-            task_id=task_id,
-            video_paths=final_video_paths,
-            params=params,
-            video_script=video_script,
-            platforms=platforms,
-            youtube_privacy_status=(
-                upload_post.upload_post_service.youtube_privacy_status
-            ),
-        )
-        # Queue full or thread pool shutdown are synchronously known scheduling
-        # failures. Task state has already been updated by the scheduling
-        # function; correct the return snapshot synchronously to avoid the
-        # caller receiving a pending state inconsistent with subsequent queries.
-        if scheduling_error:
-            kwargs["cross_post_state"] = const.CROSS_POST_STATE_FAILED
-            kwargs["cross_post_error"] = scheduling_error
-            kwargs["cross_post_owner"] = None
-
-    return kwargs
-
-
-def _resolve_series_outline(params: VideoParams) -> list[str]:
-    """Return the chapter subjects for a series task, planning them if needed."""
-    outline = [
-        chapter.strip() for chapter in (params.series_outline or []) if chapter.strip()
-    ]
-    if outline:
-        # An outline confirmed in the WebUI wins over the count input: the user
-        # already saw and edited the chapters they want.
-        logger.info(f"using the confirmed series outline: {len(outline)} chapters")
-        return outline[: const.MAX_SERIES_PARTS]
-
-    return llm.generate_series_outline(
-        video_subject=params.video_subject or params.video_script,
-        parts=params.series_parts,
-        language=params.video_language,
-        video_script_prompt=params.video_script_prompt,
-    )
-
-
-def _build_series_part_prompt(params: VideoParams, outline: list[str], index: int) -> str:
-    """Tell one part where it sits in the series, so the chapters do not overlap."""
-    total = len(outline)
-    lines = [
-        f'This is part {index} of {total} in a video series about '
-        f'"{params.video_subject}".',
-        f"This part covers only: {outline[index - 1]}",
-    ]
-    if index > 1:
-        lines.append(f"The previous part covered: {outline[index - 2]}")
-    if index < total:
-        lines.append(f"The next part will cover: {outline[index]}")
-    lines.append(
-        "Do not repeat what the other parts cover, and do not summarize the "
-        "whole series."
-    )
-
-    context = "\n".join(lines)
-    user_prompt = (params.video_script_prompt or "").strip()
-    if not user_prompt:
-        return context
-
-    # Series context goes first: the script service truncates the tail at
-    # MAX_SCRIPT_PROMPT_LENGTH, and losing the context would break the arc.
-    return f"{context}\n\n{user_prompt}"
-
-
-def _build_series_part_params(
-    params: VideoParams, outline: list[str], index: int
-) -> VideoParams:
-    part_params = params.model_copy(deep=True)
-    part_params.series_enabled = False
-    part_params.video_subject = outline[index - 1]
-    # Each part writes its own script and keywords. Reusing the series-level
-    # ones would give every chapter the same narration and the same footage.
-    part_params.video_script = ""
-    part_params.video_terms = None
-    if params.series_continuity:
-        part_params.video_script_prompt = _build_series_part_prompt(
-            params, outline, index
-        )
-    if params.custom_audio_file:
-        # One narration file cannot serve several chapters.
-        logger.warning(
-            "series mode ignores the custom audio file; each part narrates its "
-            "own script"
-        )
-        part_params.custom_audio_file = None
-    return part_params
-
-
-def _run_series(
-    task_id,
-    params: VideoParams,
-    stop_at: str = "video",
-    allow_server_file_input: bool = False,
-):
-    """
-    Run the normal pipeline once per chapter and collect the results.
-
-    Parts run under nested task ids, so each chapter keeps its own directory,
-    script, and final videos inside the parent task directory.
-    """
-    outline = _resolve_series_outline(params)
-    if not outline:
-        return _mark_task_failed(task_id, "series", "failed to plan the video series")
-
-    total = len(outline)
-    logger.info(f"start series task: {task_id}, parts: {total}")
-    sm.state.update_task(
-        task_id,
-        state=const.TASK_STATE_PROCESSING,
-        progress=5,
-        series_outline=outline,
-    )
-
-    parts = []
-    videos = []
-    scripts = []
-    warnings = []
-    for index, chapter in enumerate(outline, start=1):
-        part_task_id = f"{task_id}/part-{index:02d}"
-        logger.info(f"\n\n## series part {index}/{total}: {chapter}")
-        result = _run_pipeline(
-            part_task_id,
-            _build_series_part_params(params, outline, index),
-            stop_at=stop_at,
-            allow_server_file_input=allow_server_file_input,
-        )
-        if result.get("state") == const.TASK_STATE_FAILED:
-            # One failed chapter must not throw away the parts that did render.
-            logger.error(
-                f"series part failed: task_id={task_id}, part={index}, "
-                f"error={result.get('error')}"
-            )
-            warnings.append(
-                {
-                    "code": "series_part_failed",
-                    "part": index,
-                    "subject": chapter,
-                    "error": result.get("error"),
-                }
-            )
-        else:
-            videos.extend(result.get("videos") or [])
-            scripts.append(result.get("script") or "")
-            parts.append(
-                {
-                    "part": index,
-                    "subject": chapter,
-                    "task_id": part_task_id,
-                    "videos": result.get("videos") or [],
-                }
-            )
-
-        sm.state.update_task(
-            task_id,
-            state=const.TASK_STATE_PROCESSING,
-            progress=5 + int(90 * index / total),
-        )
-
-    if not parts:
-        return _mark_task_failed(task_id, "series", "every part of the series failed")
-
-    video_script = "\n\n".join(script for script in scripts if script)
-    # The parent directory keeps its own script.json, so a series appears in the
-    # task history and stays restorable just like a single video task.
-    save_script_data(task_id, video_script, [], params)
-
-    kwargs = {
-        "videos": videos,
-        "script": video_script,
-        "series_outline": outline,
-        "series_parts": parts,
-        "warnings": warnings or None,
-    }
-    sm.state.update_task(
-        task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
-    )
-    logger.success(
-        f"series task {task_id} finished, {len(parts)}/{total} parts, "
-        f"{len(videos)} videos."
-    )
-    return kwargs
-
-
-def start(
-    task_id,
-    params: VideoParams,
-    stop_at: str = "video",
-    voice_preview: dict | None = None,
-    loomloom_video_request: loomloom.LoomLoomConfirmedVideoRequest | None = None,
-    allow_server_file_input: bool = False,
-):
-    """
-    Execute the task pipeline and ensure unexpected exceptions also convert to queryable failure states.
-
-    ``allow_server_file_input`` is for local CLI use only. HTTP API and WebUI
-    must keep the default value so custom audio is always constrained to the
-    current task directory.
-    """
-    try:
-        if params.series_enabled:
-            if loomloom_video_request is not None:
-                return _mark_task_failed(
-                    task_id,
-                    "preflight",
-                    "series mode cannot reuse a confirmed LoomLoom video quote; "
-                    "each part needs its own quote",
-                )
-            if voice_preview:
-                # The preview was rendered for a single script; every part
-                # narrates its own.
-                logger.warning("series mode ignores the reusable voice preview")
-            return _run_series(
-                task_id,
-                params,
-                stop_at=stop_at,
-                allow_server_file_input=allow_server_file_input,
-            )
-
-        return _run_pipeline(
-            task_id,
-            params,
-            stop_at=stop_at,
-            voice_preview=voice_preview,
-            loomloom_video_request=loomloom_video_request,
-            allow_server_file_input=allow_server_file_input,
-        )
-    except Exception as exc:
-        logger.exception(
-            f"unexpected task pipeline failure, task_id: {task_id}, error: {exc}"
-        )
-        return _mark_task_failed(
-            task_id,
-            "pipeline",
-            f"{type(exc).__name__}: {exc}",
-        )
+    return True, None, 202
 
 
 if __name__ == "__main__":

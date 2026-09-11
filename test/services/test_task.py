@@ -959,7 +959,11 @@ class TestTaskService(unittest.TestCase):
             with (
                 patch.object(tm.voice, "tts", return_value=sub_maker),
                 patch.object(tm.voice, "get_audio_duration", return_value=0.0),
-                patch.object(tm, "_mark_task_failed") as mark_task_failed,
+                # generate_audio's zero-duration guard calls mark_task_failed
+                # from within its home module (pipeline/stages.py), not
+                # through the tm re-export, so the patch target must be the
+                # stages module itself.
+                patch.object(tm.stages, "mark_task_failed") as mark_task_failed,
             ):
                 audio_file, audio_duration, result_sub_maker = tm.generate_audio(
                     task_id, params, "script"
