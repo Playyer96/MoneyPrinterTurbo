@@ -128,11 +128,17 @@ def run_series_video(
 
     total = len(outline)
     logger.info(f"start series task: {task_id}, parts: {total}")
+    # ``total_parts`` is written once at the start so the WebUI can render
+    # "chapter N/M" without having to read the outline; ``current_part``
+    # is updated at the top of every chapter so the panel follows along as
+    # a chapter starts. Both are independent of ``progress`` so a stalled
+    # network call inside one chapter does not freeze the indicator.
     sm.state.update_task(
         task_id,
         state=const.TASK_STATE_PROCESSING,
         progress=_SERIES_HEAD_PROGRESS,
         series_outline=outline,
+        total_parts=total,
     )
 
     # Look the single-video runner up through ``app.services.task`` rather
@@ -149,6 +155,15 @@ def run_series_video(
     for index, chapter in enumerate(outline, start=1):
         part_task_id = f"{task_id}/part-{index:02d}"
         logger.info(f"\n\n## series part {index}/{total}: {chapter}")
+        # Announce the chapter before invoking the inner pipeline so the
+        # WebUI's "chapter X/Y" indicator updates as soon as the chapter
+        # starts, not after it finishes. Without this, the indicator would
+        # only advance on completion and lag a full chapter behind.
+        sm.state.update_task(
+            task_id,
+            current_part=index,
+            current_chapter=chapter,
+        )
         result = _task._run_pipeline(
             part_task_id,
             build_series_part_params(params, outline, index),

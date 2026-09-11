@@ -2022,9 +2022,32 @@ def _render_generation_task_snapshot(task_id, task):
     progress = max(0, min(100, int(task.get("progress", 0) or 0)))
     if state == const.TASK_STATE_PROCESSING:
         st.info(tr("Generating Video"))
+        # When the pipeline is rendering a multi-chapter series, the parent
+        # task's progress curve only jumps between chapters and would leave
+        # the WebUI bar stuck inside a long chapter. The series pipeline
+        # writes ``current_part``/``total_parts``/``current_chapter`` as
+        # each chapter starts, so we surface that here as a "chapter X/Y"
+        # caption that follows the inner pipeline in real time.
+        current_part = task.get("current_part")
+        total_parts = task.get("total_parts")
+        current_chapter = str(task.get("current_chapter") or "").strip()
+        progress_text = f"{tr('Task Progress')}: {progress}%"
+        if (
+            current_part
+            and total_parts
+            and int(current_part) > 0
+            and int(total_parts) > 0
+        ):
+            progress_text = tr(
+                "Series Chapter Progress"
+            ).format(
+                current=int(current_part),
+                total=int(total_parts),
+                subject=current_chapter or "—",
+            )
         st.progress(
             progress,
-            text=f"{tr('Task Progress')}: {progress}%",
+            text=progress_text,
         )
         _render_generation_logs(task_id)
         return

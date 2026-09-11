@@ -179,6 +179,68 @@ class TestRunSeries(unittest.TestCase):
         pipeline.assert_not_called()
         self.assertEqual(const.TASK_STATE_FAILED, result["state"])
 
+    def test_parent_state_carries_current_and_total_chapter_counts(self):
+        """The WebUI reads ``current_part``/``total_parts``/``current_chapter``
+        from the parent task to render a chapter X/Y indicator while a
+        chapter is rendering. Make sure each chapter announces itself
+        before invoking the inner pipeline and that ``total_parts`` is
+        written once at the start.
+        """
+        params = _series_params(series_outline=["one", "two", "three"])
+
+        def fake_pipeline(task_id, part_params, **kwargs):
+            return {"videos": [f"{task_id}/final-1.mp4"], "script": "text"}
+
+        # Index every parent-state write so we can assert both the order
+        # (announce-before-invoke) and that ``total_parts`` is published
+        # exactly once with the right value.
+        write_log = []
+        original_update = self.state.update_task.side_effect
+
+        def capturing_update(task_id, **kwargs):
+            write_log.append((task_id, dict(kwargs)))
+            return original_update(task_id, **kwargs)
+
+        self.state.update_task.side_effect = capturing_update
+
+        with patch.object(tm, "_run_pipeline", side_effect=fake_pipeline):
+            tm._run_series("task-1", params)
+
+        parent_writes = [
+            (kid, kwargs) for kid, kwargs in write_log if kid == "task-1"
+        ]
+        # ``total_parts`` lands on the first parent write that announces the
+        # outline, before any chapter runs.
+        first_total = next(
+            (
+                kwargs.get("total_parts")
+                for _, kwargs in parent_writes
+                if "total_parts" in kwargs
+            ),
+            None,
+        )
+        self.assertEqual(3, first_total)
+
+        # Each chapter writes ``current_part`` and ``current_chapter`` BEFORE
+        # the inner pipeline runs. The pipeline below is faked, but the
+        # order of state writes still has to put the announcement ahead of
+        # any progress bump for that part.
+        current_part_writes = [
+            kwargs.get("current_part")
+            for _, kwargs in parent_writes
+            if "current_part" in kwargs
+        ]
+        self.assertEqual([1, 2, 3], current_part_writes)
+
+        # Each announcement also carries the chapter subject so the WebUI
+        # can label the indicator.
+        chapter_subjects = [
+            kwargs.get("current_chapter")
+            for _, kwargs in parent_writes
+            if "current_chapter" in kwargs
+        ]
+        self.assertEqual(["one", "two", "three"], chapter_subjects)
+
 
 class TestStartRouting(unittest.TestCase):
     def test_series_tasks_take_the_series_driver(self):
