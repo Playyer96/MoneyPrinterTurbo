@@ -331,6 +331,28 @@ def get_voicestudio_base_url() -> str:
     return str(configured or VOICESTUDIO_DEFAULT_BASE_URL).strip().rstrip("/")
 
 
+def _is_running_in_docker() -> bool:
+    """True when this process is inside a container.
+
+    The vendored VoiceStudio server cannot run here on macOS (no Metal in the
+    Linux VM) and has no business running here on Linux either -- the compose
+    service is the real server in that case. Use this only to skip the
+    in-process spawn fallback; do not gate functionality on it.
+    """
+    if os.path.exists("/.dockerenv"):
+        return True
+    try:
+        with open("/proc/1/cgroup", "r", encoding="utf-8", errors="replace") as fh:
+            return any(
+                marker in line
+                for line in fh
+                for marker in ("docker", "containerd", "kubepods", "buildkit")
+            )
+    except OSError:
+        # /proc is Linux-only; non-Linux hosts are never in a Linux container.
+        return False
+
+
 def ensure_voicestudio_server_running(timeout: float = 2.0) -> bool:
     """
     Spawn the bundled VoiceStudio server when the configured port is dead.
@@ -340,6 +362,12 @@ def ensure_voicestudio_server_running(timeout: float = 2.0) -> bool:
     separate terminal) stay unaffected. Returns True when a usable server is
     reachable at the end of the call, False otherwise — never raises, so
     importing this module never breaks startup.
+
+    Inside a container the spawn is skipped on purpose: torch cannot reach a
+    host GPU from a Linux VM, and on Linux the right server is the compose
+    service, not an in-process subprocess. The caller (WebUI or API) is
+    expected to surface the warning we log here so the user knows which
+    command to run on the host.
     """
     base_url = get_voicestudio_base_url()
     try:
@@ -348,6 +376,19 @@ def ensure_voicestudio_server_running(timeout: float = 2.0) -> bool:
             return True
     except Exception:
         pass
+
+    if _is_running_in_docker():
+        # Compose's `voicestudio` service owns this on Linux; on macOS the
+        # socat front door in docker-compose.mac.yml needs the host
+        # LaunchAgent to actually be listening on 127.0.0.1:8780.
+        logger.warning(
+            "voicestudio not reachable at {} and we are inside a container, "
+            "so the bundled server cannot be launched here. On macOS run "
+            "`make mac-setup` on the host first. On Linux run "
+            "`docker compose up -d voicestudio`.",
+            base_url,
+        )
+        return False
 
     server_script = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),

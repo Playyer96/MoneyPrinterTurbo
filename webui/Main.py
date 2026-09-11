@@ -61,6 +61,7 @@ from app.services import elevenlabs_music as elevenlabs_music_service
 from app.services import sonilo as sonilo_service
 from app.services import state as sm
 from app.services import task as tm
+from app.services import upload_post as upload_post_service
 from app.services import version_checker
 from app.utils.logging_utils import configure_terminal_logger
 from app.utils import utils
@@ -68,8 +69,11 @@ from app.utils import utils
 # Auto-launch the bundled VoiceStudio (OmniVoice) server so the WebUI's
 # preview buttons work out of the box. The probe inside the helper makes the
 # call idempotent — a server already running externally is left alone, and
-# streamlit's hot-reload does not spawn a duplicate process.
-voice.ensure_voicestudio_server_running()
+# streamlit's hot-reload does not spawn a duplicate process. The boolean is
+# remembered so the preview pane can show an actionable hint when the
+# configured endpoint is still unreachable (e.g. macOS host server not yet
+# bootstrapped with `make mac-setup`).
+st.session_state["voicestudio_reachable"] = voice.ensure_voicestudio_server_running()
 
 st.set_page_config(
     page_title="MoneyPrinterTurbo",
@@ -1247,6 +1251,53 @@ def _build_video_download_name(subject, index, total):
     return f"{safe_subject}{suffix}.mp4"
 
 
+def _can_publish(task: dict) -> bool:
+    """Manual publish only makes sense when Upload-Post is fully wired up and the video is ready."""
+    if not upload_post_service.upload_post_service.is_configured():
+        return False
+    if upload_post_service.upload_post_service.auto_upload:
+        # Auto-upload already covers this case; an extra button would be noise.
+        return False
+    if task.get("state") != const.TASK_STATE_COMPLETE:
+        return False
+    if task.get("cross_post_state") in tm._ACTIVE_CROSS_POST_STATES:
+        return False
+    return bool(task.get("videos") or task.get("video_file"))
+
+
+def _format_cross_post_status(task: dict) -> str:
+    """Render a compact per-platform status string for the row caption."""
+    state = task.get("cross_post_state")
+    if not state:
+        return ""
+    label = tr(f"Cross Post State {state.capitalize()}")
+    results = task.get("cross_post_results") or []
+    if not results:
+        return label
+    pieces = []
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        per_platform = result.get("platform_statuses") or {}
+        if isinstance(per_platform, dict) and per_platform:
+            for platform, status in per_platform.items():
+                marker = "✓" if str(status).lower() in {"success", "ok", "true", "completed"} else "✗"
+                pieces.append(f"{platform} {marker}")
+        else:
+            marker = "✓" if result.get("success") else "✗"
+            pieces.append(marker)
+    if not pieces:
+        return label
+    return f"{label} · {' '.join(pieces)}"
+
+
+def _render_cross_post_status(task: dict, key_prefix: str) -> None:
+    status_text = _format_cross_post_status(task)
+    if not status_text:
+        return
+    st.caption(status_text, key=f"cross_post_status_{key_prefix}_{task['task_id']}")
+
+
 def _render_task_table(filtered_tasks, key_prefix):
     with st.container(key=f"task_table_header_{key_prefix}"):
         header_cols = st.columns([1.1, 1.7, 3.0, 0.8, 1.6], vertical_alignment="center")
@@ -1280,7 +1331,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                 key=f"task_row_{key_prefix}_{safe_task_key}", border=True
             ):
                 row_cols = st.columns(
-                    [1.1, 1.7, 3.0, 0.8, 1.6],
+                    [1.1, 1.7, 3.0, 0.8, 1.8],
                     vertical_alignment="center",
                 )
                 row_cols[0].write(_task_state_label(task["state"], has_video))
@@ -1289,7 +1340,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                 row_cols[3].write(f"{task['progress']}%")
 
                 action_cols = row_cols[4].columns(
-                    4,
+                    5,
                     vertical_alignment="center",
                     gap="small",
                 )
@@ -1329,6 +1380,26 @@ def _render_task_table(filtered_tasks, key_prefix):
                         _queue_task_restore(task_id)
 
                 with action_cols[3]:
+                    publish_label = tr("Publish")
+                    publish_disabled = is_processing or not _can_publish(task)
+                    if st.button(
+                        publish_label,
+                        key=f"publish_task_{key_prefix}_{task_id}",
+                        use_container_width=True,
+                        icon=":material/share:",
+                        help=publish_label,
+                        disabled=publish_disabled,
+                    ):
+                        scheduled, error, _status_code = tm.schedule_manual_cross_post(
+                            task_id=task_id,
+                        )
+                        if scheduled:
+                            st.toast(tr("Publish Scheduled"))
+                            st.rerun()
+                        else:
+                            st.error(tr("Publish Failed").format(error=error or "unknown"))
+
+                with action_cols[4]:
                     delete_label = tr("Delete Task")
                     delete_help = (
                         f"{delete_label} ({tr('Task Status Processing')})"
@@ -1348,6 +1419,8 @@ def _render_task_table(filtered_tasks, key_prefix):
                             st.rerun()
                         else:
                             st.error(tr("Task Delete Failed"))
+
+                _render_cross_post_status(task, key_prefix)
 
 
 def _render_task_manager_panel(tasks=None):
@@ -3343,6 +3416,20 @@ def _render_settings_dialog():
                 )
                 if upload_post_youtube_privacy_status != config.app.get("upload_post_youtube_privacy_status", "public"):
                     _set_runtime_config("app", "upload_post_youtube_privacy_status", upload_post_youtube_privacy_status)
+
+            if st.button(
+                tr("Test Connection"),
+                key="upload_post_test_connection_button",
+                use_container_width=True,
+                help=tr("Test Connection Help"),
+            ):
+                test_result = upload_post_service.upload_post_service.test_connection()
+                if not test_result.get("configured"):
+                    st.warning(tr("Test Connection Not Configured"))
+                elif test_result.get("valid"):
+                    st.success(tr("Test Connection Success"))
+                else:
+                    st.error(tr("Test Connection Failed"))
 
         # 左侧面板 - 日志设置
         with left_config_panel:
@@ -6044,7 +6131,19 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
                         )
                         st.rerun()
                 else:
-                    st.error(tr("Voice Preview No Audio"))
+                    if (
+                        selected_tts_server == "voicestudio"
+                        and not st.session_state.get("voicestudio_reachable", True)
+                    ):
+                        st.error(
+                            "VoiceStudio is not reachable from the WebUI "
+                            "container. On macOS Apple Silicon run "
+                            "`make mac-setup` on the host first, then restart "
+                            "the stack with `make up`. On Linux/Windows run "
+                            "`docker compose up -d voicestudio`."
+                        )
+                    else:
+                        st.error(tr("Voice Preview No Audio"))
 
     cached_preview = st.session_state.get("voice_preview_audio")
     valid_fingerprints = {sample_fingerprint, full_fingerprint}

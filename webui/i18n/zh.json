@@ -582,6 +582,18 @@
     "Title Duration": "标题时长（秒）",
     "Title Animation": "标题动画",
     "Gemini TTS Model": "Gemini TTS 模型",
-    "Models listed by Google's API for this key; different models have different rate limits and quotas.": "此密钥下 Google API 列出的模型；不同模型有不同的速率限制和配额。"
+    "Models listed by Google's API for this key; different models have different rate limits and quotas.": "此密钥下 Google API 列出的模型；不同模型有不同的速率限制和配额。",
+    "Publish": "发布",
+    "Publish Scheduled": "已加入发布队列",
+    "Publish Failed": "发布失败：{error}",
+    "Test Connection": "测试连接",
+    "Test Connection Help": "验证当前 Upload-Post API Key 是否通过身份验证，不会发起真实上传。",
+    "Test Connection Success": "Upload-Post API Key 有效。",
+    "Test Connection Failed": "Upload-Post 拒绝了该 API Key。",
+    "Test Connection Not Configured": "请先在上方填写 Upload-Post API Key 和用户名。",
+    "Cross Post State Pending": "发布：等待中",
+    "Cross Post State Processing": "发布：上传中",
+    "Cross Post State Complete": "发布：已完成",
+    "Cross Post State Failed": "发布：失败"
   }
 }

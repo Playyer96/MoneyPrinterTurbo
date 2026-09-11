@@ -183,6 +183,17 @@ Thanks to [Kimi](https://platform.kimi.ai?track_id=track-f6b0a640d35c41deb03b247
 - [x] Export portrait `9:16 (1080×1920)`, landscape `16:9 (1920×1080)`, or square `1:1 (1080×1080)` videos
 - [x] Publish completed videos directly to **TikTok, Instagram, and YouTube Shorts**
 
+#### Cross-platform Publishing (Upload-Post)
+
+Finished videos can be published to TikTok, Instagram Reels, and YouTube Shorts through [Upload-Post](https://upload-post.com). To wire up credentials for the first time:
+
+1. Create an API key at [API Keys](https://app.upload-post.com/api-keys).
+2. Pick or create a publishing user at [Manage Users](https://app.upload-post.com/manage-users), then connect the target platforms to that user.
+3. Open **Settings → Auto-Publish Settings** from the top menu in the WebUI, fill in **Upload-Post API Key** and **Upload-Post Profile Username** (the Manage Users username, not your login email), pick the target platforms, and save.
+4. Click **Test Connection** in the same panel to verify the credentials. Once it passes, either toggle **Enable Auto-Publish** to publish every completed video automatically, or leave it off and use the **Publish** button on each task card.
+
+See the [Upload-Post docs](https://docs.upload-post.com/) for the full API reference; the `upload_post_*` block in `config.example.toml` lists every available knob.
+
 ## Gallery 🎬
 
 All examples below were generated with MoneyPrinterTurbo.

@@ -582,6 +582,18 @@
     "Title Duration": "Title Duration (Seconds)",
     "Title Animation": "Title Animation",
     "Gemini TTS Model": "Gemini TTS Model",
-    "Models listed by Google's API for this key; different models have different rate limits and quotas.": "Models listed by Google's API for this key; different models have different rate limits and quotas."
+    "Models listed by Google's API for this key; different models have different rate limits and quotas.": "Models listed by Google's API for this key; different models have different rate limits and quotas.",
+    "Publish": "Publish",
+    "Publish Scheduled": "Publish scheduled",
+    "Publish Failed": "Publish failed: {error}",
+    "Test Connection": "Test Connection",
+    "Test Connection Help": "Verify the configured Upload-Post API key authenticates. Sends no real upload.",
+    "Test Connection Success": "Upload-Post API key is valid.",
+    "Test Connection Failed": "Upload-Post rejected the API key.",
+    "Test Connection Not Configured": "Add the Upload-Post API key and username in the fields above first.",
+    "Cross Post State Pending": "Publish: pending",
+    "Cross Post State Processing": "Publish: uploading",
+    "Cross Post State Complete": "Publish: done",
+    "Cross Post State Failed": "Publish: failed"
   }
 }

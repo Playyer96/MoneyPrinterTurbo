@@ -1554,6 +1554,11 @@ class TestTaskService(unittest.TestCase):
                 "cross_post_video",
                 return_value={"success": True, "request_id": "upload-1"},
             ),
+            patch.object(
+                tm.upload_post.upload_post_service,
+                "poll_status",
+                return_value={"success": True, "platform_statuses": {}},
+            ),
         ):
             worker(*worker_args)
 
@@ -1772,6 +1777,11 @@ class TestTaskService(unittest.TestCase):
                 "cross_post_video",
                 return_value={"success": True, "request_id": "upload-1"},
             ) as cross_post,
+            patch.object(
+                tm.upload_post.upload_post_service,
+                "poll_status",
+                return_value={"success": True, "platform_statuses": {}},
+            ),
             patch.object(tm.time, "sleep") as sleep,
         ):
             tm._run_cross_post(
@@ -2264,6 +2274,172 @@ class TestTaskService(unittest.TestCase):
         )
         result = tm.start(task_id=task_id, params=params)
         print(result)
+
+
+class TestScheduleManualCrossPost(unittest.TestCase):
+    def _seed_complete_task(self, state, task_id, **overrides):
+        defaults = dict(
+            state=tm.const.TASK_STATE_COMPLETE,
+            progress=100,
+            videos=["final.mp4"],
+            script="A coffee story.",
+        )
+        defaults.update(overrides)
+        state.update_task(task_id, **defaults)
+
+    def test_returns_404_when_task_unknown(self):
+        state = MemoryState()
+        with (
+            patch.object(tm.upload_post.upload_post_service, "is_configured", return_value=True),
+            patch.object(tm.sm, "state", state),
+        ):
+            scheduled, error, code = tm.schedule_manual_cross_post("missing")
+
+        self.assertFalse(scheduled)
+        self.assertEqual(code, 404)
+        self.assertIn("not found", error or "")
+
+    def test_returns_400_when_video_incomplete(self):
+        state = MemoryState()
+        state.update_task(
+            "incomplete",
+            state=tm.const.TASK_STATE_PROCESSING,
+            progress=50,
+            videos=[],
+        )
+        with (
+            patch.object(tm.upload_post.upload_post_service, "is_configured", return_value=True),
+            patch.object(tm.sm, "state", state),
+        ):
+            scheduled, error, code = tm.schedule_manual_cross_post("incomplete")
+
+        self.assertFalse(scheduled)
+        self.assertEqual(code, 400)
+
+    def test_returns_409_when_cross_post_active(self):
+        state = MemoryState()
+        self._seed_complete_task(
+            state, "busy", cross_post_state=tm.const.CROSS_POST_STATE_PROCESSING,
+        )
+        with (
+            patch.object(tm.upload_post.upload_post_service, "is_configured", return_value=True),
+            patch.object(tm.sm, "state", state),
+        ):
+            scheduled, error, code = tm.schedule_manual_cross_post("busy")
+
+        self.assertFalse(scheduled)
+        self.assertEqual(code, 409)
+
+    def test_returns_400_when_not_configured(self):
+        state = MemoryState()
+        self._seed_complete_task(state, "unconfigured")
+        with (
+            patch.object(tm.upload_post.upload_post_service, "is_configured", return_value=False),
+            patch.object(tm.sm, "state", state),
+        ):
+            scheduled, error, code = tm.schedule_manual_cross_post("unconfigured")
+
+        self.assertFalse(scheduled)
+        self.assertEqual(code, 400)
+
+    def test_succeeds_and_reuses_schedule_helper(self):
+        state = MemoryState()
+        self._seed_complete_task(state, "ready")
+        with (
+            patch.object(tm.upload_post.upload_post_service, "is_configured", return_value=True),
+            patch.object(
+                type(tm.upload_post.upload_post_service),
+                "platforms",
+                new_callable=PropertyMock,
+                return_value=["tiktok", "instagram"],
+            ),
+            patch.object(tm.sm, "state", state),
+            patch.object(tm, "_schedule_cross_post", return_value=None) as schedule,
+        ):
+            scheduled, error, code = tm.schedule_manual_cross_post("ready")
+
+        self.assertTrue(scheduled)
+        self.assertEqual(code, 202)
+        schedule.assert_called_once()
+        self.assertEqual(schedule.call_args.kwargs["task_id"], "ready")
+        self.assertEqual(
+            schedule.call_args.kwargs["platforms"], ["tiktok", "instagram"],
+        )
+        task = state.get_task("ready")
+        self.assertEqual(task["cross_post_state"], tm.const.CROSS_POST_STATE_PENDING)
+        self.assertTrue(task["cross_post_owner"])
+
+
+class TestCrossPostPolling(unittest.TestCase):
+    def _seed(self, state, task_id):
+        state.update_task(
+            task_id,
+            state=tm.const.TASK_STATE_COMPLETE,
+            progress=100,
+            videos=["final.mp4"],
+            cross_post_state=tm.const.CROSS_POST_STATE_PENDING,
+            script="A coffee story.",
+        )
+
+    def test_poll_status_is_invoked_after_successful_upload(self):
+        """Upload-Post's 'accepted' response is not terminal; polling folds the
+        real per-platform outcome into the result."""
+        state = MemoryState()
+        self._seed(state, "poll-after-upload")
+
+        with (
+            patch.object(tm.sm, "state", state),
+            patch.object(tm.llm, "generate_social_metadata", return_value={"title": "T", "caption": "C", "hashtags": []}),
+            patch.object(
+                tm.upload_post,
+                "cross_post_video",
+                return_value={"success": True, "request_id": "req-1"},
+            ),
+            patch.object(
+                tm.upload_post.upload_post_service,
+                "poll_status",
+                return_value={"success": True, "platform_statuses": {"tiktok": "ok"}},
+            ) as poll,
+        ):
+            tm._run_cross_post(
+                "poll-after-upload", ("final.mp4",), "Coffee", "script", "en",
+                ("tiktok",), "public",
+            )
+
+        poll.assert_called_once_with("req-1")
+        task = state.get_task("poll-after-upload")
+        self.assertEqual(
+            task["cross_post_results"][0]["platform_statuses"], {"tiktok": "ok"},
+        )
+        self.assertEqual(task["cross_post_state"], tm.const.CROSS_POST_STATE_COMPLETE)
+
+    def test_poll_timeout_does_not_leave_task_in_processing_state(self):
+        """A polled timeout must still produce a terminal state, not orphan PROCESSING."""
+        state = MemoryState()
+        self._seed(state, "poll-timeout")
+
+        with (
+            patch.object(tm.sm, "state", state),
+            patch.object(tm.llm, "generate_social_metadata", return_value={"title": "T", "caption": "C", "hashtags": []}),
+            patch.object(
+                tm.upload_post,
+                "cross_post_video",
+                return_value={"success": True, "request_id": "req-2"},
+            ),
+            patch.object(
+                tm.upload_post.upload_post_service,
+                "poll_status",
+                return_value={"success": False, "error": "Upload-Post did not finish within 1800s"},
+            ),
+        ):
+            tm._run_cross_post(
+                "poll-timeout", ("final.mp4",), "Coffee", "script", "en",
+                ("tiktok",), "public",
+            )
+
+        task = state.get_task("poll-timeout")
+        self.assertEqual(task["cross_post_state"], tm.const.CROSS_POST_STATE_FAILED)
+        self.assertIn("did not finish", task["cross_post_error"])
 
 
 if __name__ == "__main__":

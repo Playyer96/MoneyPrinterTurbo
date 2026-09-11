@@ -20,10 +20,11 @@ _CONFIG_BASE = {
 }
 
 
-def _mock_response(success=True):
+def _mock_response(success=True, status_code=200):
     r = MagicMock()
     r.json.return_value = {"success": success, "request_id": "abc123"}
     r.raise_for_status = MagicMock()
+    r.status_code = status_code
     return r
 
 
@@ -185,6 +186,173 @@ class TestUploadPostYouTubePayload(unittest.TestCase):
         self.assertIn("tiktok", platforms)
         self.assertIn("instagram", platforms)
         self.assertIn("youtube", platforms)
+
+
+class TestUploadPostRetry(unittest.TestCase):
+    """Verify the retry+backoff path around the upload POST."""
+
+    @patch("app.services.upload_post.config.app", _CONFIG_BASE)
+    @patch("app.services.upload_post.os.path.exists", return_value=True)
+    @patch("builtins.open", mock_open(read_data=b"fake"))
+    @patch("app.services.upload_post.requests.post")
+    @patch("app.services.upload_post.time.sleep")
+    def test_upload_retries_on_5xx_then_succeeds(self, sleep, mock_post, _exists):
+        bad = _mock_response(success=False, status_code=503)
+        good = _mock_response(success=True, status_code=200)
+        mock_post.side_effect = [bad, bad, good]
+
+        # 1s base × 2^attempt keeps sleep call_count verifiable; sleep is mocked
+        # so the test does not actually wait.
+        with patch.object(UploadPostService, "max_attempts", 3):
+            with patch.object(UploadPostService, "retry_base_seconds", 1):
+                result = UploadPostService().upload_video("/fake/v.mp4", "Title")
+
+        self.assertEqual(mock_post.call_count, 3)
+        self.assertTrue(result["success"])
+        # Two backoff sleeps between the three attempts: 1s and 2s.
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(sleep.call_args_list[0].args, (1,))
+        self.assertEqual(sleep.call_args_list[1].args, (2,))
+
+    @patch("app.services.upload_post.config.app", _CONFIG_BASE)
+    @patch("app.services.upload_post.os.path.exists", return_value=True)
+    @patch("builtins.open", mock_open(read_data=b"fake"))
+    @patch("app.services.upload_post.requests.post")
+    @patch("app.services.upload_post.time.sleep")
+    def test_upload_does_not_retry_on_4xx(self, sleep, mock_post, _exists):
+        bad = _mock_response(success=False, status_code=400)
+        mock_post.return_value = bad
+
+        with patch.object(UploadPostService, "max_attempts", 3):
+            with patch.object(UploadPostService, "retry_base_seconds", 1):
+                # raise_for_status is a no-op MagicMock, so HTTPError path stays open.
+                bad.raise_for_status.side_effect = requests.exceptions.HTTPError("400")
+                result = UploadPostService().upload_video("/fake/v.mp4", "Title")
+
+        self.assertEqual(mock_post.call_count, 1)
+        sleep.assert_not_called()
+        self.assertFalse(result["success"])
+
+    @patch("app.services.upload_post.config.app", _CONFIG_BASE)
+    @patch("app.services.upload_post.os.path.exists", return_value=True)
+    @patch("builtins.open", mock_open(read_data=b"fake"))
+    @patch("app.services.upload_post.requests.post")
+    @patch("app.services.upload_post.time.sleep")
+    def test_upload_retries_on_request_exception(self, sleep, mock_post, _exists):
+        mock_post.side_effect = [
+            requests.exceptions.ConnectionError("offline"),
+            _mock_response(success=True, status_code=200),
+        ]
+
+        with patch.object(UploadPostService, "max_attempts", 3):
+            with patch.object(UploadPostService, "retry_base_seconds", 1):
+                result = UploadPostService().upload_video("/fake/v.mp4", "Title")
+
+        self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(sleep.call_count, 1)
+        self.assertEqual(sleep.call_args.args, (1,))
+        self.assertTrue(result["success"])
+
+
+class TestUploadPostPollStatus(unittest.TestCase):
+    @staticmethod
+    def _status_response(payload, status_code=200):
+        r = MagicMock()
+        r.json.return_value = payload
+        r.raise_for_status = MagicMock()
+        r.status_code = status_code
+        return r
+
+    @patch("app.services.upload_post.config.app", _CONFIG_BASE)
+    @patch("app.services.upload_post.requests.get")
+    @patch("app.services.upload_post.time.sleep")
+    def test_poll_status_succeeds_after_two_attempts(self, sleep, mock_get):
+        mock_get.side_effect = [
+            self._status_response({"success": False, "status": "processing"}),
+            self._status_response({"success": True, "platform_statuses": {"tiktok": "ok"}}),
+        ]
+
+        with patch.object(UploadPostService, "poll_interval_seconds", 0):
+            with patch.object(UploadPostService, "poll_timeout_seconds", 30):
+                result = UploadPostService().poll_status("req-1")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["platform_statuses"], {"tiktok": "ok"})
+        sleep.assert_called_once()
+
+    @patch("app.services.upload_post.config.app", _CONFIG_BASE)
+    @patch("app.services.upload_post.requests.get")
+    @patch("app.services.upload_post.time.sleep")
+    def test_poll_status_times_out_when_never_terminal(self, sleep, mock_get):
+        mock_get.return_value = self._status_response(
+            {"success": False, "status": "processing"}
+        )
+
+        with patch.object(UploadPostService, "poll_interval_seconds", 0):
+            with patch.object(UploadPostService, "poll_timeout_seconds", 0.1):
+                with patch("app.services.upload_post.time.monotonic", side_effect=[0.0, 0.05, 0.2]):
+                    result = UploadPostService().poll_status("req-1")
+
+        self.assertFalse(result["success"])
+        self.assertIn("did not finish", result["error"])
+
+
+class TestUploadPostTestConnection(unittest.TestCase):
+    @patch(
+        "app.services.upload_post.config.app",
+        {**_CONFIG_BASE, "upload_post_api_key": "", "upload_post_username": ""},
+    )
+    def test_test_connection_returns_unconfigured_when_keys_missing(self):
+        result = UploadPostService().test_connection()
+        self.assertFalse(result["configured"])
+        self.assertFalse(result["valid"])
+
+    @patch("app.services.upload_post.config.app", _CONFIG_BASE)
+    @patch("app.services.upload_post.requests.get")
+    def test_test_connection_marks_invalid_on_401(self, mock_get):
+        r = MagicMock()
+        r.json.return_value = {"success": False, "error": "401 unauthorized"}
+        r.raise_for_status = MagicMock()
+        r.status_code = 401
+        mock_get.return_value = r
+
+        result = UploadPostService().test_connection()
+        self.assertTrue(result["configured"])
+        self.assertFalse(result["valid"])
+
+    @patch("app.services.upload_post.config.app", _CONFIG_BASE)
+    @patch("app.services.upload_post.requests.get")
+    def test_test_connection_marks_valid_on_unknown_request_id(self, mock_get):
+        r = MagicMock()
+        r.json.return_value = {"success": False, "error": "request not found"}
+        r.raise_for_status = MagicMock()
+        r.status_code = 404
+        mock_get.return_value = r
+
+        result = UploadPostService().test_connection()
+        self.assertTrue(result["configured"])
+        self.assertTrue(result["valid"])
+
+
+class TestUploadPostPayloadHelpers(unittest.TestCase):
+    def test_base_fields_include_user_title_privacy_and_platforms(self):
+        data = UploadPostService._base_fields(
+            "user", "title", "PUBLIC_TO_EVERYONE", ["tiktok", "instagram"],
+        )
+        keys = [k for k, _ in data]
+        self.assertIn("user", keys)
+        self.assertIn("title", keys)
+        self.assertIn("privacy_level", keys)
+        self.assertEqual(_get_all(data, "platform[]"), ["tiktok", "instagram"])
+
+    def test_youtube_extra_fields_always_emit_synthetic_media_true(self):
+        data = UploadPostService._youtube_extra_fields(
+            {"youtube_title": "T", "tags": ["a", "b"]},
+        )
+        self.assertEqual(_get(data, "youtube_title"), "T")
+        self.assertEqual(_get_all(data, "tags[]"), ["a", "b"])
+        self.assertEqual(_get(data, "containsSyntheticMedia"), "true")
+        self.assertEqual(_get(data, "privacyStatus"), "public")
 
 
 if __name__ == "__main__":

@@ -496,6 +496,21 @@ upload_post_youtube_privacy_status = "public"
 # rejected.
 # Cross-post jobs run in the current process and are not resumed after restart.
 upload_post_max_pending_tasks = 10
+# Retry budget for the upload POST itself: transient network errors and
+# HTTP 429/5xx are retried this many times with exponential backoff
+# (retry_base_seconds * 2^(attempt-1)); 4xx errors are never retried.
+upload_post_max_attempts = 3
+upload_post_retry_base_seconds = 5
+upload_post_request_timeout_seconds = 300
+# Upload-Post accepts the upload immediately but publishes to each platform
+# asynchronously. After a successful upload, poll the status endpoint every
+# poll_interval_seconds until a terminal result or poll_timeout_seconds elapses.
+upload_post_poll_interval_seconds = 10
+upload_post_poll_timeout_seconds = 1800
+# Optional webhook alternative to polling. Not yet implemented server-side;
+# leave empty.
+upload_post_webhook_url = ""
+upload_post_webhook_secret = ""
 
 # =============================================================================
 # Whisper Subtitles / Whisper 字幕

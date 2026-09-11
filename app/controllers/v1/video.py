@@ -2,11 +2,11 @@ import glob
 import os
 import pathlib
 import shutil
-from typing import Union
+from typing import Optional, Union
 
 from fastapi import BackgroundTasks, Depends, Path, Query, Request, UploadFile
 from fastapi.params import File
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from loguru import logger
 
 from app.config import config
@@ -28,13 +28,20 @@ from app.models.schema import (
     TaskResponse,
     TaskVideoRequest,
     VideoMaterialUploadResponse,
-    VideoMaterialRetrieveResponse
+    VideoMaterialRetrieveResponse,
 )
+from pydantic import BaseModel, Field
 from app.services import bgm as bgm_service
 from app.services import material_upload as material_upload_service
 from app.services import state as sm
 from app.services import task as tm
+from app.services import upload_post as upload_post_service
 from app.utils import file_security, utils
+
+
+class CrossPostPublishRequest(BaseModel):
+    platforms: Optional[list[str]] = None
+    force: bool = Field(default=False, description="Override an orphaned cross-post; never replaces a live one")
 
 # authenticate once at the V1 video router entry point. verify_token keeps the
 # existing no-auth behaviour while api_key is empty, so clients are only
@@ -326,6 +333,75 @@ def delete_video(request: Request, task_id: str = Path(..., description="Task ID
 
     raise HttpException(
         task_id=task_id, status_code=404, message=f"{request_id}: task not found"
+    )
+
+
+@router.post(
+    "/videos/{task_id}/publish",
+    summary="Manually trigger cross-platform publishing for a completed task",
+)
+def publish_video(
+    request: Request,
+    body: CrossPostPublishRequest,
+    task_id: str = Path(..., description="Task ID"),
+):
+    request_id = base.get_task_id(request)
+    scheduled, error, status_code = tm.schedule_manual_cross_post(
+        task_id=task_id,
+        platforms=body.platforms,
+        force=body.force,
+    )
+    if scheduled:
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": 202,
+                "data": {
+                    "task_id": task_id,
+                    "cross_post_state": tm.const.CROSS_POST_STATE_PENDING,
+                },
+            },
+        )
+    raise HttpException(
+        task_id=task_id,
+        status_code=status_code,
+        message=f"{request_id}: {error or 'unknown error'}",
+    )
+
+
+@router.get(
+    "/videos/{task_id}/cross-post",
+    summary="Query the cross-post status of a task",
+)
+def get_cross_post_status(
+    request: Request,
+    task_id: str = Path(..., description="Task ID"),
+):
+    request_id = base.get_task_id(request)
+    task = sm.state.get_task(task_id)
+    if not task:
+        raise HttpException(
+            task_id=task_id, status_code=404, message=f"{request_id}: task not found",
+        )
+    return utils.get_response(
+        200,
+        {
+            "task_id": task_id,
+            "cross_post_state": task.get("cross_post_state"),
+            "cross_post_results": task.get("cross_post_results"),
+            "cross_post_error": task.get("cross_post_error"),
+        },
+    )
+
+
+@router.get(
+    "/upload-post/test",
+    summary="Verify the configured Upload-Post credentials",
+)
+def test_upload_post(request: Request):
+    return utils.get_response(
+        200,
+        upload_post_service.upload_post_service.test_connection(),
     )
 
 

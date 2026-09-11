@@ -183,6 +183,18 @@
 - [x] 支持竖屏 `9:16（1080×1920）`、横屏 `16:9（1920×1080）` 和方形 `1:1（1080×1080）`
 - [x] 支持一键 **跨平台发布**，生成完成后可自动上传至 **TikTok、Instagram 和 YouTube Shorts**
 
+#### 跨平台发布（Upload-Post）
+
+成片可经由 [Upload-Post](https://upload-post.com) 一键发布到 TikTok、Instagram Reels 和 YouTube Shorts。
+首次使用请按以下步骤准备凭证：
+
+1. 在 [API Keys](https://app.upload-post.com/api-keys) 创建一个 API Key。
+2. 在 [Manage Users](https://app.upload-post.com/manage-users) 选择或创建发布账号，并完成目标平台授权。
+3. 在 WebUI 顶部菜单打开 **Settings → Auto-Publish Settings**，填写 **Upload-Post API Key** 与 **Upload-Post Profile Username**（填 Manage Users 中的 Username，不是登录邮箱），勾选目标平台，保存。
+4. 在同一面板点击 **Test Connection** 验证凭证；通过后再勾选 **Enable Auto-Publish** 即可让生成流程结束后自动发布，或保留关闭，改用任务卡片上的 **Publish** 按钮手动触发。
+
+完整接口与请求字段以 [Upload-Post 官方文档](https://docs.upload-post.com/) 为准；详细配置项见 `config.example.toml` 中的 `upload_post_*` 段。
+
 ## 作品展示 🎬
 
 以下示例均由 MoneyPrinterTurbo 实际生成。

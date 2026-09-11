@@ -18,8 +18,10 @@ PROVIDER_TIPS_PREFIXES = (
     LLM_PROVIDER_TIPS_PREFIX,
     TTS_PROVIDER_TIPS_PREFIX,
 )
-# 合作 Provider 的品牌名和长说明只维护中英文。次要 locale 统一回退英文，
-# 避免把完全相同的品牌名复制十份，也避免长说明后续只更新部分语言。
+# Partner provider brand names and long descriptions are only maintained in
+# Chinese and English. Secondary locales fall back to English uniformly,
+# avoiding copying identical brand names ten times and preventing long
+# descriptions from only being updated in some languages.
 ENGLISH_FALLBACK_KEYS = frozenset(
     {
         "AI Video Quote Required",
@@ -87,6 +89,60 @@ ENGLISH_FALLBACK_KEYS = frozenset(
         "Stop Tracking LoomLoom Run",
         "Stop Tracking LoomLoom Run Help",
         "Unavailable AI Video Model",
+        # --- Subtitle style presets, animations, and title overlay keys ---
+        "Subtitle Style Preset",
+        "Subtitle Casing",
+        "As Is",
+        "UPPERCASE (TikTok Style)",
+        "TikTok Viral Yellow",
+        "Alex Hormozi Punch",
+        "MrBeast Bold",
+        "CapCut Dark Pill",
+        "Minimalist Clean",
+        "Cyber Neon Aqua",
+        "Fire & Alert Red",
+        "Golden Luxury",
+        "Comic Pop Humor",
+        "Viral Barbie Pink",
+        "Vintage Cinema Warm",
+        "Scale Up (Punch)",
+        "Smooth Fade",
+        "Slide Up",
+        "Shake (Impact)",
+        "Video Title Settings",
+        "Enable Title / Hook Banner",
+        "Title Text",
+        "Title Text Help",
+        "Title Style",
+        "TikTok Yellow Badge",
+        "Breaking Red Banner",
+        "Neon Cyber Glow",
+        "Minimalist Bold White",
+        "Golden Luxury Card",
+        "Comic Bang Punch",
+        "Title Position",
+        "Intro (First 4 Seconds)",
+        "Full Video",
+        "Title Duration",
+        "Title Animation",
+        # --- Gemini TTS keys ---
+        "Gemini TTS Model",
+        "Models listed by Google's API for this key; different models have different rate limits and quotas.",
+        # --- Cross-post publishing keys ---
+        # Short UI labels; English fallback reads fine until a translator picks
+        # them up, so keep secondary locales free of these keys.
+        "Publish",
+        "Publish Scheduled",
+        "Publish Failed",
+        "Test Connection",
+        "Test Connection Help",
+        "Test Connection Success",
+        "Test Connection Failed",
+        "Test Connection Not Configured",
+        "Cross Post State Pending",
+        "Cross Post State Processing",
+        "Cross Post State Complete",
+        "Cross Post State Failed",
     }
 )
 FORMAT_PLACEHOLDER_PATTERN = re.compile(r"(?<!\{)\{([a-zA-Z_][a-zA-Z0-9_]*)\}(?!\})")
@@ -115,7 +171,7 @@ def _load_translation(locale):
 
 
 def _required_translation_keys(translations):
-    """返回二级语言必须维护的 key，Provider 长说明统一回退英文。"""
+    """Return keys that secondary locales must maintain; provider long descriptions fall back to English."""
     return {
         key
         for key in translations
@@ -125,12 +181,12 @@ def _required_translation_keys(translations):
 
 
 def _format_placeholders(value):
-    """提取运行时格式化变量，防止翻译遗漏或误改变量名。"""
+    """Extract runtime format variables to prevent translations from missing or renaming them."""
     return set(FORMAT_PLACEHOLDER_PATTERN.findall(value))
 
 
 def _markdown_urls(value):
-    """提取 Markdown 链接目标，允许翻译链接文字但不允许改坏地址。"""
+    """Extract Markdown link targets; translations may change link text but must not break URLs."""
     return set(MARKDOWN_URL_PATTERN.findall(value))
 
 
@@ -173,7 +229,7 @@ class TestWebuiI18n(unittest.TestCase):
         self.assertEqual(sorted(visitor.keys - en_keys), [])
 
     def test_shengsuanyun_provider_tips_keep_registration_and_model_links(self):
-        """合作入口和模型目录属于产品配置，避免后续改文案时误删追踪链接。"""
+        """Partner entry points and model directories are product configuration; prevent accidental deletion of tracking links during copy edits."""
         expected_urls = {
             "https://www.shengsuanyun.com/?from=CH_XUQ4OTSK",
             "https://global.modelmesh.info/model",
@@ -191,7 +247,7 @@ class TestWebuiI18n(unittest.TestCase):
                 self.assertEqual(_markdown_urls(rendered), expected_urls)
 
     def test_metaso_api_key_label_keeps_mpt_referral_link(self):
-        """秘塔 Key 获取入口必须保留 MPT 追踪参数，避免赞助转化链路失效。"""
+        """Metaso API key entry must keep the MPT referral parameter to preserve the sponsor conversion funnel."""
         expected_url = "https://metaso.cn/minimax-h3/?s=MPT"
 
         for locale in ("zh", "en"):
@@ -209,8 +265,9 @@ class TestWebuiI18n(unittest.TestCase):
                 self.assertEqual(sorted(required_en_keys - locale_keys), [])
 
     def test_secondary_locales_do_not_duplicate_provider_tips(self):
-        # Provider 配置长说明只维护中英文，其它语言运行时回退英文。
-        # 禁止复制这些 key，避免出现不会持续维护的半翻译内容。
+        # Provider long descriptions are only maintained in Chinese and English;
+        # other languages fall back to English at runtime. Prevent duplicating
+        # these keys to avoid half-translated content that won't be maintained.
         for locale in SECONDARY_LOCALES:
             with self.subTest(locale=locale):
                 locale_keys = set(_load_translation(locale))

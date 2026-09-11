@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import os
+import requests as req_lib
 import shutil
 import unittest
 import sys
@@ -1781,6 +1782,30 @@ class TestVoiceStudioVoice(unittest.TestCase):
             )
         self.assertFalse(ok)
         self.assertIn("already exists", message)
+
+    def test_ensure_voicestudio_skips_spawn_when_inside_container(self):
+        """Inside Docker the bundled server cannot reach a host GPU, so the
+        probe-fail-then-spawn fallback must short-circuit and return False.
+        """
+        with patch.object(
+            vs, "_is_running_in_docker", return_value=True
+        ), patch.object(vs, "requests") as req, patch.object(
+            vs.subprocess, "Popen"
+        ) as popen:
+            req.get.side_effect = req_lib.exceptions.ConnectionError("no socat")
+            with patch.dict(os.environ, {}, clear=False):
+                vs.os.environ.pop("VOICESTUDIO_BASE_URL", None)
+                with patch.object(
+                    vs.config, "voicestudio", {"base_url": "http://voicestudio:8780"}
+                ):
+                    ok = vs.ensure_voicestudio_server_running(timeout=0.1)
+        self.assertFalse(ok)
+        popen.assert_not_called()
+
+    def test_is_running_in_docker_detects_dockerenv(self):
+        """The cheapest signal wins: /.dockerenv present means container."""
+        with patch.object(vs.os.path, "exists", return_value=True):
+            self.assertTrue(vs._is_running_in_docker())
 
     def test_create_voicestudio_profile_offline_returns_failure(self):
         import requests as req_lib
