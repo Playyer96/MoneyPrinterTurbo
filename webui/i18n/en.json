@@ -454,7 +454,7 @@
     "Please Configure the OpenAI Image Source": "Please configure the **Base URL** and **Model** for the OpenAI compatible image source (**API Key** optional for local gateways)",
     "Video Encoder": "Video Encoder",
     "Default Video Encoder": "Default (Recommended)",
-    "Video Encoder Help": "Advanced option. Default follows the app's stable encoder policy, currently libx264. If a selected hardware encoder is unavailable, the app automatically falls back to libx264.",
+    "Video Encoder Help": "Advanced option. Default uses a hardware encoder (NVENC/AMF/QSV/VideoToolbox) when one is available and transparently falls back to libx264 otherwise. If a selected hardware encoder is unavailable, the app automatically falls back to libx264.",
     "API Platform": "API Platform",
     "Custom API Endpoint": "Custom Endpoint",
     "llm_provider_endpoint_selector.moonshot": "Kimi API Platform",

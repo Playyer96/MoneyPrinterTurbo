@@ -19,6 +19,10 @@
 #      Windows PowerShell: docker info | Select-String nvidia
 #   4. Smoke test the GPU is visible to containers:
 #      docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+#
+# `video` is requested alongside `gpu` so the driver mounts libnvidia-encode
+# (and libnvidia-ffmpeg): without it ffmpeg's h264_nvenc encoder fails with
+# "Cannot load libnvidia-encode.so.1" while the ML models still load fine.
 x-nvidia: &nvidia
   deploy:
     resources:
@@ -26,7 +30,7 @@ x-nvidia: &nvidia
         devices:
           - driver: nvidia
             count: all
-            capabilities: [gpu]
+            capabilities: [gpu, video]
 
 # webui and api run video generation in-process, and faster-whisper's "auto"
 # device needs the GPU visible here too -- so they swap the slim CPU image for

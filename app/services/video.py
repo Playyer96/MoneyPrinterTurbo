@@ -90,6 +90,10 @@ _MIN_MATERIAL_DIMENSION = 480
 # a small tolerance admits material that is short only because of rounding while
 # still rejecting genuinely low-resolution footage.
 _MIN_DIMENSION_TOLERANCE = 10
+# libx264 is the software fallback used whenever a hardware encoder is absent
+# or failed at runtime. The default policy for an unset video_codec is "auto":
+# probe for a platform hardware encoder and only then fall back to libx264, so
+# a GPU passes through by default and a CPU-only host keeps working unchanged.
 _DEFAULT_VIDEO_CODEC = "libx264"
 _SUBTITLE_SPRING_DURATION_SECONDS = 0.18
 _MIN_SUBTITLE_SPRING_SCALE = 0.05
@@ -381,10 +385,11 @@ def _get_configured_video_codec() -> str:
     """
     Read the user-configured video encoder.
 
-    This setting targets advanced users who want to try hardware encoding such
-    as NVENC, AMF, QSV, or VideoToolbox. Only a fixed allowlist is accepted on
-    purpose: opening it to arbitrary FFmpeg parameters would let a typo produce
-    an unpredictable output format, or fail the task at a much later stage.
+    When video_codec is unset the project default is "auto": probe ffmpeg for a
+    hardware encoder (NVENC/AMF/QSV/VideoToolbox) and fall back to libx264 when
+    none can be used. Only a fixed allowlist is accepted on purpose: opening it
+    to arbitrary FFmpeg parameters would let a typo produce an unpredictable
+    output format, or fail the task at a much later stage.
     """
     configured_codec = str(config.app.get("video_codec", "auto") or "auto").strip()
     if configured_codec not in _SUPPORTED_VIDEO_CODECS:
@@ -396,26 +401,15 @@ def _get_configured_video_codec() -> str:
     return configured_codec
 
 
-# Probe cache holds only positive results: a transient failure (PATH blip,
-# subprocess timeout, locked file) on the first call would otherwise stick
-# a False here for the lifetime of the process and turn every clip in a long
-# render into libx264. False results are re-probed each call so a recovery on
-# a later clip is automatic.
-_TRUE_FFMPEG_ENCODERS: set[tuple[str, str]] = set()
-
-
+@lru_cache(maxsize=16)
 def _ffmpeg_encoder_exists(ffmpeg_binary: str, codec: str) -> bool:
     """
     Check whether this FFmpeg build advertises the given encoder.
 
-    Encoding a True result only proves the encoder was compiled in, not that
-    this machine's hardware and drivers can actually use it, so a real
-    encoding failure still falls back to libx264.
+    That only proves the encoder was compiled in, not that this machine's
+    hardware and drivers can actually use it, so the runtime smoke test and
+    real encoding path still fall back to libx264.
     """
-    cache_key = (ffmpeg_binary, codec)
-    if cache_key in _TRUE_FFMPEG_ENCODERS:
-        return True
-
     try:
         result = subprocess.run(
             [ffmpeg_binary, "-hide_banner", "-encoders"],
@@ -438,32 +432,72 @@ def _ffmpeg_encoder_exists(ffmpeg_binary: str, codec: str) -> bool:
             f"{ffmpeg_binary}, fallback to {_DEFAULT_VIDEO_CODEC}: {stderr_excerpt}"
         )
         return False
-    if codec in result.stdout:
-        _TRUE_FFMPEG_ENCODERS.add(cache_key)
-        return True
-    return False
+    return codec in result.stdout
 
 
-def clear_ffmpeg_encoder_cache() -> None:
+@lru_cache(maxsize=16)
+def _ffmpeg_encoder_runnable(ffmpeg_binary: str, codec: str) -> bool:
     """
-    Drop cached "encoder present" results.
+    Verify an encoder actually works by running a tiny smoke encode.
 
-    Tests and the runtime fallback path call this when a True probe later
-    turned out to be wrong (e.g. the encoder was advertised but the encode
-    failed for a hardware/driver reason). The next clip re-probes so a
-    recoverable transient does not stick for the rest of the task.
+    `ffmpeg -encoders` only proves the encoder was compiled into the build.
+    A GPU-less container still lists h264_nvenc and h264_qsv even though
+    neither can open a device here, so the "auto" policy must probe with a
+    real encode instead of trusting the listing. The same standard ffmpeg
+    parameters as a real task are used, so a build that rejects an encoder's
+    private option (for example -rc) is also rejected up front.
     """
-    _TRUE_FFMPEG_ENCODERS.clear()
+    command = [
+        ffmpeg_binary,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=duration=0.2:size=192x192:rate=5",
+        "-frames:v",
+        "1",
+        "-c:v",
+        codec,
+    ]
+    command.extend(_HARDWARE_CODEC_FFMPEG_PARAMS.get(codec, []))
+    command.extend(["-f", "null", "-"])
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning(
+            f"failed to smoke-test encoder {codec}, "
+            f"fallback to {_DEFAULT_VIDEO_CODEC}: {str(exc)}"
+        )
+        return False
+    if result.returncode != 0:
+        logger.warning(
+            f"encoder {codec} smoke test failed, "
+            f"fallback to {_DEFAULT_VIDEO_CODEC}: "
+            f"{(result.stderr or result.stdout or '').strip()}"
+        )
+        return False
+    logger.info(f"encoder {codec} passed the runtime smoke test")
+    return True
 
 
 def _get_effective_video_codec(preferred_codec: str | None = None) -> str:
     """
     Return the codec actually used for this run.
 
-    When the user picks `auto`, probe ffmpeg for an available hardware encoder
-    based on the current platform. When the user picks a specific hardware
-    codec, validate it against ffmpeg's encoder list and the runtime-disabled
-    set so a single failure does not repeat for every clip in a task.
+    When the user picks `auto`, probe ffmpeg for a hardware encoder that can
+    actually encode on this host and pick the first one. When the user picks a
+    specific hardware codec, validate it against ffmpeg's encoder list, a
+    runtime smoke encode, and the runtime-disabled set so a codec that cannot
+    work here is rejected before any clip wastes time failing.
     """
     selected_codec = preferred_codec or _get_configured_video_codec()
     if selected_codec == _DEFAULT_VIDEO_CODEC:
@@ -495,21 +529,36 @@ def _get_effective_video_codec(preferred_codec: str | None = None) -> str:
         )
         return _DEFAULT_VIDEO_CODEC
 
+    if not _ffmpeg_encoder_runnable(ffmpeg_binary, selected_codec):
+        logger.warning(
+            f"ffmpeg encoder {selected_codec} cannot encode on this host "
+            f"(no compatible GPU or driver), fallback to {_DEFAULT_VIDEO_CODEC}"
+        )
+        return _DEFAULT_VIDEO_CODEC
+
     return selected_codec
 
 
 def _detect_hardware_codec(ffmpeg_binary: str) -> str | None:
     """
-    Probe ffmpeg for an available hardware H.264 encoder.
+    Probe ffmpeg for a hardware H.264 encoder that can actually run here.
 
     Order is platform-specific (videotoolbox on macOS, nvenc first on
-    Linux/Windows) so the most likely useful encoder is preferred. Returns
-    None when no hardware encoder is available, which the caller maps to the
-    software fallback.
+    Linux/Windows) so the most likely useful encoder is preferred. Each
+    candidate must both be listed by `-encoders` and pass a tiny smoke encode,
+    because a GPU-less container still ships nvenc/qsv builds although neither
+    can open a device. A codec already disabled after a runtime failure is
+    skipped, so "auto" does not keep retrying the same broken encoder for every
+    clip in a task. Returns None when no hardware encoder can work, which the
+    caller maps to the software fallback.
     """
     priority = _HARDWARE_CODEC_AUTO_PRIORITY.get(sys.platform, ())
     for codec in priority:
-        if _ffmpeg_encoder_exists(ffmpeg_binary, codec):
+        if codec in _runtime_disabled_video_codecs:
+            continue
+        if _ffmpeg_encoder_exists(ffmpeg_binary, codec) and _ffmpeg_encoder_runnable(
+            ffmpeg_binary, codec
+        ):
             return codec
     return None
 
@@ -559,10 +608,6 @@ def _fallback_write_videofile(clip, output_file: str, failed_codec: str, reason:
     """
     kwargs.pop("ffmpeg_params", None)
     clip.write_videofile(output_file, codec=_DEFAULT_VIDEO_CODEC, **kwargs)
-    # The hardware encoder was advertised by ffmpeg but failed at encode time;
-    # drop the positive probe so the next clip re-probes. A transient GPU
-    # driver glitch shouldn't stick for the rest of the render.
-    clear_ffmpeg_encoder_cache()
     _disable_runtime_video_codec(failed_codec, reason)
     return _DEFAULT_VIDEO_CODEC
 
@@ -653,6 +698,10 @@ def concat_video_clips_with_ffmpeg(
             "-pix_fmt",
             "yuv420p",
         ]
+        # same minimal parameters as the MoviePy write path, so a hardware
+        # encoder picked by "auto" gets preset/quality/bitrate it can use.
+        if codec in _HARDWARE_CODEC_FFMPEG_PARAMS:
+            command.extend(_HARDWARE_CODEC_FFMPEG_PARAMS[codec])
         if max_duration is not None and max_duration > 0:
             command.extend(["-t", f"{max_duration:.3f}"])
         command.append(output_file)
@@ -1926,7 +1975,13 @@ def render_image_zoom_video(image_path: str, clip_duration: int = 5) -> str:
         try:
             # Output the video to a file.
             video_file = f"{image_path}.mp4"
-            final_clip.write_videofile(video_file, fps=30, logger=None)
+            _write_videofile_with_codec_fallback(
+                final_clip,
+                video_file,
+                _get_configured_video_codec(),
+                fps=30,
+                logger=None,
+            )
             return video_file
         finally:
             close_clip(final_clip)

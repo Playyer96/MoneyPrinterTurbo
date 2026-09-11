@@ -55,13 +55,15 @@ class TestVideoService(unittest.TestCase):
         self.original_app_config = dict(config.app)
         self.test_img_path = os.path.join(resources_dir, "1.png")
         vd._runtime_disabled_video_codecs.clear()
-        vd.clear_ffmpeg_encoder_cache()
+        vd._ffmpeg_encoder_exists.cache_clear()
+        vd._ffmpeg_encoder_runnable.cache_clear()
 
     def tearDown(self):
         config.app.clear()
         config.app.update(self.original_app_config)
         vd._runtime_disabled_video_codecs.clear()
-        vd.clear_ffmpeg_encoder_cache()
+        vd._ffmpeg_encoder_exists.cache_clear()
+        vd._ffmpeg_encoder_runnable.cache_clear()
 
     def test_subtitle_spring_animation_keeps_color_and_mask_aligned(self):
         """
@@ -541,6 +543,19 @@ class TestVideoService(unittest.TestCase):
         with patch.object(vd, "_ffmpeg_encoder_exists", return_value=False):
             self.assertEqual(vd._get_effective_video_codec(), "libx264")
 
+    def test_get_effective_video_codec_falls_back_when_encoder_not_runnable(self):
+        """
+        An encoder compiled into FFmpeg may still not encode on the host -- a
+        GPU-less Docker container lists nvenc/qsv but cannot open a device. The
+        smoke encode must reject it before any clip wastes time failing.
+        """
+        config.app["video_codec"] = "h264_nvenc"
+
+        with patch.object(vd, "_ffmpeg_encoder_exists", return_value=True), patch.object(
+            vd, "_ffmpeg_encoder_runnable", return_value=False
+        ):
+            self.assertEqual(vd._get_effective_video_codec(), "libx264")
+
     def test_get_effective_video_codec_auto_picks_platform_priority(self):
         """
         `video_codec = "auto"` must probe ffmpeg via the platform priority list
@@ -561,15 +576,42 @@ class TestVideoService(unittest.TestCase):
         with patch.object(vd, "_detect_hardware_codec", return_value=None):
             self.assertEqual(vd._get_effective_video_codec(), "libx264")
 
-    def test_get_configured_video_codec_auto_detects_when_unset(self):
+    def test_get_configured_video_codec_uses_auto_default_when_unset(self):
         """
         The WebUI's "default" mode does not persist video_codec. With the
-        setting absent, the backend must probe for hardware and retain libx264
-        as the runtime fallback when no accelerated encoder works.
+        setting absent the backend must return "auto" so a hardware encoder is
+        picked when one is available and libx264 is the fallback, rather than
+        leaving an empty value for MoviePy or FFmpeg to interpret.
         """
         config.app.pop("video_codec", None)
 
         self.assertEqual(vd._get_configured_video_codec(), "auto")
+
+    def test_detect_hardware_codec_skips_runtime_disabled_codecs(self):
+        """
+        A codec disabled after a runtime failure must not be re-picked by
+        "auto", or every subsequent clip in a task would retry the broken
+        encoder and fall back again.
+        """
+        vd._runtime_disabled_video_codecs.add("h264_nvenc")
+
+        with patch.object(
+            vd,
+            "_ffmpeg_encoder_exists",
+            side_effect=lambda _binary, codec: codec == "h264_qsv",
+        ), patch.object(vd, "_ffmpeg_encoder_runnable", return_value=True):
+            self.assertEqual(vd._detect_hardware_codec("/tmp/ffmpeg"), "h264_qsv")
+
+    def test_detect_hardware_codec_skips_encoder_that_fails_smoke_test(self):
+        """
+        `auto` must not pick an encoder that `-encoders` lists but which cannot
+        open a device on this host, or a GPU-less container would fail a
+        hardware encode on every task and only then fall back to libx264.
+        """
+        with patch.object(vd, "_ffmpeg_encoder_exists", return_value=True), patch.object(
+            vd, "_ffmpeg_encoder_runnable", return_value=False
+        ):
+            self.assertIsNone(vd._detect_hardware_codec("/tmp/ffmpeg"))
 
     def test_get_configured_video_codec_preserves_explicit_libx264(self):
         """
@@ -594,55 +636,38 @@ class TestVideoService(unittest.TestCase):
         ):
             self.assertFalse(vd._ffmpeg_encoder_exists("C:/ffmpeg/bin/ffmpeg.exe", "h264_nvenc"))
 
-    def test_ffmpeg_encoder_exists_recovers_from_transient_probe_failure(self):
+    def test_ffmpeg_encoder_runnable_falls_back_when_probe_fails(self):
         """
-        The first probe of a long render can hit a transient subprocess
-        failure (locked file, Defender scan, PATH blip). Caching that False
-        for the lifetime of the process turns every subsequent clip into a
-        CPU encode, which is what motivated the positive-only cache. After a
-        probe failure, a later probe must still see the encoder.
+        A ffmpeg binary that cannot even start must not be ranked as a usable
+        hardware encoder by the smoke encode.
         """
-        ok_result = types.SimpleNamespace(
-            returncode=0,
-            stdout=" V....D h264_videotoolbox    VideoToolbox H.264 Encoder\n",
-            stderr="",
-        )
-        # First call: subprocess raises (transient). Second call: succeeds.
-        # We patch with a side_effect sequence: first OSError, then OK.
         with patch.object(
             vd.subprocess,
             "run",
-            side_effect=[OSError("transient"), ok_result],
+            side_effect=OSError("permission denied"),
         ):
-            first = vd._ffmpeg_encoder_exists("/opt/homebrew/bin/ffmpeg", "h264_videotoolbox")
-            second = vd._ffmpeg_encoder_exists("/opt/homebrew/bin/ffmpeg", "h264_videotoolbox")
-        self.assertFalse(first)
-        self.assertTrue(second)
+            self.assertFalse(vd._ffmpeg_encoder_runnable("C:/ffmpeg/bin/ffmpeg.exe", "h264_nvenc"))
 
-    def test_ffmpeg_encoder_exists_does_not_cache_negative_results(self):
+    def test_ffmpeg_encoder_runnable_false_on_probe_failure(self):
         """
-        Negative probe results must not be cached: a 296-clip render that
-        legitimately lacks the encoder should not pay a subprocess round-trip
-        per clip, but it must also not pin the answer in case a later probe
-        would succeed (see the recovery test above). In practice both look
-        the same to the caller — False — but the assertion that subprocess.run
-        is called twice proves the cache only holds positive results.
+        A nonzero exit from the smoke encode means the encoder cannot run on
+        this host (missing GPU, driver, or rate-control support), even though
+        `-encoders` still lists it.
         """
-        missing_result = types.SimpleNamespace(
-            returncode=0,
-            stdout=" V....D libx264    libx264 H.264 encoder (codec h264)\n",
-            stderr="",
-        )
         with patch.object(
             vd.subprocess,
             "run",
-            return_value=missing_result,
-        ) as run_mock:
-            first = vd._ffmpeg_encoder_exists("/opt/homebrew/bin/ffmpeg", "h264_videotoolbox")
-            second = vd._ffmpeg_encoder_exists("/opt/homebrew/bin/ffmpeg", "h264_videotoolbox")
-        self.assertFalse(first)
-        self.assertFalse(second)
-        self.assertEqual(run_mock.call_count, 2)
+            return_value=types.SimpleNamespace(returncode=1, stdout="", stderr="no device"),
+        ):
+            self.assertFalse(vd._ffmpeg_encoder_runnable("/usr/bin/ffmpeg", "h264_qsv"))
+
+    def test_ffmpeg_encoder_runnable_true_on_successful_encode(self):
+        with patch.object(
+            vd.subprocess,
+            "run",
+            return_value=types.SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ):
+            self.assertTrue(vd._ffmpeg_encoder_runnable("/usr/bin/ffmpeg", "h264_nvenc"))
 
     def test_write_videofile_falls_back_after_runtime_encoder_failure(self):
         """
@@ -662,7 +687,9 @@ class TestVideoService(unittest.TestCase):
 
         fake_clip = _FakeClip()
 
-        with patch.object(vd, "_ffmpeg_encoder_exists", return_value=True):
+        with patch.object(vd, "_ffmpeg_encoder_exists", return_value=True), patch.object(
+            vd, "_ffmpeg_encoder_runnable", return_value=True
+        ):
             used_codec = vd._write_videofile_with_codec_fallback(
                 fake_clip,
                 "/tmp/fake.mp4",
@@ -686,7 +713,9 @@ class TestVideoService(unittest.TestCase):
             def write_videofile(self, output_file, codec, **kwargs):
                 raise RuntimeError(f"{codec} cannot write output")
 
-        with patch.object(vd, "_ffmpeg_encoder_exists", return_value=True):
+        with patch.object(vd, "_ffmpeg_encoder_exists", return_value=True), patch.object(
+            vd, "_ffmpeg_encoder_runnable", return_value=True
+        ):
             with self.assertRaises(RuntimeError):
                 vd._write_videofile_with_codec_fallback(
                     _FakeClip(),
@@ -761,7 +790,9 @@ class TestVideoService(unittest.TestCase):
             output_file = os.path.join(temp_dir, "combined.mp4")
             Path(clip_file).write_bytes(b"fake")
 
-            with patch.object(vd, "_ffmpeg_encoder_exists", return_value=True):
+            with patch.object(vd, "_ffmpeg_encoder_exists", return_value=True), patch.object(
+                vd, "_ffmpeg_encoder_runnable", return_value=True
+            ):
                 with patch.object(vd.subprocess, "run", side_effect=fake_run) as run:
                     vd.concat_video_clips_with_ffmpeg(
                         clip_files=[clip_file],
@@ -799,7 +830,9 @@ class TestVideoService(unittest.TestCase):
             output_file = os.path.join(temp_dir, "combined.mp4")
             Path(clip_file).write_bytes(b"fake")
 
-            with patch.object(vd, "_ffmpeg_encoder_exists", return_value=True):
+            with patch.object(vd, "_ffmpeg_encoder_exists", return_value=True), patch.object(
+                vd, "_ffmpeg_encoder_runnable", return_value=True
+            ):
                 with patch.object(vd.subprocess, "run", side_effect=fake_run):
                     with self.assertRaises(RuntimeError):
                         vd.concat_video_clips_with_ffmpeg(

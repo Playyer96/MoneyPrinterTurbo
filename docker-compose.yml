@@ -63,6 +63,11 @@ x-build-args: &build-args
   PIP_USE_OFFICIAL: "${PIP_USE_OFFICIAL:-auto}"
 
 x-service-env: &service-env
+  # MoviePy defaults to the imageio-ffmpeg bundled binary (a static ffmpeg
+  # 7.0.2 build), which has no NVENC encoder at all, while the app itself
+  # resolves /usr/bin/ffmpeg for concat/probes. Point MoviePy at the same
+  # binary so the hardware-codec smoke test reflects what actually encodes.
+  FFMPEG_BINARY: "${FFMPEG_BINARY:-/usr/bin/ffmpeg}"
   # Service name on the bridge network by default. docker-compose.mac.yml
   # repoints this at the host, where the GPU actually is on Apple Silicon.
   VOICESTUDIO_BASE_URL: "${VOICESTUDIO_BASE_URL:-http://voicestudio:8780}"
