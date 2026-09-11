@@ -24,6 +24,17 @@ mac-setup:
 		uv venv --python 3.11 && \
 		uv pip install --python "$(REPO)/.venv/bin/python" \
 			-r vendor/voice_studio/requirements.txt; }
+	# Idempotent: pin refresh + a known-bad dep check before bootstrapping.
+	# If you ever see the LaunchAgent crash-loop on omnivoice import, this is
+	# what fixes it -- run `make mac-setup` again.
+	@uv pip install --python "$(REPO)/.venv/bin/python" --quiet \
+		-r vendor/voice_studio/requirements.txt
+	@if ! "$(REPO)/.venv/bin/python" -c \
+		"import tokenizers; v=tuple(int(x) for x in tokenizers.__version__.split('.')[:2]); assert (0,23) <= v < (0,24)" 2>/dev/null; then \
+		echo "tokenizers out of range, pinning..."; \
+		uv pip install --python "$(REPO)/.venv/bin/python" --quiet \
+			'tokenizers>=0.23.1,<0.24.0'; \
+	fi
 	@mkdir -p "$(HOME)/Library/LaunchAgents" "$(REPO)/storage/logs"
 	@printf '%s\n' \
 	  '<?xml version="1.0" encoding="UTF-8"?>' \
@@ -31,8 +42,7 @@ mac-setup:
 	  '<plist version="1.0"><dict>' \
 	  '  <key>Label</key><string>com.moneyprinterturbo.voicestudio</string>' \
 	  '  <key>ProgramArguments</key><array>' \
-	  '    <string>$(REPO)/.venv/bin/python</string>' \
-	  '    <string>$(REPO)/vendor/voice_studio/server.py</string>' \
+	  '    <string>$(REPO)/scripts/voicestudio-runner.sh</string>' \
 	  '  </array>' \
 	  '  <key>EnvironmentVariables</key><dict>' \
 	  '    <key>VOICESTUDIO_HOST</key><string>0.0.0.0</string>' \
