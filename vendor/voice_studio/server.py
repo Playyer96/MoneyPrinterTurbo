@@ -10,7 +10,9 @@ lock because the heavy OmniVoice model is loaded once per process.
 Endpoints:
     GET  /health           -> liveness probe
     GET  /voices           -> list bundled voice-design presets + cloned profiles
+    GET  /profiles         -> list cloned profile names
     POST /profiles         -> clone a voice from an uploaded sample (multipart)
+    DELETE /profiles/<name> -> delete a cloned profile and all its files
     POST /generate         -> synthesize WAV (JSON: text, voice, speed?)
     POST /transcribe       -> transcribe raw audio bytes (Metal/MLX whisper)
 
@@ -54,18 +56,11 @@ _model_lock = threading.Lock()
 # behind each other's model loads.
 _whisper_lock = threading.Lock()
 
-# Bundled voice-design presets. Each entry maps a stable name (kept as the
-# original character name the user expects to see in the dropdown) to the
-# `instruct` string OmniVoice consumes. Names are short, lowercase, ASCII so
-# they round-trip cleanly through MPT's voice id parser
-# (voicestudio:<name>) and through TOML config keys.
-VOICE_PRESETS: dict[str, str] = {
-    "cr7": "male, middle-aged, low pitch, portuguese accent",
-    "goku": "male, young adult, moderate pitch",
-    "narrator": "male, middle-aged, moderate pitch",
-    "casual": "female, young adult, moderate pitch",
-    "energetic": "male, young adult, high pitch",
-}
+# Bundled voice-design presets. Each entry maps a stable name to the
+# `instruct` string OmniVoice consumes. Kept empty: every usable voice is a
+# cloned profile in PROFILES_DIR; add preset entries here if a textual voice
+# design is ever needed.
+VOICE_PRESETS: dict[str, str] = {}
 
 # Cloned voices live as `<name>.pt` (a saved VoiceClonePrompt), an optional
 # `<name>.<ext>` audio sample, and a `<name>.json` metadata file in the
@@ -159,7 +154,7 @@ def _load_model():
 
 class GenerateRequest(BaseModel):
     text: str
-    voice: str = "narrator"
+    voice: Optional[str] = None
     speed: Optional[float] = None
 
 
@@ -255,6 +250,58 @@ async def create_profile(
         ) from exc
 
     return {"ok": True, "name": profile_name, "voices": _list_profiles()}
+
+
+@app.get("/profiles")
+def list_profiles_endpoint() -> dict:
+    """Return every cloned profile name, for management UIs.
+
+    Presets live in code (``VOICE_PRESETS``) and are deliberately excluded:
+    this endpoint answers \"what can I delete / manage\", not \"what can I
+    synthesize with\" (that is ``/voices``).
+    """
+    return {"profiles": [{"name": name} for name in _list_profiles()]}
+
+
+@app.delete("/profiles/{name}")
+def delete_profile(name: str) -> dict:
+    """Delete a cloned profile and every file that belongs to it.
+
+    All ``<name>.*`` files in ``PROFILES_DIR`` are removed (the saved
+    ``VoiceClonePrompt`` ``.pt``, the ``.json`` metadata, and the reference
+    audio sample). Presets are never touchable through this endpoint: they
+    live in ``VOICE_PRESETS``, not on disk, so a preset name has no prompt
+    file and simply reports 404. Returns the remaining profile list so
+    callers can refresh without a second round-trip.
+    """
+    profile_name = _normalize_profile_name(name)
+    if not profile_name:
+        raise HTTPException(
+            status_code=400, detail="profile name must be non-empty"
+        )
+    if _profile_prompt_path(profile_name) is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"voice profile '{profile_name}' not found",
+        )
+
+    removed_files = 0
+    prefix = f"{profile_name}."
+    if os.path.isdir(PROFILES_DIR):
+        for entry in os.listdir(PROFILES_DIR):
+            if entry.startswith(prefix):
+                try:
+                    os.remove(os.path.join(PROFILES_DIR, entry))
+                    removed_files += 1
+                except OSError:
+                    pass
+
+    return {
+        "ok": True,
+        "name": profile_name,
+        "removed_files": removed_files,
+        "voices": _list_profiles(),
+    }
 
 
 @app.post("/generate")

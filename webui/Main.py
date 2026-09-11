@@ -7213,13 +7213,43 @@ def _render_audio_settings(panel, params):
                             f"{tr('VoiceStudio Profile Created')}: "
                             f"{(profile_name_input or '').strip()}"
                         )
-                        # 让音色目录下次 rerun 时重新拉取，包含新建的音色。
+                        # Refresh the voice catalog on the next rerun so the
+                        # newly created profile shows up in the TTS drop-down.
                         st.session_state.pop("voicestudio_voice_catalog", None)
                     else:
                         st.error(f"{tr('VoiceStudio Profile Create Failed')}: {message}")
 
-            # 三种模式只渲染当前任务真正需要的控件。自动配音可调音量和语速；
-            # 上传音频只需要文件和音量；无配音不再展示无效设置。
+                cloned_profiles = voice.get_voicestudio_profiles()
+                if cloned_profiles:
+                    profile_to_remove = st.selectbox(
+                        tr("VoiceStudio Profile to Remove"),
+                        options=cloned_profiles,
+                        key="voicestudio_profile_remove_select",
+                    )
+                    if st.button(
+                        tr("Remove VoiceStudio Profile"),
+                        key="voicestudio_remove_profile_button",
+                    ):
+                        ok, message = voice.delete_voicestudio_profile(
+                            profile_to_remove
+                        )
+                        if ok:
+                            st.success(
+                                f"{tr('VoiceStudio Profile Removed')}: "
+                                f"{profile_to_remove}"
+                            )
+                            # Refresh the catalog so the deleted voice leaves
+                            # the TTS drop-down on the next rerun.
+                            st.session_state.pop("voicestudio_voice_catalog", None)
+                        else:
+                            st.error(
+                                f"{tr('VoiceStudio Profile Remove Failed')}: "
+                                f"{message}"
+                            )
+
+            # Render only the controls each mode actually needs. Auto dubbing
+            # exposes volume and rate; uploaded audio needs just the file and
+            # volume; no-voice mode shows no TTS settings.
             params.voice_name = (
                 voice.NO_VOICE_NAME if voice_mode == VOICE_MODE_NONE else voice_name
             )

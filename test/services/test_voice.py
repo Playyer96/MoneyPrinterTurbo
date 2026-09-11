@@ -1735,50 +1735,182 @@ class TestVoiceStudioVoice(unittest.TestCase):
         self.assertIsNone(result)
         mock_tts.assert_not_called()
 
-    def test_create_voicestudio_profile_returns_unsupported(self):
-        """Profile cloning was removed when the bridge moved to bundled
-        voice-design presets. The function is kept as a stable import so
-        the WebUI module still loads, but callers must see a clear failure.
-        """
-        with patch.object(vs.requests, "post") as post:
+    def test_create_voicestudio_profile_posts_multipart_and_returns_name(self):
+        class _FakeResponse:
+            status_code = 201
+
+            def json(self):
+                return {"ok": True, "name": "new_clone"}
+
+        with (
+            patch.dict(os.environ, {"VOICESTUDIO_BASE_URL": ""}),
+            patch.object(
+                vs.config, "voicestudio", {"base_url": "http://localhost:9999"}
+            ),
+            patch.object(vs.requests, "post", return_value=_FakeResponse()) as post,
+        ):
             ok, message = vs.create_voicestudio_profile(
-                profile_name="anything",
+                profile_name="New Clone",
                 audio_bytes=b"RIFF-audio",
                 original_filename="sample.wav",
             )
-        self.assertFalse(ok)
-        self.assertIn("not available", message)
-        post.assert_not_called()
+        post.assert_called_once()
+        args, kwargs = post.call_args
+        self.assertEqual(args[0], "http://localhost:9999/profiles")
+        self.assertEqual(kwargs["data"], {"name": "New Clone"})
+        self.assertEqual(kwargs["files"]["audio"][0], "sample.wav")
+        self.assertTrue(ok)
+        self.assertEqual(message, "new_clone")
 
-    def test_create_voicestudio_profile_conflict_returns_failure(self):
-        """Profile cloning is gone; the stub returns the same unsupported
-        message regardless of input so callers see a single, stable failure.
-        """
-        with patch.object(vs.requests, "post") as post:
+    def test_create_voicestudio_profile_conflict_returns_server_message(self):
+        class _FakeResponse:
+            status_code = 409
+            text = "voice profile 'goku' already exists"
+
+        with (
+            patch.dict(os.environ, {"VOICESTUDIO_BASE_URL": ""}),
+            patch.object(
+                vs.config, "voicestudio", {"base_url": "http://localhost:9999"}
+            ),
+            patch.object(vs.requests, "post", return_value=_FakeResponse()),
+        ):
             ok, message = vs.create_voicestudio_profile(
                 profile_name="goku",
                 audio_bytes=b"RIFF-audio",
                 original_filename="sample.wav",
             )
         self.assertFalse(ok)
-        self.assertIn("not available", message)
-        post.assert_not_called()
+        self.assertIn("already exists", message)
 
     def test_create_voicestudio_profile_offline_returns_failure(self):
-        with patch.object(vs.requests, "post") as post:
+        import requests as req_lib
+
+        with (
+            patch.dict(os.environ, {"VOICESTUDIO_BASE_URL": ""}),
+            patch.object(
+                vs.config, "voicestudio", {"base_url": "http://localhost:9999"}
+            ),
+            patch.object(
+                vs.requests,
+                "post",
+                side_effect=req_lib.exceptions.ConnectionError("down"),
+            ),
+        ):
             ok, message = vs.create_voicestudio_profile(
                 profile_name="x",
                 audio_bytes=b"RIFF-audio",
                 original_filename="sample.wav",
             )
         self.assertFalse(ok)
-        post.assert_not_called()
+        self.assertIn("voicestudio server unreachable", message)
 
     def test_create_voicestudio_profile_empty_input_is_rejected(self):
         ok, message = vs.create_voicestudio_profile(
             profile_name="  ", audio_bytes=b"", original_filename="sample.wav"
         )
         self.assertFalse(ok)
+        self.assertEqual(message, "profile name must be non-empty")
+
+    def test_get_voicestudio_profiles_reads_server_clones(self):
+        class _FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"profiles": [{"name": "myclone"}, {"name": "cr7_profile"}]}
+
+        with (
+            patch.dict(os.environ, {"VOICESTUDIO_BASE_URL": ""}),
+            patch.object(
+                vs.config, "voicestudio", {"base_url": "http://localhost:9999"}
+            ),
+            patch.object(vs.requests, "get", return_value=_FakeResponse()) as mock_get,
+        ):
+            result = vs.get_voicestudio_profiles()
+
+        mock_get.assert_called_once_with("http://localhost:9999/profiles", timeout=5)
+        self.assertEqual(result, ["myclone", "cr7_profile"])
+
+    def test_get_voicestudio_profiles_offline_returns_empty(self):
+        import requests as req_lib
+
+        with (
+            patch.dict(os.environ, {"VOICESTUDIO_BASE_URL": ""}),
+            patch.object(
+                vs.config, "voicestudio", {"base_url": "http://localhost:9999"}
+            ),
+            patch.object(
+                vs.requests,
+                "get",
+                side_effect=req_lib.exceptions.ConnectionError("down"),
+            ),
+        ):
+            result = vs.get_voicestudio_profiles()
+        self.assertEqual(result, [])
+
+    def test_delete_voicestudio_profile_success(self):
+        class _FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"ok": True, "name": "myclone"}
+
+        with (
+            patch.dict(os.environ, {"VOICESTUDIO_BASE_URL": ""}),
+            patch.object(
+                vs.config, "voicestudio", {"base_url": "http://localhost:9999"}
+            ),
+            patch.object(
+                vs.requests, "delete", return_value=_FakeResponse()
+            ) as mock_delete,
+        ):
+            ok, message = vs.delete_voicestudio_profile("myclone")
+
+        mock_delete.assert_called_once_with(
+            "http://localhost:9999/profiles/myclone", timeout=60
+        )
+        self.assertTrue(ok)
+        self.assertEqual(message, "myclone")
+
+    def test_delete_voicestudio_profile_missing_returns_failure(self):
+        class _FakeResponse:
+            status_code = 404
+            text = "voice profile 'ghost' not found"
+
+        with (
+            patch.dict(os.environ, {"VOICESTUDIO_BASE_URL": ""}),
+            patch.object(
+                vs.config, "voicestudio", {"base_url": "http://localhost:9999"}
+            ),
+            patch.object(vs.requests, "delete", return_value=_FakeResponse()),
+        ):
+            ok, message = vs.delete_voicestudio_profile("ghost")
+        self.assertFalse(ok)
+        self.assertIn("not found", message)
+
+    def test_delete_voicestudio_profile_empty_name_is_rejected(self):
+        with patch.object(vs.requests, "delete") as mock_delete:
+            ok, message = vs.delete_voicestudio_profile("   ")
+        self.assertFalse(ok)
+        self.assertEqual(message, "profile name must be non-empty")
+        mock_delete.assert_not_called()
+
+    def test_delete_voicestudio_profile_offline_returns_failure(self):
+        import requests as req_lib
+
+        with (
+            patch.dict(os.environ, {"VOICESTUDIO_BASE_URL": ""}),
+            patch.object(
+                vs.config, "voicestudio", {"base_url": "http://localhost:9999"}
+            ),
+            patch.object(
+                vs.requests,
+                "delete",
+                side_effect=req_lib.exceptions.ConnectionError("down"),
+            ),
+        ):
+            ok, message = vs.delete_voicestudio_profile("myclone")
+        self.assertFalse(ok)
+        self.assertIn("voicestudio server unreachable", message)
 
 
 class TestElevenLabsVoice(unittest.TestCase):

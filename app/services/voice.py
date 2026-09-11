@@ -17,7 +17,7 @@ import unicodedata
 import wave
 from datetime import datetime, timedelta
 from typing import Union
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from xml.sax.saxutils import escape, unescape
 
 import edge_tts
@@ -471,6 +471,64 @@ def create_voicestudio_profile(
         return True, name
     logger.warning(
         f"voicestudio profile creation failed with status "
+        f"{response.status_code}: {response.text[:200]}"
+    )
+    return False, response.text[:200]
+
+
+def get_voicestudio_profiles() -> list[str]:
+    """List cloned profile names from the local OmniVoice bridge.
+
+    Unlike :func:`get_voicestudio_voices` this returns only the cloned
+    profiles (not the bundled presets), so the WebUI can offer them for
+    deletion without having to know which names are presets.
+    """
+    base_url = get_voicestudio_base_url()
+    try:
+        response = requests.get(f"{base_url}/profiles", timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            profiles = data.get("profiles", []) if isinstance(data, dict) else []
+            return [
+                entry.get("name")
+                for entry in profiles
+                if isinstance(entry, dict) and entry.get("name")
+            ]
+    except Exception as exc:
+        logger.warning(f"voicestudio profile list unavailable: {exc}")
+    return []
+
+
+def delete_voicestudio_profile(profile_name: str) -> tuple[bool, str]:
+    """Delete a cloned voice profile from the local OmniVoice bridge.
+
+    Sends ``DELETE {base_url}/profiles/<name>``, which removes the saved
+    ``VoiceClonePrompt`` (``.pt``), its metadata (``.json``), and the stored
+    reference audio sample. Returns ``(ok, message_or_name)`` matching the
+    contract used by :func:`create_voicestudio_profile`.
+    """
+    profile_name = (profile_name or "").strip()
+    if not profile_name:
+        return False, "profile name must be non-empty"
+    base_url = get_voicestudio_base_url()
+    try:
+        response = requests.delete(
+            f"{base_url}/profiles/{quote(profile_name, safe='')}", timeout=60
+        )
+    except Exception as exc:
+        logger.warning(f"voicestudio profile deletion failed: {exc}")
+        return False, f"voicestudio server unreachable: {exc}"
+
+    if response.status_code == 200:
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = {}
+        name = detail.get("name") or profile_name
+        logger.success(f"voicestudio profile removed: {name}")
+        return True, name
+    logger.warning(
+        f"voicestudio profile removal failed with status "
         f"{response.status_code}: {response.text[:200]}"
     )
     return False, response.text[:200]
