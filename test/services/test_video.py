@@ -561,15 +561,31 @@ class TestVideoService(unittest.TestCase):
         with patch.object(vd, "_detect_hardware_codec", return_value=None):
             self.assertEqual(vd._get_effective_video_codec(), "libx264")
 
-    def test_get_configured_video_codec_uses_stable_default_when_unset(self):
+    def test_get_configured_video_codec_uses_auto_default_when_unset(self):
         """
         The WebUI's "default" mode does not persist video_codec. With the
-        setting absent the backend must still return libx264 explicitly, rather
-        than leaving an empty value for MoviePy or FFmpeg to interpret.
+        setting absent the backend must return "auto" so a hardware encoder is
+        picked when one is available and libx264 is the fallback, rather than
+        leaving an empty value for MoviePy or FFmpeg to interpret.
         """
         config.app.pop("video_codec", None)
 
-        self.assertEqual(vd._get_configured_video_codec(), "libx264")
+        self.assertEqual(vd._get_configured_video_codec(), "auto")
+
+    def test_detect_hardware_codec_skips_runtime_disabled_codecs(self):
+        """
+        A codec disabled after a runtime failure must not be re-picked by
+        "auto", or every subsequent clip in a task would retry the broken
+        encoder and fall back again.
+        """
+        vd._runtime_disabled_video_codecs.add("h264_nvenc")
+
+        with patch.object(
+            vd,
+            "_ffmpeg_encoder_exists",
+            side_effect=lambda _binary, codec: codec == "h264_qsv",
+        ):
+            self.assertEqual(vd._detect_hardware_codec("/tmp/ffmpeg"), "h264_qsv")
 
     def test_get_configured_video_codec_preserves_explicit_libx264(self):
         """

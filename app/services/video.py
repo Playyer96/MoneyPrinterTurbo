@@ -85,6 +85,10 @@ _MIN_MATERIAL_DIMENSION = 480
 # a small tolerance admits material that is short only because of rounding while
 # still rejecting genuinely low-resolution footage.
 _MIN_DIMENSION_TOLERANCE = 10
+# libx264 is the software fallback used whenever a hardware encoder is absent
+# or failed at runtime. The default policy for an unset video_codec is "auto":
+# probe for a platform hardware encoder and only then fall back to libx264, so
+# a GPU passes through by default and a CPU-only host keeps working unchanged.
 _DEFAULT_VIDEO_CODEC = "libx264"
 _SUBTITLE_SPRING_DURATION_SECONDS = 0.18
 _MIN_SUBTITLE_SPRING_SCALE = 0.05
@@ -376,14 +380,13 @@ def _get_configured_video_codec() -> str:
     """
     Read the user-configured video encoder.
 
-    This setting targets advanced users who want to try hardware encoding such
-    as NVENC, AMF, QSV, or VideoToolbox. Only a fixed allowlist is accepted on
-    purpose: opening it to arbitrary FFmpeg parameters would let a typo produce
-    an unpredictable output format, or fail the task at a much later stage.
+    When video_codec is unset the project default is "auto": probe ffmpeg for a
+    hardware encoder (NVENC/AMF/QSV/VideoToolbox) and fall back to libx264 when
+    none can be used. Only a fixed allowlist is accepted on purpose: opening it
+    to arbitrary FFmpeg parameters would let a typo produce an unpredictable
+    output format, or fail the task at a much later stage.
     """
-    configured_codec = str(
-        config.app.get("video_codec", _DEFAULT_VIDEO_CODEC) or _DEFAULT_VIDEO_CODEC
-    ).strip()
+    configured_codec = str(config.app.get("video_codec", "auto") or "auto").strip()
     if configured_codec not in _SUPPORTED_VIDEO_CODECS:
         logger.warning(
             f"unsupported video codec configured: {configured_codec}, "
@@ -473,12 +476,16 @@ def _detect_hardware_codec(ffmpeg_binary: str) -> str | None:
     Probe ffmpeg for an available hardware H.264 encoder.
 
     Order is platform-specific (videotoolbox on macOS, nvenc first on
-    Linux/Windows) so the most likely useful encoder is preferred. Returns
+    Linux/Windows) so the most likely useful encoder is preferred. A codec
+    already disabled after a runtime failure is skipped, so "auto" does not
+    keep retrying the same broken encoder for every clip in a task. Returns
     None when no hardware encoder is available, which the caller maps to the
     software fallback.
     """
     priority = _HARDWARE_CODEC_AUTO_PRIORITY.get(sys.platform, ())
     for codec in priority:
+        if codec in _runtime_disabled_video_codecs:
+            continue
         if _ffmpeg_encoder_exists(ffmpeg_binary, codec):
             return codec
     return None
@@ -616,6 +623,10 @@ def concat_video_clips_with_ffmpeg(
             "-pix_fmt",
             "yuv420p",
         ]
+        # same minimal parameters as the MoviePy write path, so a hardware
+        # encoder picked by "auto" gets preset/quality/bitrate it can use.
+        if codec in _HARDWARE_CODEC_FFMPEG_PARAMS:
+            command.extend(_HARDWARE_CODEC_FFMPEG_PARAMS[codec])
         if max_duration is not None and max_duration > 0:
             command.extend(["-t", f"{max_duration:.3f}"])
         command.append(output_file)
@@ -1889,7 +1900,13 @@ def render_image_zoom_video(image_path: str, clip_duration: int = 5) -> str:
         try:
             # Output the video to a file.
             video_file = f"{image_path}.mp4"
-            final_clip.write_videofile(video_file, fps=30, logger=None)
+            _write_videofile_with_codec_fallback(
+                final_clip,
+                video_file,
+                _get_configured_video_codec(),
+                fps=30,
+                logger=None,
+            )
             return video_file
         finally:
             close_clip(final_clip)
