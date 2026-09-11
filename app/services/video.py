@@ -36,7 +36,7 @@ from app.models.schema import (
     VideoParams,
     VideoTransitionMode,
 )
-from app.services import guardrails
+from app.services import guardrails, subtitle_styles
 from app.services import bgm as bgm_service
 from app.services.utils import video_effects
 from app.utils import file_security, utils
@@ -181,27 +181,104 @@ def _scale_subtitle_frame_on_canvas(frame: np.ndarray, scale: float) -> np.ndarr
     return np.asarray(color_canvas).astype(frame.dtype, copy=False)
 
 
+def _shift_subtitle_frame_on_canvas(frame: np.ndarray, dx: int, dy: int) -> np.ndarray:
+    """Shift a subtitle frame or mask by (dx, dy) keeping canvas bounds intact."""
+    if dx == 0 and dy == 0:
+        return frame
+    height, width = frame.shape[:2]
+    if frame.ndim == 2:
+        mask_image = Image.fromarray(
+            np.clip(frame * 255.0, 0, 255).astype(np.uint8)
+        )
+        mask_canvas = Image.new("L", (width, height), 0)
+        mask_canvas.paste(mask_image, (dx, dy))
+        return (np.asarray(mask_canvas) / 255.0).astype(frame.dtype, copy=False)
+
+    if frame.shape[2] not in (3, 4):
+        raise ValueError("subtitle color frame must use RGB or RGBA channels")
+    color_image = Image.fromarray(frame)
+    background = (0, 0, 0, 0) if frame.shape[2] == 4 else (0, 0, 0)
+    color_canvas = Image.new(color_image.mode, (width, height), background)
+    color_canvas.paste(color_image, (dx, dy))
+    return np.asarray(color_canvas).astype(frame.dtype, copy=False)
+
+
+def _apply_subtitle_animation(clip, subtitle_duration: float, anim_type: str = "none"):
+    """
+    Apply entry animation to a subtitle or title clip.
+    Supports none, pop_spring, scale_up, fade, slide_up, shake.
+    """
+    if anim_type in ("none", "", None):
+        return clip
+
+    anim_duration = min(0.18, max(0.0, subtitle_duration))
+    if anim_duration <= 0:
+        return clip
+
+    if anim_type in ("pop_spring", "spring", "pop"):
+        def transform_spring(get_frame, t):
+            frame = get_frame(t)
+            scale = _get_subtitle_spring_scale(t, anim_duration)
+            if scale == 1.0:
+                return frame
+            return _scale_subtitle_frame_on_canvas(frame, scale)
+        return clip.transform(transform_spring, apply_to=["mask"])
+
+    if anim_type in ("scale_up", "zoom_in", "punch"):
+        def transform_scale_up(get_frame, t):
+            frame = get_frame(t)
+            if t >= anim_duration:
+                return frame
+            progress = max(0.0, min(t / anim_duration, 1.0))
+            scale = 1.0 - 0.35 * ((1.0 - progress) ** 2)
+            return _scale_subtitle_frame_on_canvas(frame, scale)
+        return clip.transform(transform_scale_up, apply_to=["mask"])
+
+    if anim_type in ("fade", "fade_in"):
+        def transform_fade(get_frame, t):
+            frame = get_frame(t)
+            if t >= anim_duration:
+                return frame
+            progress = max(0.0, min(t / anim_duration, 1.0))
+            if frame.ndim == 2:
+                return (frame * progress).astype(frame.dtype, copy=False)
+            if frame.shape[2] == 4:
+                frame_copy = frame.copy()
+                frame_copy[:, :, 3] = np.clip(frame_copy[:, :, 3] * progress, 0, 255).astype(frame.dtype)
+                return frame_copy
+            return (frame * progress).astype(frame.dtype, copy=False)
+        return clip.transform(transform_fade, apply_to=["mask"])
+
+    if anim_type in ("slide_up", "rise"):
+        clip_h = getattr(clip, "h", None) or 50
+        shift_dist = max(15, int(round(clip_h * 0.3)))
+        def transform_slide(get_frame, t):
+            frame = get_frame(t)
+            if t >= anim_duration:
+                return frame
+            progress = max(0.0, min(t / anim_duration, 1.0))
+            dy = int(round(shift_dist * ((1.0 - progress) ** 2)))
+            return _shift_subtitle_frame_on_canvas(frame, 0, dy)
+        return clip.transform(transform_slide, apply_to=["mask"])
+
+    if anim_type in ("shake", "jitter"):
+        def transform_shake(get_frame, t):
+            frame = get_frame(t)
+            if t >= anim_duration:
+                return frame
+            decay = math.exp(-20.0 * t)
+            dx = int(round(5.0 * math.sin(t * 60.0) * decay))
+            dy = int(round(3.5 * math.cos(t * 50.0) * decay))
+            return _shift_subtitle_frame_on_canvas(frame, dx, dy)
+        return clip.transform(transform_shake, apply_to=["mask"])
+
+    return clip
+
+
 def _apply_subtitle_spring_animation(clip, subtitle_duration: float):
     """Scale the subtitle frame and its mask together so the bounce animation
     never opens on a black frame."""
-    animation_duration = min(
-        _SUBTITLE_SPRING_DURATION_SECONDS,
-        max(0.0, subtitle_duration),
-    )
-    if animation_duration <= 0:
-        return clip
-
-    def transform_frame(get_frame, time_seconds):
-        frame = get_frame(time_seconds)
-        scale = _get_subtitle_spring_scale(time_seconds, animation_duration)
-        if scale == 1.0:
-            return frame
-        return _scale_subtitle_frame_on_canvas(frame, scale)
-
-    # apply_to=["mask"] is the fix: MoviePy only transforms the colour frame by
-    # default, so the old implementation briefly kept a full-size mask as each
-    # subtitle appeared and showed a black text outline.
-    return clip.transform(transform_frame, apply_to=["mask"])
+    return _apply_subtitle_animation(clip, subtitle_duration, "pop_spring")
 
 
 def _get_required_video_duration(audio_duration: float) -> float:
@@ -1268,6 +1345,166 @@ def subtitle_font_supports_text(font_path: str, text: str) -> bool:
     return _subtitle_font_supports_sample(font_path, sample)
 
 
+def _create_title_clip(
+    params: VideoParams,
+    video_width: int,
+    video_height: int,
+    video_duration: float,
+):
+    """
+    Render an on-screen title or hook banner overlay clip for TikTok/Reels/Shorts.
+    Returns None if title overlay is not enabled or title text is empty.
+    """
+    if not getattr(params, "title_enabled", False):
+        return None
+
+    title_text = (getattr(params, "title_text", "") or "").strip()
+    if not title_text:
+        title_text = (getattr(params, "video_subject", "") or "").strip()
+    if not title_text:
+        return None
+
+    style_id = getattr(params, "title_style", "tiktok_yellow") or "tiktok_yellow"
+    style_cfg = (
+        subtitle_styles.get_title_style(style_id)
+        or subtitle_styles.TITLE_STYLES["tiktok_yellow"]
+    )
+
+    casing = style_cfg.get("casing", "uppercase")
+    title_text = subtitle_styles.apply_text_casing(title_text, casing)
+
+    font_name = (
+        getattr(params, "title_font_name", None)
+        or style_cfg.get("font_name")
+        or getattr(params, "font_name", "Anton-Regular.ttf")
+    )
+    available_fonts = [
+        f for f in os.listdir(utils.font_dir()) if f.endswith((".ttf", ".ttc"))
+    ]
+    if font_name not in available_fonts:
+        font_name = (
+            "STHeitiMedium.ttc"
+            if "STHeitiMedium.ttc" in available_fonts
+            else (available_fonts[0] if available_fonts else "")
+        )
+    font_path = os.path.join(utils.font_dir(), font_name)
+    if os.name == "nt":
+        font_path = font_path.replace("\\", "/")
+
+    font_size = getattr(params, "title_font_size", None)
+    if not font_size:
+        font_size = max(36, int(video_width * 0.055))
+    font_size = int(font_size)
+
+    max_title_width = video_width * 0.85
+    wrapped_title, _ = wrap_text(
+        title_text,
+        max_width=max_title_width,
+        font=font_path,
+        fontsize=font_size,
+    )
+
+    text_color = style_cfg.get("text_color", "#FFFFFF")
+    stroke_color = style_cfg.get("stroke_color")
+    stroke_width = float(style_cfg.get("stroke_width", 0.0))
+    bg_color = style_cfg.get("bg_color")
+    rounded = style_cfg.get("rounded", True)
+
+    pad_x = int(font_size * 0.5) if bg_color else 0
+    pad_y = int(font_size * 0.3) if bg_color else 0
+
+    try:
+        font_obj = ImageFont.truetype(font_path, font_size)
+        text_w = max(
+            int(font_obj.getbbox(line)[2] - font_obj.getbbox(line)[0])
+            for line in wrapped_title.split("\n")
+        )
+    except Exception:
+        text_w = int(max_title_width)
+
+    box_w = max(1, min(int(max_title_width), text_w + 2 * pad_x))
+    interline = int(font_size * 0.2)
+    line_count = wrapped_title.count("\n") + 1
+    clip_h = int(font_size * line_count * 1.3 + 2 * pad_y)
+
+    text_clip = TextClip(
+        text=wrapped_title,
+        font=font_path,
+        font_size=font_size,
+        color=text_color,
+        stroke_color=stroke_color,
+        stroke_width=int(stroke_width),
+        interline=interline,
+        size=(box_w, None),
+        text_align="center",
+    )
+    clip_h = max(clip_h, text_clip.h + 2 * pad_y)
+
+    if bg_color:
+        radius = max(8, int(font_size * 0.4)) if rounded else 0
+        bg_clip = _rounded_subtitle_background_clip(
+            width=box_w,
+            height=clip_h,
+            color=bg_color,
+            alpha=235,
+            radius=radius,
+        )
+        text_pos = _get_visible_center_position(text_clip, box_w, clip_h)
+        title_clip = CompositeVideoClip(
+            [bg_clip, text_clip.with_position(text_pos)],
+            size=(box_w, clip_h),
+        )
+    else:
+        title_clip = text_clip
+
+    duration_mode = getattr(params, "title_duration", "intro")
+    if duration_mode == "full":
+        title_duration = video_duration
+    else:
+        title_duration = min(4.5, video_duration)
+
+    title_clip = (
+        title_clip.with_start(0.0)
+        .with_duration(title_duration)
+        .with_end(title_duration)
+    )
+
+    anim = getattr(params, "title_animation", "pop_spring")
+    title_clip = _apply_subtitle_animation(title_clip, title_duration, anim)
+
+    if duration_mode != "full" and title_duration > 1.0:
+        fade_out_dur = min(0.4, title_duration * 0.2)
+
+        def fade_out_transform(get_frame, t):
+            frame = get_frame(t)
+            time_left = title_duration - t
+            if time_left >= fade_out_dur:
+                return frame
+            p = max(0.0, min(time_left / fade_out_dur, 1.0))
+            if frame.ndim == 2:
+                return (frame * p).astype(frame.dtype, copy=False)
+            if frame.shape[2] == 4:
+                fc = frame.copy()
+                fc[:, :, 3] = np.clip(fc[:, :, 3] * p, 0, 255).astype(frame.dtype)
+                return fc
+            return (frame * p).astype(frame.dtype, copy=False)
+
+        title_clip = title_clip.transform(fade_out_transform, apply_to=["mask"])
+
+    pos = getattr(params, "title_position", "top")
+    if pos == "top":
+        y_pos = max(20.0, video_height * 0.08)
+    elif pos == "center":
+        y_pos = "center"
+    elif pos == "bottom":
+        y_pos = max(20.0, video_height * 0.82 - title_clip.h)
+    else:
+        y_pos = max(20.0, video_height * 0.08)
+
+    title_clip = title_clip.with_position(("center", y_pos))
+    return title_clip
+
+
 def generate_video(
     video_path: str,
     audio_path: str,
@@ -1321,6 +1558,8 @@ def generate_video(
         params.font_size = int(params.font_size)
         params.stroke_width = int(params.stroke_width)
         phrase = subtitle_item[1]
+        casing = getattr(params, "subtitle_casing", "as_is")
+        phrase = subtitle_styles.apply_text_casing(phrase, casing)
         max_width = video_width * 0.9
         bg_color = resolve_subtitle_background_color()
         rounded_bg_enabled = bool(
@@ -1472,8 +1711,7 @@ def generate_video(
         # the bounce animation runs only when the user selects it; the default
         # of none keeps the original subtitle rendering path exactly.
         anim_type = getattr(params, "subtitle_animation", "none")
-        if anim_type in ("pop_spring", "spring", "pop"):
-            _clip = _apply_subtitle_spring_animation(_clip, duration)
+        _clip = _apply_subtitle_animation(_clip, duration, anim_type)
 
         if params.subtitle_position == "bottom":
             _clip = _clip.with_position(("center", video_height * 0.95 - _clip.h))
@@ -1519,6 +1757,7 @@ def generate_video(
                 font_size=params.font_size,
             )
 
+        clips_to_composite = [video_clip]
         if subtitle_path and os.path.exists(subtitle_path):
             sub = clip_stack.enter_context(
                 SubtitlesClip(
@@ -1531,7 +1770,19 @@ def generate_video(
             for item in sub.subtitles:
                 clip = create_text_clip(subtitle_item=item)
                 text_clips.append(clip)
-            video_clip = CompositeVideoClip([video_clip, *text_clips])
+            clips_to_composite.extend(text_clips)
+
+        title_clip = _create_title_clip(
+            params=params,
+            video_width=video_width,
+            video_height=video_height,
+            video_duration=video_clip.duration,
+        )
+        if title_clip is not None:
+            clips_to_composite.append(title_clip)
+
+        if len(clips_to_composite) > 1:
+            video_clip = CompositeVideoClip(clips_to_composite)
             clip_stack.callback(video_clip.close)
 
         bgm_enabled = bgm_service.should_use_bgm(

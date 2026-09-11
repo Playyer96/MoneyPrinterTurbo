@@ -51,6 +51,7 @@ from app.services import (
     material,
     metaso_minimax,
     ofox,
+    subtitle_styles,
     video,
     volcengine_seedance,
     voice,
@@ -182,6 +183,8 @@ DEFAULT_SUBTITLE_SETTINGS = {
     "subtitle_position": "bottom",
     "subtitle_display_mode": "sentence",
     "subtitle_animation": "none",
+    "subtitle_style_preset": "custom",
+    "subtitle_casing": "as_is",
     "custom_position": 70.0,
     "text_fore_color": "#FFFFFF",
     "font_size": 60,
@@ -190,6 +193,12 @@ DEFAULT_SUBTITLE_SETTINGS = {
     "subtitle_background_enabled": False,
     "subtitle_background_color": "#000000",
     "rounded_subtitle_background": False,
+    "title_enabled": False,
+    "title_text": "",
+    "title_style": "tiktok_yellow",
+    "title_position": "top",
+    "title_duration": "intro",
+    "title_animation": "pop_spring",
 }
 LOCAL_MATERIAL_EXTENSIONS = {
     ".mp4",
@@ -1594,9 +1603,12 @@ def _apply_restored_params(params):
         params.get("video_music_prompt") or ""
     )
 
-    # 字幕设置。对旧任务中的越界数值做最小限幅，避免 Slider 无法初始化。
+    # Subtitle and title settings. Clamp out-of-range values from legacy tasks so sliders initialize safely.
     st.session_state["subtitle_enabled_checkbox"] = bool(
         params.get("subtitle_enabled", True)
+    )
+    _set_stable_widget_value(
+        "subtitle_preset_select", params.get("subtitle_style_preset") or "custom"
     )
     _set_stable_widget_value("font_name_select", params.get("font_name") or "")
     _set_stable_widget_value(
@@ -1607,6 +1619,9 @@ def _apply_restored_params(params):
     )
     _set_stable_widget_value(
         "subtitle_animation_select", params.get("subtitle_animation") or "none"
+    )
+    _set_stable_widget_value(
+        "subtitle_casing_select", params.get("subtitle_casing") or "as_is"
     )
     custom_position = min(100.0, max(0.0, float(params.get("custom_position", 70.0))))
     st.session_state["custom_position_input"] = str(custom_position)
@@ -1625,6 +1640,24 @@ def _apply_restored_params(params):
         st.session_state["subtitle_background_color_picker"] = background_color
     st.session_state["rounded_subtitle_background_checkbox"] = bool(
         params.get("rounded_subtitle_background", False) and background_enabled
+    )
+
+    # Video title overlay settings
+    st.session_state["title_enabled_checkbox"] = bool(
+        params.get("title_enabled", False)
+    )
+    st.session_state["title_text_input"] = str(params.get("title_text") or "")
+    _set_stable_widget_value(
+        "title_style_select", params.get("title_style") or "tiktok_yellow"
+    )
+    _set_stable_widget_value(
+        "title_position_select", params.get("title_position") or "top"
+    )
+    _set_stable_widget_value(
+        "title_duration_select", params.get("title_duration") or "intro"
+    )
+    _set_stable_widget_value(
+        "title_animation_select", params.get("title_animation") or "pop_spring"
     )
 
     st.session_state.pop("local_video_materials_uploader", None)
@@ -2554,9 +2587,12 @@ def reset_script_system_prompt():
 
 
 def reset_subtitle_settings():
-    """恢复 WebUI 字幕控件和持久化配置中的默认值。"""
+    """Restore default values in WebUI subtitle and title controls and persistent configuration."""
     defaults = DEFAULT_SUBTITLE_SETTINGS
     st.session_state["subtitle_enabled_checkbox"] = defaults["subtitle_enabled"]
+    _set_stable_widget_value(
+        "subtitle_preset_select", defaults["subtitle_style_preset"]
+    )
     _set_stable_widget_value("font_name_select", defaults["font_name"])
     _set_stable_widget_value("subtitle_position_select", defaults["subtitle_position"])
     _set_stable_widget_value(
@@ -2564,6 +2600,9 @@ def reset_subtitle_settings():
     )
     _set_stable_widget_value(
         "subtitle_animation_select", defaults["subtitle_animation"]
+    )
+    _set_stable_widget_value(
+        "subtitle_casing_select", defaults["subtitle_casing"]
     )
     st.session_state["custom_position_input"] = str(defaults["custom_position"])
     st.session_state["font_color_picker"] = defaults["text_fore_color"]
@@ -2579,14 +2618,22 @@ def reset_subtitle_settings():
     st.session_state["rounded_subtitle_background_checkbox"] = defaults[
         "rounded_subtitle_background"
     ]
+    st.session_state["title_enabled_checkbox"] = defaults["title_enabled"]
+    st.session_state["title_text_input"] = defaults["title_text"]
+    _set_stable_widget_value("title_style_select", defaults["title_style"])
+    _set_stable_widget_value("title_position_select", defaults["title_position"])
+    _set_stable_widget_value("title_duration_select", defaults["title_duration"])
+    _set_stable_widget_value("title_animation_select", defaults["title_animation"])
 
-    # 同步会持久化的 UI 选项，确保恢复后刷新页面仍保持默认设置。
+    # Synchronize persistent UI options so reloading keeps default settings.
     for key in (
         "subtitle_enabled",
         "font_name",
         "subtitle_position",
         "subtitle_display_mode",
         "subtitle_animation",
+        "subtitle_style_preset",
+        "subtitle_casing",
         "custom_position",
         "text_fore_color",
         "font_size",
@@ -2595,6 +2642,12 @@ def reset_subtitle_settings():
         "subtitle_background_enabled",
         "subtitle_background_color",
         "rounded_subtitle_background",
+        "title_enabled",
+        "title_text",
+        "title_style",
+        "title_position",
+        "title_duration",
+        "title_animation",
     ):
         if key in defaults:
             _set_runtime_config("ui", key, defaults[key])
@@ -7248,8 +7301,69 @@ def _render_audio_settings(panel, params):
     return uploaded_audio_file, uploaded_bgm_file, voice_mode
 
 
+def _on_subtitle_preset_change():
+    """Apply selected subtitle preset attributes to WebUI widgets and runtime config."""
+    preset_key = localized_widget_key("subtitle_preset_select")
+    preset_id = st.session_state.get(preset_key, "custom")
+    preset = subtitle_styles.get_subtitle_preset(preset_id)
+    if not preset or preset_id == "custom":
+        return
+
+    font_names = get_all_fonts()
+    p_font = preset.get("font_name", "")
+    if p_font in font_names:
+        _set_stable_widget_value("font_name_select", p_font)
+        _set_runtime_config("ui", "font_name", p_font)
+
+    if "text_fore_color" in preset:
+        st.session_state["font_color_picker"] = preset["text_fore_color"]
+        _set_runtime_config("ui", "text_fore_color", preset["text_fore_color"])
+
+    if "font_size" in preset:
+        st.session_state["font_size_slider"] = int(preset["font_size"])
+        _set_runtime_config("ui", "font_size", int(preset["font_size"]))
+
+    if "stroke_color" in preset:
+        st.session_state["stroke_color_picker"] = preset["stroke_color"]
+        _set_runtime_config("ui", "stroke_color", preset["stroke_color"])
+
+    if "stroke_width" in preset:
+        st.session_state["stroke_width_slider"] = float(preset["stroke_width"])
+        _set_runtime_config("ui", "stroke_width", float(preset["stroke_width"]))
+
+    bg_enabled = bool(preset.get("subtitle_background_enabled", False))
+    st.session_state["subtitle_background_enabled_checkbox"] = bg_enabled
+    _set_runtime_config("ui", "subtitle_background_enabled", bg_enabled)
+
+    if "subtitle_background_color" in preset:
+        st.session_state["subtitle_background_color_picker"] = preset[
+            "subtitle_background_color"
+        ]
+        _set_runtime_config(
+            "ui",
+            "subtitle_background_color",
+            preset["subtitle_background_color"],
+        )
+
+    rounded = bool(preset.get("rounded_subtitle_background", False))
+    st.session_state["rounded_subtitle_background_checkbox"] = rounded
+    _set_runtime_config("ui", "rounded_subtitle_background", rounded)
+
+    if "subtitle_animation" in preset:
+        _set_stable_widget_value(
+            "subtitle_animation_select", preset["subtitle_animation"]
+        )
+        _set_runtime_config("ui", "subtitle_animation", preset["subtitle_animation"])
+
+    if "subtitle_casing" in preset:
+        _set_stable_widget_value(
+            "subtitle_casing_select", preset["subtitle_casing"]
+        )
+        _set_runtime_config("ui", "subtitle_casing", preset["subtitle_casing"])
+
+
 def _render_subtitle_settings(panel, params):
-    """渲染字幕设置并更新生成参数。"""
+    """Render subtitle settings and update generation parameters."""
     with panel:
         with st.container(border=True):
             st.write(tr("Subtitle Settings"))
@@ -7266,6 +7380,47 @@ def _render_subtitle_settings(panel, params):
             )
             _set_runtime_config("ui", "subtitle_enabled", params.subtitle_enabled)
             subtitle_settings_disabled = not params.subtitle_enabled
+
+            # Subtitle Style Preset selector
+            preset_options = [
+                (tr("Custom"), "custom"),
+                (tr("TikTok Viral Yellow"), "tiktok_yellow"),
+                (tr("Alex Hormozi Punch"), "hormozi"),
+                (tr("MrBeast Bold"), "mrbeast"),
+                (tr("CapCut Dark Pill"), "capcut_box"),
+                (tr("Minimalist Clean"), "minimalist_clean"),
+                (tr("Cyber Neon Aqua"), "cyber_neon"),
+                (tr("Fire & Alert Red"), "fire_alert"),
+                (tr("Golden Luxury"), "golden_luxury"),
+                (tr("Comic Pop Humor"), "comic_pop"),
+                (tr("Viral Barbie Pink"), "barbie_pink"),
+                (tr("Vintage Cinema Warm"), "vintage_film"),
+            ]
+            saved_preset = config.ui.get(
+                "subtitle_style_preset",
+                DEFAULT_SUBTITLE_SETTINGS["subtitle_style_preset"],
+            )
+            saved_preset_idx = 0
+            for i, (_, val) in enumerate(preset_options):
+                if val == saved_preset:
+                    saved_preset_idx = i
+                    break
+            selected_preset = stable_selectbox(
+                tr("Subtitle Style Preset"),
+                options=[val for _, val in preset_options],
+                default_value=preset_options[saved_preset_idx][1],
+                key="subtitle_preset_select",
+                format_func=lambda val: dict(
+                    (v, label) for label, v in preset_options
+                ).get(val, val),
+                on_change=_on_subtitle_preset_change,
+                disabled=subtitle_settings_disabled,
+            )
+            params.subtitle_style_preset = selected_preset
+            _set_runtime_config(
+                "ui", "subtitle_style_preset", params.subtitle_style_preset
+            )
+
             font_names = get_all_fonts()
             saved_font_name = config.ui.get(
                 "font_name", DEFAULT_SUBTITLE_SETTINGS["font_name"]
@@ -7340,10 +7495,14 @@ def _render_subtitle_settings(panel, params):
                 "ui", "subtitle_display_mode", params.subtitle_display_mode
             )
 
-            # Subtitle Animation (None vs Pop Spring)
+            # Subtitle Animation
             subtitle_animations = [
                 (tr("None"), "none"),
                 (tr("Pop Up (Spring)"), "pop_spring"),
+                (tr("Scale Up (Punch)"), "scale_up"),
+                (tr("Smooth Fade"), "fade"),
+                (tr("Slide Up"), "slide_up"),
+                (tr("Shake (Impact)"), "shake"),
             ]
             saved_anim = config.ui.get(
                 "subtitle_animation",
@@ -7369,6 +7528,32 @@ def _render_subtitle_settings(panel, params):
                 "ui", "subtitle_animation", params.subtitle_animation
             )
 
+            # Subtitle Casing / Text Format
+            subtitle_casings = [
+                (tr("As Is"), "as_is"),
+                (tr("UPPERCASE (TikTok Style)"), "uppercase"),
+            ]
+            saved_casing = config.ui.get(
+                "subtitle_casing", DEFAULT_SUBTITLE_SETTINGS["subtitle_casing"]
+            )
+            saved_casing_idx = 0
+            for i, (_, val) in enumerate(subtitle_casings):
+                if val == saved_casing:
+                    saved_casing_idx = i
+                    break
+            selected_casing = stable_selectbox(
+                tr("Subtitle Casing"),
+                options=[val for _, val in subtitle_casings],
+                default_value=subtitle_casings[saved_casing_idx][1],
+                key="subtitle_casing_select",
+                format_func=lambda value: dict(
+                    (v, label) for label, v in subtitle_casings
+                ).get(value, value),
+                disabled=subtitle_settings_disabled,
+            )
+            params.subtitle_casing = selected_casing
+            _set_runtime_config("ui", "subtitle_casing", params.subtitle_casing)
+
             if params.subtitle_position == "custom":
                 saved_custom_position = config.ui.get(
                     "custom_position", DEFAULT_SUBTITLE_SETTINGS["custom_position"]
@@ -7392,8 +7577,8 @@ def _render_subtitle_settings(panel, params):
                 except ValueError:
                     st.error(tr("Please enter a valid number"))
 
-            # 非中文语言的颜色标签通常比中文更长。为颜色选择器保留适当宽度，
-            # 避免标签换行，同时仍给字号滑块保留足够的可操作空间。
+            # Color labels are often longer than in Chinese; reserve sufficient width
+            # to prevent label wrapping while keeping slider usability intact.
             font_cols = st.columns([0.42, 0.58])
             with font_cols[0]:
                 saved_text_fore_color = config.ui.get(
@@ -7454,7 +7639,7 @@ def _render_subtitle_settings(panel, params):
                 )
                 _set_runtime_config("ui", "stroke_width", params.stroke_width)
 
-            # 背景开关的本地化名称普遍比颜色标签更长，因此让开关占据略多空间。
+            # Background toggle label is generally longer than color label; allocate proportional width.
             subtitle_bg_cols = st.columns([0.55, 0.45])
             saved_subtitle_background_enabled = config.ui.get(
                 "subtitle_background_enabled",
@@ -7476,10 +7661,8 @@ def _render_subtitle_settings(panel, params):
                 subtitle_background_enabled,
             )
 
-            # 背景颜色和圆角样式都从属于字幕背景开关。子控件始终保留在页面中，
-            # 父开关关闭时统一禁用，避免一个控件消失而另一个控件禁用造成布局跳动。
-            # 颜色值仍保存在 UI 配置中，重新启用背景后可以恢复用户之前的选择；
-            # 传给生成服务的参数则设为 False，确保关闭状态不会实际渲染背景。
+            # Background color and rounded styling are subordinate to the background toggle.
+            # Child controls remain rendered on the page and are disabled together when parent is off.
             saved_subtitle_background_color = config.ui.get(
                 "subtitle_background_color",
                 DEFAULT_SUBTITLE_SETTINGS["subtitle_background_color"],
@@ -7510,8 +7693,7 @@ def _render_subtitle_settings(panel, params):
                 "rounded_subtitle_background",
                 DEFAULT_SUBTITLE_SETTINGS["rounded_subtitle_background"],
             )
-            # 背景关闭时，圆角背景没有可渲染的底色。这里禁用控件但保留原配置，
-            # 用户下次重新开启字幕背景后，可以继续使用之前保存的圆角偏好。
+            # When background is off, rounded background has no plate to render; disable but retain config.
             rounded_background_disabled = (
                 subtitle_settings_disabled or not subtitle_background_enabled
             )
@@ -7538,8 +7720,7 @@ def _render_subtitle_settings(panel, params):
                 )
 
             if video.subtitle_colors_are_indistinguishable(params):
-                # 同色配置仍然是合法的用户选择，因此只在字幕设置区域就近提示，
-                # 不阻止生成。用户可以根据实际视觉需求决定是否继续。
+                # Matching text and background color is valid user choice; warn nearby without blocking generation.
                 st.warning(tr("Subtitle Colors Are Indistinguishable"))
 
             subtitle_preview_text = params.video_script or params.video_subject
@@ -7561,6 +7742,147 @@ def _render_subtitle_settings(panel, params):
                 use_container_width=True,
             ):
                 st.toast(tr("Default Subtitle Settings Restored"))
+
+
+def _render_title_settings(panel, params):
+    """Render video title / hook banner overlay settings and update parameters."""
+    with panel:
+        with st.container(border=True):
+            st.write(tr("Video Title Settings"))
+            st.session_state.setdefault(
+                "title_enabled_checkbox",
+                _saved_ui_bool(
+                    "title_enabled",
+                    DEFAULT_SUBTITLE_SETTINGS["title_enabled"],
+                ),
+            )
+            params.title_enabled = st.checkbox(
+                tr("Enable Title / Hook Banner"),
+                key="title_enabled_checkbox",
+            )
+            _set_runtime_config("ui", "title_enabled", params.title_enabled)
+            title_disabled = not params.title_enabled
+
+            saved_title_text = config.ui.get(
+                "title_text", DEFAULT_SUBTITLE_SETTINGS["title_text"]
+            )
+            st.session_state.setdefault("title_text_input", str(saved_title_text))
+            params.title_text = st.text_input(
+                tr("Title Text"),
+                placeholder=tr("Title Text Help"),
+                key="title_text_input",
+                disabled=title_disabled,
+            )
+            _set_runtime_config("ui", "title_text", params.title_text)
+
+            title_styles = [
+                (tr("TikTok Yellow Badge"), "tiktok_yellow"),
+                (tr("Breaking Red Banner"), "red_banner"),
+                (tr("CapCut Dark Pill"), "capcut_black"),
+                (tr("Neon Cyber Glow"), "neon_cyan"),
+                (tr("Minimalist Bold White"), "minimalist_white"),
+                (tr("Golden Luxury Card"), "golden_luxury"),
+                (tr("Comic Bang Punch"), "comic_punch"),
+            ]
+            saved_title_style = config.ui.get(
+                "title_style", DEFAULT_SUBTITLE_SETTINGS["title_style"]
+            )
+            saved_title_style_idx = 0
+            for i, (_, val) in enumerate(title_styles):
+                if val == saved_title_style:
+                    saved_title_style_idx = i
+                    break
+            params.title_style = stable_selectbox(
+                tr("Title Style"),
+                options=[val for _, val in title_styles],
+                default_value=title_styles[saved_title_style_idx][1],
+                key="title_style_select",
+                format_func=lambda val: dict(
+                    (v, label) for label, v in title_styles
+                ).get(val, val),
+                disabled=title_disabled,
+            )
+            _set_runtime_config("ui", "title_style", params.title_style)
+
+            title_row = st.columns([0.5, 0.5])
+            with title_row[0]:
+                title_positions = [
+                    (tr("Top"), "top"),
+                    (tr("Center"), "center"),
+                    (tr("Bottom"), "bottom"),
+                ]
+                saved_tpos = config.ui.get(
+                    "title_position", DEFAULT_SUBTITLE_SETTINGS["title_position"]
+                )
+                saved_tpos_idx = 0
+                for i, (_, val) in enumerate(title_positions):
+                    if val == saved_tpos:
+                        saved_tpos_idx = i
+                        break
+                params.title_position = stable_selectbox(
+                    tr("Title Position"),
+                    options=[val for _, val in title_positions],
+                    default_value=title_positions[saved_tpos_idx][1],
+                    key="title_position_select",
+                    format_func=lambda val: dict(
+                        (v, label) for label, v in title_positions
+                    ).get(val, val),
+                    disabled=title_disabled,
+                )
+                _set_runtime_config("ui", "title_position", params.title_position)
+
+            with title_row[1]:
+                title_durations = [
+                    (tr("Intro (First 4 Seconds)"), "intro"),
+                    (tr("Full Video"), "full"),
+                ]
+                saved_tdur = config.ui.get(
+                    "title_duration", DEFAULT_SUBTITLE_SETTINGS["title_duration"]
+                )
+                saved_tdur_idx = 0
+                for i, (_, val) in enumerate(title_durations):
+                    if val == saved_tdur:
+                        saved_tdur_idx = i
+                        break
+                params.title_duration = stable_selectbox(
+                    tr("Title Duration"),
+                    options=[val for _, val in title_durations],
+                    default_value=title_durations[saved_tdur_idx][1],
+                    key="title_duration_select",
+                    format_func=lambda val: dict(
+                        (v, label) for label, v in title_durations
+                    ).get(val, val),
+                    disabled=title_disabled,
+                )
+                _set_runtime_config("ui", "title_duration", params.title_duration)
+
+            title_animations = [
+                (tr("Pop Up (Spring)"), "pop_spring"),
+                (tr("Scale Up (Punch)"), "scale_up"),
+                (tr("Smooth Fade"), "fade"),
+                (tr("Slide Up"), "slide_up"),
+                (tr("Shake (Impact)"), "shake"),
+                (tr("None"), "none"),
+            ]
+            saved_tanim = config.ui.get(
+                "title_animation", DEFAULT_SUBTITLE_SETTINGS["title_animation"]
+            )
+            saved_tanim_idx = 0
+            for i, (_, val) in enumerate(title_animations):
+                if val == saved_tanim:
+                    saved_tanim_idx = i
+                    break
+            params.title_animation = stable_selectbox(
+                tr("Title Animation"),
+                options=[val for _, val in title_animations],
+                default_value=title_animations[saved_tanim_idx][1],
+                key="title_animation_select",
+                format_func=lambda val: dict(
+                    (v, label) for label, v in title_animations
+                ).get(val, val),
+                disabled=title_disabled,
+            )
+            _set_runtime_config("ui", "title_animation", params.title_animation)
 
 
 def _render_generation_controls(
@@ -7974,6 +8296,7 @@ def _render_application():
     )
 
     _render_subtitle_settings(right_panel, params)
+    _render_title_settings(right_panel, params)
 
     generation_submitted = _render_generation_controls(
         params,
