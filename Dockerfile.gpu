@@ -34,6 +34,9 @@ COPY docker/pick-mirror.py /usr/local/bin/pick-mirror.py
 # links dynamically against the nvidia/cuda base image's libnvidia-encode*,
 # which makes h264_nvenc (and h264_qsv, h264_amf) usable inside the
 # container. xz-utils is added only for extracting the .tar.xz release.
+# The binary is mirrored at /usr/bin/ffmpeg because docker-compose.yml's
+# FFMPEG_BINARY default and scripts/ffmpeg_mac_wrapper.py both assume that
+# path, and MoviePy 2.x validates it at import time.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common \
         git \
@@ -58,6 +61,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         && tar -xJf /tmp/ffmpeg.tar.xz -C /opt/ffmpeg-static --strip-components=1 \
         && ln -sf /opt/ffmpeg-static/bin/ffmpeg /usr/local/bin/ffmpeg \
         && ln -sf /opt/ffmpeg-static/bin/ffprobe /usr/local/bin/ffprobe \
+        && ln -sf /usr/local/bin/ffmpeg /usr/bin/ffmpeg \
+        && ln -sf /usr/local/bin/ffprobe /usr/bin/ffprobe \
         && rm /tmp/ffmpeg.tar.xz \
         && /usr/local/bin/ffmpeg -version | head -1
 
