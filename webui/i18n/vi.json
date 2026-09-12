@@ -443,6 +443,16 @@
     "Web Search Provider": "Dịch vụ tìm kiếm",
     "Web Search Provider Help": "Cả hai đều miễn phí và không cần khóa. searxng là container tìm kiếm tổng hợp trong docker-compose.yml — không bị giới hạn tần suất và được dùng tự động khi chạy Docker. duckduckgo đọc điểm cuối HTML công khai và là phương án dự phòng tự động.",
     "SearXNG Base URL": "Địa chỉ SearXNG",
-    "Web Research Guardrails Note": "Trang web được đọc bằng container trình duyệt headless Lightpanda, nên cả bài viết chỉ dựng bằng JavaScript vẫn lấy được nội dung. Nguồn được lọc trùng theo trang web và những trang không có nội dung thật sẽ bị loại."
+    "Web Research Guardrails Note": "Trang web được đọc bằng container trình duyệt headless Lightpanda, nên cả bài viết chỉ dựng bằng JavaScript vẫn lấy được nội dung. Nguồn được lọc trùng theo trang web và những trang không có nội dung thật sẽ bị loại.",
+    "Series Chapter Progress": "Chương {current}/{total}: {subject}",
+    "Two Words (Punch)": "Hai từ (nhấn mạnh)",
+    "Three Words (Rhythm)": "Ba từ (nhịp điệu)",
+    "Progressive Reveal": "Hiện dần",
+    "Karaoke Highlight": "Tô sáng karaoke",
+    "Binance Gold Karaoke": "Karaoke vàng Binance",
+    "TikTok Lime Karaoke": "Karaoke xanh chanh TikTok",
+    "Podcast Blue Focus": "Tiêu điểm xanh podcast",
+    "News Reel Stack": "Xếp chồng tin tức",
+    "Creator Clean Reveal": "Hiện rõ cho nhà sáng tạo"
   }
 }

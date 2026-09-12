@@ -53,22 +53,24 @@ class TestVideoParams(unittest.TestCase):
         self.assertEqual(params.video_count, 1)
 
     def test_subtitle_modes_accept_only_supported_api_values(self):
-        """新增字幕参数必须拒绝拼写错误，避免请求成功后静默降级。"""
-        params = VideoParams(
-            video_subject="Coffee",
-            subtitle_display_mode="word_by_word",
-            subtitle_animation="pop_spring",
-        )
-        request = SubtitleRequest(
-            video_script="Coffee",
-            subtitle_display_mode="word_by_word",
-            subtitle_animation="pop_spring",
-        )
+        """New subtitle options reject typos instead of silently degrading."""
+        for display_mode in schema._SUBTITLE_DISPLAY_MODES:
+            with self.subTest(display_mode=display_mode):
+                params = VideoParams(
+                    video_subject="Coffee",
+                    subtitle_display_mode=display_mode,
+                    subtitle_animation="pop_spring",
+                )
+                request = SubtitleRequest(
+                    video_script="Coffee",
+                    subtitle_display_mode=display_mode,
+                    subtitle_animation="pop_spring",
+                )
 
-        self.assertEqual(params.subtitle_display_mode, "word_by_word")
-        self.assertEqual(params.subtitle_animation, "pop_spring")
-        self.assertEqual(request.subtitle_display_mode, "word_by_word")
-        self.assertEqual(request.subtitle_animation, "pop_spring")
+                self.assertEqual(params.subtitle_display_mode, display_mode)
+                self.assertEqual(params.subtitle_animation, "pop_spring")
+                self.assertEqual(request.subtitle_display_mode, display_mode)
+                self.assertEqual(request.subtitle_animation, "pop_spring")
 
         invalid_cases = (
             ("subtitle_display_mode", "word-by-word"),
@@ -87,7 +89,7 @@ class TestVideoParams(unittest.TestCase):
                     SubtitleRequest(video_script="Coffee", **{field_name: value})
 
     def test_invalid_saved_subtitle_mode_falls_back_during_upgrade(self):
-        """旧配置包含无效值时应回退默认值，而不是阻止服务启动。"""
+        """Invalid legacy config falls back instead of blocking startup."""
         with patch.object(
             schema.config,
             "ui",

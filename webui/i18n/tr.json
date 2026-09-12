@@ -443,6 +443,16 @@
     "Web Search Provider": "Arama sağlayıcısı",
     "Web Search Provider Help": "İkisi de ücretsizdir ve anahtar istemez. searxng, docker-compose.yml içindeki meta arama kapsayıcısıdır: hız sınırı yoktur ve Docker'da otomatik olarak kullanılır. duckduckgo herkese açık HTML uç noktasını okur ve otomatik yedek seçenektir.",
     "SearXNG Base URL": "SearXNG adresi",
-    "Web Research Guardrails Note": "Sayfalar Lightpanda başsız tarayıcı kapsayıcısı tarafından okunur; böylece yalnızca JavaScript ile oluşturulan makaleler de metin verir. Kaynaklar site başına tekilleştirilir, gerçek metni olmayan sayfalar atılır."
+    "Web Research Guardrails Note": "Sayfalar Lightpanda başsız tarayıcı kapsayıcısı tarafından okunur; böylece yalnızca JavaScript ile oluşturulan makaleler de metin verir. Kaynaklar site başına tekilleştirilir, gerçek metni olmayan sayfalar atılır.",
+    "Series Chapter Progress": "Bölüm {current}/{total}: {subject}",
+    "Two Words (Punch)": "İki kelime (vurgu)",
+    "Three Words (Rhythm)": "Üç kelime (ritim)",
+    "Progressive Reveal": "Aşamalı gösterim",
+    "Karaoke Highlight": "Karaoke vurgusu",
+    "Binance Gold Karaoke": "Binance altın karaoke",
+    "TikTok Lime Karaoke": "TikTok lime karaoke",
+    "Podcast Blue Focus": "Podcast mavi odak",
+    "News Reel Stack": "Haber akışı yığını",
+    "Creator Clean Reveal": "Üretici temiz gösterim"
   }
 }

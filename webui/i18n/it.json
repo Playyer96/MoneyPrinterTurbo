@@ -443,6 +443,16 @@
     "Web Search Provider": "Motore di ricerca",
     "Web Search Provider Help": "Entrambi sono gratuiti e senza chiave. searxng è il container di meta-ricerca di docker-compose.yml: nessun limite di richieste e attivo automaticamente in Docker. duckduckgo interroga l'endpoint HTML pubblico e fa da ripiego automatico.",
     "SearXNG Base URL": "Indirizzo di SearXNG",
-    "Web Research Guardrails Note": "Le pagine vengono lette dal container del browser headless Lightpanda, così anche gli articoli resi solo in JavaScript producono testo. Le fonti sono deduplicate per sito e le pagine senza testo reale vengono scartate."
+    "Web Research Guardrails Note": "Le pagine vengono lette dal container del browser headless Lightpanda, così anche gli articoli resi solo in JavaScript producono testo. Le fonti sono deduplicate per sito e le pagine senza testo reale vengono scartate.",
+    "Series Chapter Progress": "Capitolo {current} di {total}: {subject}",
+    "Two Words (Punch)": "Due parole (impatto)",
+    "Three Words (Rhythm)": "Tre parole (ritmo)",
+    "Progressive Reveal": "Rivelazione progressiva",
+    "Karaoke Highlight": "Evidenziazione karaoke",
+    "Binance Gold Karaoke": "Karaoke oro Binance",
+    "TikTok Lime Karaoke": "Karaoke lime TikTok",
+    "Podcast Blue Focus": "Focus blu podcast",
+    "News Reel Stack": "Sequenza notizie",
+    "Creator Clean Reveal": "Rivelazione pulita creator"
   }
 }

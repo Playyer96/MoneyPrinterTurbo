@@ -61,6 +61,17 @@ def build_series_part_prompt(params: VideoParams, outline: list[str], index: int
         "Do not repeat what the other parts cover, and do not summarize the "
         "whole series."
     )
+    if index < total:
+        lines.append(
+            "Resolve this part's immediate problem, then make the final sentence "
+            "a specific bridge or cliffhanger that clearly says the story continues "
+            "in the next part. Do not use a generic 'stay tuned' sign-off."
+        )
+    else:
+        lines.append(
+            "Resolve the series' central problems and end with a definitive final "
+            "sentence. Do not promise another part."
+        )
 
     context = "\n".join(lines)
     user_prompt = (params.video_script_prompt or "").strip()

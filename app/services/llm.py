@@ -56,6 +56,15 @@ Generate a script for a video, depending on the subject of the video.
 8. respond in the same language as the video subject.
 """.strip()
 
+NARRATIVE_STRUCTURE_RULES = """
+# Required Narrative Structure:
+1. open with one short, catchy sentence that creates immediate curiosity.
+2. establish the situation clearly, then develop a middle with concrete problems, conflict, or consequences.
+3. resolve the main problem and give the audience a satisfying emotional landing; do not leave them in distress without purpose.
+4. make the final sentence decisive and memorable, never a generic sign-off.
+5. exception for a non-final series part: resolve its immediate beat, then end with a specific bridge or cliffhanger that clearly promises the next part. the final series part must resolve the overall story and end decisively.
+""".strip()
+
 # The Claude Code CLI defaults to a coding agent's system prompt whose many
 # constraints have nothing to do with copywriting and would pull script and
 # keyword generation off target, so it is replaced wholesale for these calls.
@@ -762,6 +771,9 @@ def build_script_prompt(
 # Additional User Requirements:
 {video_script_prompt}
 """.rstrip()
+    # Narrative quality is an application invariant, including when an advanced
+    # user replaces the general system prompt.
+    prompt += f"\n\n{NARRATIVE_STRUCTURE_RULES}"
     research_context = _limit_script_text(
         research_context, MAX_RESEARCH_CONTEXT_LENGTH, "research_context"
     )
@@ -952,6 +964,8 @@ Split a subject into an ordered list of chapters. Each chapter becomes one stand
 4. the chapters must not overlap, and together they must cover the subject in a sensible order.
 5. do not number the chapters, and do not return anything but the json-array.
 6. respond in the same language as the video subject.
+7. shape the full series as a narrative arc: an opening that establishes the situation, middle chapters that develop problems and consequences, and a final chapter that resolves the central conflict with a definitive ending.
+8. every chapter must support its own beginning, problem, and meaningful beat of resolution; non-final chapters should also create specific anticipation for what follows.
 
 ## Output Example:
 ["first chapter subject", "second chapter subject", "third chapter subject"]

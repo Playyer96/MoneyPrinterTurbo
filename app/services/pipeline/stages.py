@@ -477,7 +477,8 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         )
         subtitle_provider = "whisper"
 
-    is_word_level = getattr(params, "subtitle_display_mode", "sentence") == "word_by_word"
+    display_mode = getattr(params, "subtitle_display_mode", "sentence")
+    is_word_level = display_mode != "sentence"
 
     if subtitle_provider == "edge":
         voice.create_subtitle(

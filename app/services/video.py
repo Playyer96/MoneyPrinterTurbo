@@ -1335,6 +1335,113 @@ def _rounded_subtitle_background_clip(
     return ImageClip(np.array(img), transparent=True)
 
 
+def _highlight_tokens(text: str, active: bool) -> list[tuple[str, bool]]:
+    """Split text into drawable tokens while keeping CJK glyphs wrappable."""
+    tokens: list[tuple[str, bool]] = []
+    buffer = ""
+    for char in text:
+        if char.isspace() or unicodedata.east_asian_width(char) in {"W", "F"}:
+            if buffer:
+                tokens.append((buffer, active))
+                buffer = ""
+            tokens.append((char, active))
+        else:
+            buffer += char
+    if buffer:
+        tokens.append((buffer, active))
+    return tokens
+
+
+def _render_highlighted_subtitle_clip(
+    phrase: str,
+    *,
+    font_path: str,
+    font_size: int,
+    max_width: int,
+    text_color: str,
+    highlight_color: str,
+    stroke_color: str,
+    stroke_width: int,
+    background_color: str | None,
+    rounded_background: bool,
+) -> ImageClip:
+    """Render one karaoke cue with a differently colored active word."""
+    active_start = phrase.find(subtitle_styles.HIGHLIGHT_OPEN)
+    active_end = phrase.find(subtitle_styles.HIGHLIGHT_CLOSE)
+    if active_start < 0 or active_end < active_start:
+        raise ValueError("highlighted subtitle cue is missing its active-word marker")
+
+    before = phrase[:active_start]
+    active = phrase[active_start + len(subtitle_styles.HIGHLIGHT_OPEN) : active_end]
+    after = phrase[active_end + len(subtitle_styles.HIGHLIGHT_CLOSE) :]
+    tokens = [
+        *_highlight_tokens(before, False),
+        *_highlight_tokens(active, True),
+        *_highlight_tokens(after, False),
+    ]
+
+    font = ImageFont.truetype(font_path, font_size)
+    probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+
+    def measure(value: str) -> float:
+        box = probe.textbbox((0, 0), value, font=font, stroke_width=stroke_width)
+        return float(box[2] - box[0])
+
+    padding_x = int(font_size * (0.42 if background_color else 0.12))
+    padding_y = int(font_size * (0.30 if background_color else 0.18))
+    text_width = max(1, max_width - 2 * padding_x)
+    lines: list[list[tuple[str, bool, float]]] = [[]]
+    line_widths = [0.0]
+    for token, is_active in tokens:
+        if token.isspace() and not lines[-1]:
+            continue
+        token_width = measure(token)
+        if lines[-1] and not token.isspace() and line_widths[-1] + token_width > text_width:
+            lines.append([])
+            line_widths.append(0.0)
+        lines[-1].append((token, is_active, token_width))
+        line_widths[-1] += token_width
+
+    font_box = font.getbbox("Ag", stroke_width=stroke_width)
+    line_height = max(1, font_box[3] - font_box[1])
+    interline = int(font_size * 0.22)
+    content_width = max(1, math.ceil(max(line_widths, default=1)))
+    canvas_width = min(max_width, content_width + 2 * padding_x)
+    canvas_height = (
+        len(lines) * line_height + max(0, len(lines) - 1) * interline + 2 * padding_y
+    )
+    image = Image.new("RGBA", (canvas_width, canvas_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    if background_color:
+        rgb = _hex_to_rgb(background_color)
+        alpha = 140 if rounded_background else 255
+        radius = int(font_size * 0.4) if rounded_background else 0
+        draw.rounded_rectangle(
+            (0, 0, canvas_width - 1, canvas_height - 1),
+            radius=radius,
+            fill=(*rgb, alpha),
+        )
+
+    normal_rgb = _hex_to_rgb(text_color)
+    active_rgb = _hex_to_rgb(highlight_color)
+    stroke_rgb = _hex_to_rgb(stroke_color)
+    y = padding_y - font_box[1]
+    for line, line_width in zip(lines, line_widths):
+        x = (canvas_width - line_width) / 2
+        for token, is_active, token_width in line:
+            draw.text(
+                (x, y),
+                token,
+                font=font,
+                fill=active_rgb if is_active else normal_rgb,
+                stroke_width=stroke_width,
+                stroke_fill=stroke_rgb,
+            )
+            x += token_width
+        y += line_height + interline
+    return ImageClip(np.array(image), transparent=True)
+
+
 def _get_visible_center_position(
     text_clip: TextClip,
     container_width: int,
@@ -1640,6 +1747,30 @@ def generate_video(
             return "#000000" if params.text_background_color else None
         return params.text_background_color
 
+    def finish_text_clip(clip, subtitle_item):
+        duration = subtitle_item[0][1] - subtitle_item[0][0]
+        clip = clip.with_start(subtitle_item[0][0])
+        clip = clip.with_end(subtitle_item[0][1])
+        clip = clip.with_duration(duration)
+
+        anim_type = getattr(params, "subtitle_animation", "none")
+        clip = _apply_subtitle_animation(clip, duration, anim_type)
+
+        if params.subtitle_position == "bottom":
+            clip = clip.with_position(("center", video_height * 0.95 - clip.h))
+        elif params.subtitle_position == "top":
+            clip = clip.with_position(("center", video_height * 0.05))
+        elif params.subtitle_position in ("two_thirds_bottom", "two_thirds", "2/3_bottom"):
+            clip = clip.with_position(("center", (video_height - clip.h) / 3.0))
+        elif params.subtitle_position == "custom":
+            margin = 10
+            max_y = video_height - clip.h - margin
+            custom_y = (video_height - clip.h) * (params.custom_position / 100)
+            clip = clip.with_position(("center", max(margin, min(custom_y, max_y))))
+        else:
+            clip = clip.with_position(("center", "center"))
+        return clip
+
     def create_text_clip(subtitle_item):
         params.font_size = int(params.font_size)
         params.stroke_width = int(params.stroke_width)
@@ -1651,6 +1782,24 @@ def generate_video(
         rounded_bg_enabled = bool(
             getattr(params, "rounded_subtitle_background", False) and bg_color
         )
+        if subtitle_styles.HIGHLIGHT_OPEN in phrase:
+            preset = subtitle_styles.get_subtitle_preset(
+                getattr(params, "subtitle_style_preset", "custom")
+            ) or {}
+            highlighted_clip = _render_highlighted_subtitle_clip(
+                phrase,
+                font_path=font_path,
+                font_size=params.font_size,
+                max_width=int(max_width),
+                text_color=params.text_fore_color,
+                highlight_color=preset.get("highlight_color", "#FFE600"),
+                stroke_color=params.stroke_color,
+                stroke_width=params.stroke_width,
+                background_color=bg_color,
+                rounded_background=rounded_bg_enabled,
+            )
+            return finish_text_clip(highlighted_clip, subtitle_item)
+
         has_subtitle_background = bool(bg_color)
         # the rounded background is sized to the real text width, so it needs
         # less horizontal padding. the old rectangular background keeps the
@@ -1789,37 +1938,7 @@ def generate_video(
                 size=size,
                 text_align="center",
             )
-        duration = subtitle_item[0][1] - subtitle_item[0][0]
-        _clip = _clip.with_start(subtitle_item[0][0])
-        _clip = _clip.with_end(subtitle_item[0][1])
-        _clip = _clip.with_duration(duration)
-
-        # the bounce animation runs only when the user selects it; the default
-        # of none keeps the original subtitle rendering path exactly.
-        anim_type = getattr(params, "subtitle_animation", "none")
-        _clip = _apply_subtitle_animation(_clip, duration, anim_type)
-
-        if params.subtitle_position == "bottom":
-            _clip = _clip.with_position(("center", video_height * 0.95 - _clip.h))
-        elif params.subtitle_position == "top":
-            _clip = _clip.with_position(("center", video_height * 0.05))
-        elif params.subtitle_position in ("two_thirds_bottom", "two_thirds", "2/3_bottom"):
-            # 2/3 from the bottom = 1/3 from the top: y = (video_height - _clip.h) * (1/3)
-            y_two_thirds = (video_height - _clip.h) / 3.0
-            _clip = _clip.with_position(("center", y_two_thirds))
-        elif params.subtitle_position == "custom":
-            # Ensure the subtitle is fully within the screen bounds
-            margin = 10  # Additional margin, in pixels
-            max_y = video_height - _clip.h - margin
-            min_y = margin
-            custom_y = (video_height - _clip.h) * (params.custom_position / 100)
-            custom_y = max(
-                min_y, min(custom_y, max_y)
-            )  # Constrain the y value within the valid range
-            _clip = _clip.with_position(("center", custom_y))
-        else:  # center
-            _clip = _clip.with_position(("center", "center"))
-        return _clip
+        return finish_text_clip(_clip, subtitle_item)
 
     # MoviePy's CompositeAudioClip.close() does not close the child
     # AudioFileClips. hold every source reader in an ExitStack so the FFmpeg
@@ -1853,7 +1972,11 @@ def generate_video(
                 )
             )
             text_clips = []
-            for item in sub.subtitles:
+            display_cues = subtitle_styles.build_display_cues(
+                sub.subtitles,
+                getattr(params, "subtitle_display_mode", "sentence"),
+            )
+            for item in display_cues:
                 clip = create_text_clip(subtitle_item=item)
                 text_clips.append(clip)
             clips_to_composite.extend(text_clips)

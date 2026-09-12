@@ -443,6 +443,16 @@
     "Web Search Provider": "Suchdienst",
     "Web Search Provider Help": "Beide sind kostenlos und ohne Schlüssel. searxng ist der Meta-Suchcontainer aus docker-compose.yml — ohne Ratenbegrenzung und in Docker automatisch aktiv. duckduckgo liest den öffentlichen HTML-Endpunkt und dient als automatischer Rückfall.",
     "SearXNG Base URL": "SearXNG-Adresse",
-    "Web Research Guardrails Note": "Seiten werden vom Lightpanda-Headless-Browser-Container gelesen, damit auch rein per JavaScript erzeugte Artikel Text liefern. Quellen werden pro Website entdoppelt, Seiten ohne echten Fließtext verworfen."
+    "Web Research Guardrails Note": "Seiten werden vom Lightpanda-Headless-Browser-Container gelesen, damit auch rein per JavaScript erzeugte Artikel Text liefern. Quellen werden pro Website entdoppelt, Seiten ohne echten Fließtext verworfen.",
+    "Series Chapter Progress": "Kapitel {current} von {total}: {subject}",
+    "Two Words (Punch)": "Zwei Wörter (Punch)",
+    "Three Words (Rhythm)": "Drei Wörter (Rhythmus)",
+    "Progressive Reveal": "Progressive Einblendung",
+    "Karaoke Highlight": "Karaoke-Hervorhebung",
+    "Binance Gold Karaoke": "Binance Gold Karaoke",
+    "TikTok Lime Karaoke": "TikTok Limetten-Karaoke",
+    "Podcast Blue Focus": "Podcast Blauer Fokus",
+    "News Reel Stack": "News-Reel-Stapel",
+    "Creator Clean Reveal": "Creator Klare Einblendung"
   }
 }

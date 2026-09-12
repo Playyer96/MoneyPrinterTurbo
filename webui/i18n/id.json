@@ -443,6 +443,16 @@
     "Web Search Provider": "Penyedia pencarian",
     "Web Search Provider Help": "Keduanya gratis dan tanpa kunci. searxng adalah kontainer meta-pencarian dari docker-compose.yml — tanpa pembatasan laju dan otomatis dipakai di Docker. duckduckgo membaca endpoint HTML publik dan menjadi cadangan otomatis.",
     "SearXNG Base URL": "Alamat SearXNG",
-    "Web Research Guardrails Note": "Halaman dibaca oleh kontainer peramban headless Lightpanda, sehingga artikel yang hanya dirender JavaScript tetap menghasilkan teks. Sumber dideduplikasi per situs dan halaman tanpa teks asli dibuang."
+    "Web Research Guardrails Note": "Halaman dibaca oleh kontainer peramban headless Lightpanda, sehingga artikel yang hanya dirender JavaScript tetap menghasilkan teks. Sumber dideduplikasi per situs dan halaman tanpa teks asli dibuang.",
+    "Series Chapter Progress": "Bab {current} dari {total}: {subject}",
+    "Two Words (Punch)": "Dua kata (hentakan)",
+    "Three Words (Rhythm)": "Tiga kata (ritme)",
+    "Progressive Reveal": "Tampil bertahap",
+    "Karaoke Highlight": "Sorotan karaoke",
+    "Binance Gold Karaoke": "Karaoke emas Binance",
+    "TikTok Lime Karaoke": "Karaoke limau TikTok",
+    "Podcast Blue Focus": "Fokus biru podcast",
+    "News Reel Stack": "Tumpukan berita",
+    "Creator Clean Reveal": "Tampilan bersih kreator"
   }
 }

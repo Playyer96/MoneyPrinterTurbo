@@ -7,10 +7,12 @@ import unittest
 from app.services.subtitle_styles import (
     SUBTITLE_PRESETS,
     SUPPORTED_SUBTITLE_ANIMATIONS,
+    SUPPORTED_SUBTITLE_DISPLAY_MODES,
     SUPPORTED_TITLE_DURATIONS,
     SUPPORTED_TITLE_POSITIONS,
     TITLE_STYLES,
     apply_text_casing,
+    build_display_cues,
     get_subtitle_preset,
     get_title_style,
 )
@@ -34,12 +36,15 @@ class TestSubtitlePresets(unittest.TestCase):
             "rounded_subtitle_background",
             "subtitle_animation",
             "subtitle_casing",
+            "subtitle_display_mode",
+            "subtitle_position",
+            "highlight_color",
         }
     )
 
     def test_at_least_ten_presets(self):
-        """We promised 11+ viral presets including 'custom'."""
-        self.assertGreaterEqual(len(SUBTITLE_PRESETS), 10)
+        """The picker offers a broad set of distinct short-form presets."""
+        self.assertGreaterEqual(len(SUBTITLE_PRESETS), 15)
 
     def test_custom_preset_exists(self):
         self.assertIn("custom", SUBTITLE_PRESETS)
@@ -76,6 +81,13 @@ class TestSubtitlePresets(unittest.TestCase):
                     preset["subtitle_animation"], SUPPORTED_SUBTITLE_ANIMATIONS
                 )
 
+    def test_display_modes_are_supported(self):
+        for preset_id, preset in SUBTITLE_PRESETS.items():
+            with self.subTest(preset_id=preset_id):
+                self.assertIn(
+                    preset["subtitle_display_mode"], SUPPORTED_SUBTITLE_DISPLAY_MODES
+                )
+
     def test_casing_values_are_valid(self):
         valid_casing = {"as_is", "uppercase", "lowercase", "capitalize"}
         for preset_id, preset in SUBTITLE_PRESETS.items():
@@ -90,6 +102,13 @@ class TestSubtitlePresets(unittest.TestCase):
             with self.subTest(preset_id=preset_id):
                 self.assertRegex(preset["text_fore_color"], hex_color)
                 self.assertRegex(preset["stroke_color"], hex_color)
+                self.assertRegex(preset["highlight_color"], hex_color)
+
+    def test_binance_preset_uses_gold_karaoke(self):
+        preset = SUBTITLE_PRESETS["binance_karaoke"]
+
+        self.assertEqual(preset["subtitle_display_mode"], "karaoke")
+        self.assertEqual(preset["highlight_color"], "#F0B90B")
 
 
 class TestGetSubtitlePreset(unittest.TestCase):
@@ -172,6 +191,42 @@ class TestApplyTextCasing(unittest.TestCase):
 
     def test_unknown_casing_returns_unchanged(self):
         self.assertEqual(apply_text_casing("Hello", "foobar"), "Hello")
+
+    def test_casing_preserves_karaoke_markers(self):
+        self.assertEqual(
+            apply_text_casing("hello {{active}}world{{/active}}", "uppercase"),
+            "HELLO {{active}}WORLD{{/active}}",
+        )
+
+
+class TestBuildDisplayCues(unittest.TestCase):
+    CUES = [
+        ((0.0, 0.2), "Make"),
+        ((0.2, 0.4), "every"),
+        ((0.4, 0.6), "second"),
+        ((0.6, 0.8), "count."),
+    ]
+
+    def test_word_groups_keep_the_outer_timing(self):
+        self.assertEqual(
+            build_display_cues(self.CUES, "two_words"),
+            [((0.0, 0.4), "Make every"), ((0.4, 0.8), "second count.")],
+        )
+
+    def test_progressive_reveal_builds_the_phrase(self):
+        cues = build_display_cues(self.CUES, "progressive")
+
+        self.assertEqual([cue[1] for cue in cues], [
+            "Make",
+            "Make every",
+            "Make every second",
+            "Make every second count.",
+        ])
+
+    def test_karaoke_marks_only_the_active_word(self):
+        cues = build_display_cues(self.CUES, "karaoke")
+
+        self.assertEqual(cues[1][1], "Make {{active}}every{{/active}} second count.")
 
 
 class TestSupportedConstants(unittest.TestCase):

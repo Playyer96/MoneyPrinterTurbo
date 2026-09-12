@@ -443,6 +443,16 @@
     "Web Search Provider": "Поисковый сервис",
     "Web Search Provider Help": "Оба варианта бесплатны и не требуют ключа. searxng — контейнер метапоиска из docker-compose.yml: без ограничений частоты запросов, в Docker используется автоматически. duckduckgo читает публичный HTML-эндпоинт и служит автоматическим запасным вариантом.",
     "SearXNG Base URL": "Адрес SearXNG",
-    "Web Research Guardrails Note": "Страницы читает контейнер headless-браузера Lightpanda, поэтому даже статьи, которые отрисовываются только через JavaScript, дают текст. Источники дедуплицируются по сайту, страницы без настоящего текста отбрасываются."
+    "Web Research Guardrails Note": "Страницы читает контейнер headless-браузера Lightpanda, поэтому даже статьи, которые отрисовываются только через JavaScript, дают текст. Источники дедуплицируются по сайту, страницы без настоящего текста отбрасываются.",
+    "Series Chapter Progress": "Глава {current} из {total}: {subject}",
+    "Two Words (Punch)": "Два слова (удар)",
+    "Three Words (Rhythm)": "Три слова (ритм)",
+    "Progressive Reveal": "Постепенное появление",
+    "Karaoke Highlight": "Подсветка караоке",
+    "Binance Gold Karaoke": "Золотое караоке Binance",
+    "TikTok Lime Karaoke": "Лаймовое караоке TikTok",
+    "Podcast Blue Focus": "Синий фокус подкаста",
+    "News Reel Stack": "Стопка новостей",
+    "Creator Clean Reveal": "Чистое появление автора"
   }
 }

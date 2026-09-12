@@ -443,6 +443,16 @@
     "Web Search Provider": "검색 제공자",
     "Web Search Provider Help": "둘 다 무료이며 키가 필요 없습니다. searxng는 docker-compose.yml의 메타 검색 컨테이너로 요청 제한이 없고 Docker에서 자동으로 사용됩니다. duckduckgo는 공개 HTML 엔드포인트를 읽으며 자동 대체 수단입니다.",
     "SearXNG Base URL": "SearXNG 주소",
-    "Web Research Guardrails Note": "페이지는 Lightpanda 헤드리스 브라우저 컨테이너가 읽으므로 자바스크립트로만 렌더링되는 기사도 본문을 얻습니다. 출처는 사이트별로 중복 제거하고 본문이 없는 페이지는 버립니다."
+    "Web Research Guardrails Note": "페이지는 Lightpanda 헤드리스 브라우저 컨테이너가 읽으므로 자바스크립트로만 렌더링되는 기사도 본문을 얻습니다. 출처는 사이트별로 중복 제거하고 본문이 없는 페이지는 버립니다.",
+    "Series Chapter Progress": "챕터 {current}/{total}: {subject}",
+    "Two Words (Punch)": "두 단어 (펀치)",
+    "Three Words (Rhythm)": "세 단어 (리듬)",
+    "Progressive Reveal": "점진적 표시",
+    "Karaoke Highlight": "노래방 강조",
+    "Binance Gold Karaoke": "바이낸스 골드 노래방",
+    "TikTok Lime Karaoke": "틱톡 라임 노래방",
+    "Podcast Blue Focus": "팟캐스트 블루 포커스",
+    "News Reel Stack": "뉴스 릴 스택",
+    "Creator Clean Reveal": "크리에이터 클린 표시"
   }
 }

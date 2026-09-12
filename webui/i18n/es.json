@@ -210,6 +210,10 @@
     "Display Mode": "Visualización de subtítulos",
     "Sentence by Sentence": "Frase completa",
     "Single Word (Word by Word)": "Palabra por palabra",
+    "Two Words (Punch)": "Dos palabras (impacto)",
+    "Three Words (Rhythm)": "Tres palabras (ritmo)",
+    "Progressive Reveal": "Revelado progresivo",
+    "Karaoke Highlight": "Resaltado de karaoke",
     "Word-by-word Timing Help": "La sincronización palabra por palabra es más precisa con Azure TTS V1 (Edge TTS) o Whisper. Otros proveedores de voz pueden usar frases o grupos de palabras.",
     "Subtitle Animation": "Animación de entrada",
     "Pop Up (Spring)": "Aparición con rebote",
@@ -443,6 +447,12 @@
     "Web Search Provider": "Proveedor de búsqueda",
     "Web Search Provider Help": "Ambos son gratuitos y sin clave. searxng es el contenedor de metabúsqueda de docker-compose.yml: sin límites de peticiones y activo automáticamente en Docker. duckduckgo consulta el punto de acceso HTML público y actúa como respaldo automático.",
     "SearXNG Base URL": "URL de SearXNG",
-    "Web Research Guardrails Note": "Las páginas las lee el contenedor del navegador headless Lightpanda, así que los artículos generados solo con JavaScript también devuelven texto. Las fuentes se deduplican por sitio y se descartan las páginas sin texto real."
+    "Web Research Guardrails Note": "Las páginas las lee el contenedor del navegador headless Lightpanda, así que los artículos generados solo con JavaScript también devuelven texto. Las fuentes se deduplican por sitio y se descartan las páginas sin texto real.",
+    "Binance Gold Karaoke": "Karaoke dorado de Binance",
+    "TikTok Lime Karaoke": "Karaoke lima de TikTok",
+    "Podcast Blue Focus": "Enfoque azul para podcast",
+    "News Reel Stack": "Ráfaga de titulares",
+    "Creator Clean Reveal": "Revelado limpio de creador",
+    "Series Chapter Progress": "Capítulo {current} de {total}: {subject}"
   }
 }
