@@ -98,6 +98,10 @@ services:
       # server.py reads these; matches the defaults in the Dockerfile.
       VOICESTUDIO_HOST: "0.0.0.0"
       VOICESTUDIO_PORT: "8780"
+      # OmniVoice refuses a silent CPU fallback (no cuda/rocm/mps). Opt in
+      # explicitly with VOICESTUDIO_ALLOW_CPU=1 in .env for hosts with enough
+      # RAM but no accelerator.
+      VOICESTUDIO_ALLOW_CPU: "${VOICESTUDIO_ALLOW_CPU:-0}"
       HF_HOME: "/voicestudio/models"
       HF_HUB_DISABLE_XET: "1"
     ports:
