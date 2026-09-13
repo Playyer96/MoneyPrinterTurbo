@@ -23,6 +23,7 @@ name then behaves like a preset in ``/generate`` and ``/voices``.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -36,11 +37,22 @@ from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8780
+# Default to 16 diffusion steps for noticeably better output quality.
+# 8 is the OmniVoice default; 16 gives a clear quality bump at ~2x render
+# time, still real-time on modern GPUs. Operators who need to trade quality
+# for throughput can override with OMNIVOICE_NUM_STEPS=8.
+DEFAULT_GENERATION_STEPS = int(os.environ.get("OMNIVOICE_NUM_STEPS", "16"))
+# Position temperature of 0 is OmniVoice's greedy default but tends to
+# sound flat on cloned voices. 0.2 adds natural variation without losing
+# the speaker's identity. Override with OMNIVOICE_POSITION_TEMPERATURE.
+DEFAULT_POSITION_TEMPERATURE = float(
+    os.environ.get("OMNIVOICE_POSITION_TEMPERATURE", "0.2")
+)
 
 app = FastAPI(title="OmniVoice HTTP API", version="2.0.0")
 
@@ -56,11 +68,11 @@ _model_lock = threading.Lock()
 # behind each other's model loads.
 _whisper_lock = threading.Lock()
 
-# Bundled voice-design presets. Each entry maps a stable name to the
-# `instruct` string OmniVoice consumes. Kept empty: every usable voice is a
-# cloned profile in PROFILES_DIR; add preset entries here if a textual voice
-# design is ever needed.
-VOICE_PRESETS: dict[str, str] = {}
+# Bundled voice-design presets. Each entry maps a stable name to the English
+# `instruct` string OmniVoice consumes.
+VOICE_PRESETS: dict[str, str] = {
+    "narrator": "male, middle-aged, low pitch",
+}
 
 # Cloned voices live as `<name>.pt` (a saved VoiceClonePrompt), an optional
 # `<name>.<ext>` audio sample, and a `<name>.json` metadata file in the
@@ -114,17 +126,11 @@ def _pick_device(torch):
         return "cuda", torch.float16
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps", torch.float32
-    # CPU inference is ~15x slower and looks like a hang rather than a failure,
-    # so it is refused instead of silently accepted. On a Mac this fires when
-    # the server is containerised -- the fix is the host server, not CPU.
-    if os.environ.get("VOICESTUDIO_ALLOW_CPU") != "1":
-        raise RuntimeError(
-            "no GPU available to OmniVoice (no cuda/rocm, no mps). "
-            "On Apple Silicon, run the host server: `make mac-setup`, and "
-            "bring the stack up with docker-compose.mac.yml. "
-            "Set VOICESTUDIO_ALLOW_CPU=1 to accept CPU inference."
-        )
-    return "cpu", torch.float32
+    raise RuntimeError(
+        "no GPU available to OmniVoice (no cuda/rocm, no mps). "
+        "On Apple Silicon, use docker-compose.mac.yml so Compose starts "
+        "the host Metal service automatically. CPU inference is disabled."
+    )
 
 
 def _load_model():
@@ -161,6 +167,17 @@ class GenerateRequest(BaseModel):
 @app.get("/health")
 def health() -> dict:
     return {"ok": True, "voices": list(VOICE_PRESETS.keys())}
+
+
+@app.post("/warmup")
+def warmup() -> dict:
+    """Validate presets and load the TTS model before the first request."""
+    from omnivoice.models.omnivoice import _resolve_instruct
+
+    for instruct in VOICE_PRESETS.values():
+        _resolve_instruct(instruct)
+    _load_model()
+    return {"ok": True}
 
 
 @app.get("/voices")
@@ -334,6 +351,8 @@ def generate_audio(request: GenerateRequest):
                 generate_kwargs["voice_clone_prompt"] = profile_prompt
             if request.speed is not None and request.speed > 0:
                 generate_kwargs["speed"] = float(request.speed)
+            generate_kwargs["num_step"] = DEFAULT_GENERATION_STEPS
+            generate_kwargs["position_temperature"] = DEFAULT_POSITION_TEMPERATURE
             waveforms = model.generate(**generate_kwargs)
     except HTTPException:
         raise
@@ -343,28 +362,25 @@ def generate_audio(request: GenerateRequest):
         ) from exc
 
     # OmniVoice returns one or more waveform tensors at the model's native
-    # 24 kHz. Persist them as a temporary WAV the response can stream, then
-    # clean up. Sampling rate is fixed by the model and not user-tunable.
-    filename = f"{uuid.uuid4().hex}.wav"
-    out_path = os.path.join(tempfile.gettempdir(), filename)
+    # 24 kHz. Encode the response in memory; the previous temporary file was
+    # never deleted by FileResponse and added disk I/O to every request.
     try:
-        import torch
         import soundfile as sf
 
         wav = waveforms[0]
         if hasattr(wav, "detach"):
             wav = wav.detach().cpu().float().numpy()
-        sf.write(out_path, wav, 24000)
+        output = io.BytesIO()
+        sf.write(output, wav, 24000, format="WAV")
     except Exception as exc:
         raise HTTPException(
             status_code=500, detail=f"audio write failed: {exc}"
         ) from exc
 
-    return FileResponse(
-        out_path,
+    return Response(
+        content=output.getvalue(),
         media_type="audio/wav",
-        filename=filename,
-        background=None,
+        headers={"Content-Disposition": 'attachment; filename="speech.wav"'},
     )
 
 

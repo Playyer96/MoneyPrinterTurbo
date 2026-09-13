@@ -17,4 +17,5 @@ huggingface_hub
 fastapi
 uvicorn
 python-multipart
+imageio-ffmpeg==0.6.0
 mlx-whisper; sys_platform == "darwin" and platform_machine == "arm64"
