@@ -7,7 +7,7 @@ Why this exists
 Docker Desktop for Mac runs containers in a Linux VM. That VM has no
 VideoToolbox framework, so ffmpeg inside the container cannot advertise
 `h264_videotoolbox` -- the macOS encoder the app picks by default. The
-host's ffmpeg (e.g. Homebrew's `/opt/homebrew/bin/ffmpeg`) does have it,
+host's native ffmpeg does have it,
 but its Mach-O binary cannot execute inside the Linux VM.
 
 This proxy runs on the Mac host as a LaunchAgent (port 8781, loopback
@@ -19,9 +19,8 @@ the host's ffmpeg, and return its exit code + stdout + stderr.
 Path translation is required because the bind mount
 (`./:/MoneyPrinterTurbo`) is the same directory on both sides but the
 absolute path differs (host: whatever the user cloned to; container:
-`/MoneyPrinterTurbo`). Other paths (`/tmp/...`) are passed through
-verbatim and rely on Docker Desktop sharing `/tmp` with the host VM,
-which the VirtioFS/gRPC-FUSE backends do by default.
+`/MoneyPrinterTurbo`). Commands that reference container-private paths stay
+inside the container.
 
 Protocol
 --------
@@ -41,7 +40,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 CONTAINER_REPO = "/MoneyPrinterTurbo"
-HOST_FFMPEG = os.environ.get("MPT_FFMPEG_BIN") or shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+HOST_FFMPEG = os.environ.get("MPT_FFMPEG_BIN") or shutil.which("ffmpeg") or "ffmpeg"
 LOG_PATH = Path(os.environ.get("MPT_FFMPEG_PROXY_LOG", REPO / "storage" / "logs" / "ffmpeg-mac-proxy.log"))
 LISTEN_HOST = os.environ.get("MPT_FFMPEG_PROXY_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("MPT_FFMPEG_PROXY_PORT", "8781"))
@@ -60,16 +59,15 @@ def translate_path(arg: str) -> str:
     Rewrite `/MoneyPrinterTurbo/...` to the host's repo path so ffmpeg on
     the host can read the bind-mounted storage. Other paths pass through.
     """
-    if arg.startswith(CONTAINER_REPO + "/") or arg == CONTAINER_REPO:
-        rel = arg[len(CONTAINER_REPO):].lstrip("/")
-        return str(REPO / rel) if rel else str(REPO)
-    return arg
+    if arg == CONTAINER_REPO:
+        return str(REPO)
+    return arg.replace(CONTAINER_REPO + "/", f"{REPO}/")
 
 
 def run_ffmpeg(args, cwd):
     translated = [translate_path(a) for a in args]
     host_cwd = translate_path(cwd) if cwd else str(REPO)
-    log.info("running ffmpeg: %s (cwd=%s)", translated, host_cwd)
+    log.info("running ffmpeg with %d arguments (cwd=%s)", len(translated), host_cwd)
     try:
         proc = subprocess.run(
             [HOST_FFMPEG, *translated],
@@ -210,7 +208,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     if not Path(HOST_FFMPEG).exists():
-        log.error("host ffmpeg not found at %s; set MPT_FFMPEG_BIN or install ffmpeg", HOST_FFMPEG)
+        log.error("host ffmpeg not found at %s; set MPT_FFMPEG_BIN", HOST_FFMPEG)
     log.info("starting ffmpeg-mac-proxy on %s:%d (ffmpeg=%s repo=%s)", LISTEN_HOST, LISTEN_PORT, HOST_FFMPEG, REPO)
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     try:

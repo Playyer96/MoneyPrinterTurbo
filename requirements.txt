@@ -7,6 +7,19 @@ fastapi==0.136.3
 uvicorn==0.32.1
 openai==2.24.0
 faster-whisper==1.1.0
+# Per-platform GPU Whisper backends. Each marker pulls the matching
+# CTranslate2 wheel so ``device="auto"`` lands on the GPU on the host
+# without the user having to know which ctranslate2 extra to install.
+#   Apple Silicon Mac : mlx-whisper (Metal + Neural Engine via Core ML)
+#   Linux + Nvidia    : ctranslate2[cuda] (CUDA 12 wheel, Linux only)
+#   Windows + Nvidia  : ctranslate2[cuda] (CUDA 12 wheel, Windows only)
+#   Linux + AMD ROCm  : ctranslate2[rocm] (ROCm 5 wheel, Linux only)
+# Other combinations (CPU, Intel, etc.) fall through to the default
+# faster-whisper CPU backend; nothing extra is installed on those hosts.
+ctranslate2[cuda]==4.6.0; sys_platform == "linux" and platform_machine == "x86_64"
+ctranslate2[cuda]==4.6.0; sys_platform == "win32"
+ctranslate2[rocm]==4.6.0; sys_platform == "linux" and platform_machine == "x86_64"
+mlx-whisper==0.4.3; sys_platform == "darwin" and platform_machine == "arm64"
 loguru==0.7.3
 google-genai==2.11.0
 dashscope==1.20.14

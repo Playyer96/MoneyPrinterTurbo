@@ -30,8 +30,24 @@ def _stdin_is_pipe() -> bool:
     return stat.S_ISFIFO(os.fstat(sys.stdin.fileno()).st_mode)
 
 
+def _uses_stdin(args: list[str]) -> bool:
+    """Return whether ffmpeg was explicitly told to read input from stdin."""
+    return any(
+        args[index] == "-i" and args[index + 1] in {"-", "pipe:", "pipe:0"}
+        for index in range(len(args) - 1)
+    )
+
+
 def _requires_container_ffmpeg(args: list[str]) -> bool:
-    """Return True when an absolute argument is outside the shared repository."""
+    """Keep private paths and binary stdout inside the Linux container."""
+    output = args[-1] if args else ""
+    if output == "-" or output.startswith("pipe:"):
+        output_format = next(
+            (args[index + 1] for index in range(len(args) - 2, -1, -1) if args[index] == "-f"),
+            "",
+        )
+        if output_format != "null":
+            return True
     return any(
         os.path.isabs(arg)
         and arg != CONTAINER_REPO
@@ -71,7 +87,7 @@ def main() -> int:
     if _requires_container_ffmpeg(args):
         return subprocess.call([CONTAINER_FFMPEG, *args])
     try:
-        if _stdin_is_pipe():
+        if _stdin_is_pipe() and _uses_stdin(args):
             body = _run_stream(proxy_url, args)
         else:
             payload = json.dumps({"args": args, "cwd": os.getcwd()}).encode("utf-8")
@@ -85,8 +101,7 @@ def main() -> int:
     except (urllib.error.URLError, http.client.HTTPException, ConnectionError, OSError, TimeoutError) as exc:
         sys.stderr.write(
             f"ffmpeg-mac-wrapper: cannot reach host proxy at {proxy_url}: {exc}\n"
-            "Hint: run `make mac-setup` on the Mac host to install the LaunchAgent,\n"
-            "or unset FFMPEG_MAC_PROXY_URL to fall back to the in-container ffmpeg.\n"
+            "The macOS Compose accelerator provider must be healthy; CPU fallback is disabled.\n"
         )
         return 1
     try:

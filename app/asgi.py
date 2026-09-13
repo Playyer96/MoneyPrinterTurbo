@@ -23,6 +23,17 @@ async def application_lifespan(_: FastAPI):
     """集中处理 API 进程启动恢复和关闭日志。"""
     logger.info("startup event")
 
+    # Platform-aware GPU backend self-check. Warns when the host has a
+    # GPU that the installed Whisper backend cannot reach, so the user
+    # knows to ``pip install`` the matching extra before they spend a
+    # transcription job on the CPU.
+    try:
+        from app.services import subtitle as subtitle_service
+
+        subtitle_service.log_gpu_backend_status()
+    except Exception as exc:
+        logger.debug(f"gpu backend self-check skipped: {exc}")
+
     configured_api_key = config.app.get("api_key", "")
     if configured_api_key in (None, ""):
         logger.warning(
