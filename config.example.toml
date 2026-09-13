@@ -443,21 +443,18 @@ mimo_tts_style_prompt = "Read in a natural, clear tone suitable for short-form v
 # Leave empty to skip generation.
 subtitle_provider = "edge"
 
-# FFmpeg is normally downloaded and detected automatically. If detection fails,
-# download it from https://www.gyan.dev/ffmpeg/builds/ and set the executable.
-# Windows example: ffmpeg_path = "C:\\path\\to\\ffmpeg.exe"
+# FFmpeg is bundled and detected inside Docker. This override exists only for
+# local development; the normal Compose path never needs a host-specific path.
 # ffmpeg_path = ""
 
 # Leave unset to use the default "auto" policy: pick the first hardware encoder
-# available for the current platform and fall back to libx264 when none can be
-# used, so a GPU is used by default and a CPU-only host keeps working. Hardware
-# encoders are optional; unsupported encoders automatically fall back to libx264.
-# Available values: "libx264", "h264_nvenc", "h264_amf", "h264_qsv",
-# "h264_mf", "h264_videotoolbox", or "auto" (videotoolbox on macOS, nvenc on
-# Linux/Windows NVIDIA, qsv on Intel iGPU, amf on AMD).
+# available for the current platform. CPU video encoding is disabled, so an
+# unavailable encoder fails clearly instead of silently becoming slow.
+# Available values: "h264_nvenc", "h264_amf", "h264_qsv",
+# "h264_vaapi", "h264_mf", "h264_videotoolbox", or "auto" (videotoolbox on
+# macOS, nvenc on Linux/Windows NVIDIA, qsv on Intel iGPU, vaapi/amf on AMD).
 # The selected value must be present in `ffmpeg -encoders` for the resolved
-# ffmpeg binary; on Linux/Docker without an NVENC-enabled ffmpeg, "auto"
-# resolves to libx264.
+# ffmpeg binary and must have a compatible GPU visible to the container.
 # video_codec = "auto"
 
 # -----------------------------------------------------------------------------

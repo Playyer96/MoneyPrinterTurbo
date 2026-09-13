@@ -63,6 +63,9 @@ x-build-args: &build-args
   PIP_USE_OFFICIAL: "${PIP_USE_OFFICIAL:-auto}"
 
 x-service-env: &service-env
+  # Production jobs call the real stages directly. Provider boundaries still
+  # validate their requests, without duplicate network and binary preflights.
+  MPT_SKIP_PIPELINE_PREFLIGHT: "1"
   # MoviePy defaults to the imageio-ffmpeg bundled binary (a static ffmpeg
   # 7.0.2 build), which has no NVENC encoder at all, while the app itself
   # resolves /usr/bin/ffmpeg for concat/probes. Point MoviePy at the same
@@ -98,10 +101,8 @@ services:
       # server.py reads these; matches the defaults in the Dockerfile.
       VOICESTUDIO_HOST: "0.0.0.0"
       VOICESTUDIO_PORT: "8780"
-      # OmniVoice refuses a silent CPU fallback (no cuda/rocm/mps). Opt in
-      # explicitly with VOICESTUDIO_ALLOW_CPU=1 in .env for hosts with enough
-      # RAM but no accelerator.
-      VOICESTUDIO_ALLOW_CPU: "${VOICESTUDIO_ALLOW_CPU:-0}"
+      # OmniVoice refuses to start without CUDA, ROCm, or MPS. CPU inference
+      # is intentionally unavailable because it makes each video unacceptably slow.
       HF_HOME: "/voicestudio/models"
       HF_HUB_DISABLE_XET: "1"
     ports:

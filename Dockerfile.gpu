@@ -29,8 +29,7 @@ COPY docker/pick-mirror.py /usr/local/bin/pick-mirror.py
 # own parentheses -- a trailing `|| true` would turn an apt, PPA, Python or
 # pip failure into a successful build producing an unusable image.
 #
-# ffmpeg from Ubuntu apt is built without --enable-nvenc, so the GPU image
-# would still fall back to libx264 on every clip. BtbN's GPL static build
+# ffmpeg from Ubuntu apt is built without --enable-nvenc. BtbN's GPL static build
 # links dynamically against the nvidia/cuda base image's libnvidia-encode*,
 # which makes h264_nvenc (and h264_qsv, h264_amf) usable inside the
 # container. xz-utils is added only for extracting the .tar.xz release.

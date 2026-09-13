@@ -1,13 +1,13 @@
 # Apple Silicon override -- puts the GPU behind the normal compose interface.
 #
-#   docker compose up -d      (.env pins this file, so plain compose is enough)
+#   docker compose -f docker-compose.yml -f docker-compose.mac.yml up -d --build
 #
 # MLX has no Linux build and macOS does not pass Metal through to Docker's
 # Linux VM, so the model itself cannot run in a container on a Mac -- that is a
 # platform limit, not a configuration one. What *can* be containerised is the
-# service boundary: the real OmniVoice/MLX server runs natively on the host
-# (LaunchAgent, `make mac-setup`) and this file puts a tiny socat front door in
-# front of it on the bridge network, published under the alias `voicestudio`.
+# service boundary: the real OmniVoice/MLX server runs natively on the host.
+# The Compose provider below provisions and starts it automatically, while a
+# tiny socat front door publishes it under the bridge alias `voicestudio`.
 #
 # The payoff is that nothing above this line changes shape per platform. webui
 # and api keep talking to http://voicestudio:8780 exactly as they do on Linux,
@@ -25,6 +25,7 @@
 # service-env-mac duplicates the base compose's *service-env so the YAML
 # merge stays self-contained (cross-file anchors do not resolve).
 x-service-env-mac: &service-env-mac
+  MPT_SKIP_PIPELINE_PREFLIGHT: "1"
   VOICESTUDIO_BASE_URL: "${VOICESTUDIO_BASE_URL:-http://voicestudio:8780}"
   LIGHTPANDA_URL: "${LIGHTPANDA_URL:-ws://lightpanda:9222}"
   WEB_SEARCH_PROVIDER: "${WEB_SEARCH_PROVIDER:-searxng}"
@@ -32,6 +33,13 @@ x-service-env-mac: &service-env-mac
   FFMPEG_MAC_PROXY_URL: "http://ffmpeg-mac-proxy:8781"
 
 services:
+  # Compose invokes this repository-local provider on the Mac host. It caches
+  # its isolated Python runtime under .mpt-host and starts Metal/MLX plus
+  # VideoToolbox services before either bridge container is created.
+  host-accelerators:
+    provider:
+      type: "${PWD}/scripts/mpt-mac-accelerators"
+
   # Parked behind a profile rather than scaled to zero: `replicas: 0` still
   # makes `docker compose up` BUILD the 10.8GB torch image, which on a Mac is a
   # long wait for a container that can never reach the GPU. An inactive profile
@@ -65,6 +73,8 @@ services:
       retries: 3
       start_period: 5s
     restart: unless-stopped
+    depends_on:
+      - host-accelerators
 
   # Front door for the host ffmpeg proxy (scripts/ffmpeg_mac_proxy.py). Same
   # pattern as voicestudio-host: a 5MB socat that forwards a container port
@@ -87,6 +97,8 @@ services:
       retries: 3
       start_period: 5s
     restart: unless-stopped
+    depends_on:
+      - host-accelerators
 
   # The webui and api services inherit env vars from the base file; on Mac
   # we replace them with *service-env-mac, which is the base vars plus
@@ -94,5 +106,15 @@ services:
   # environment: blocks across files, so the explicit override is required.
   webui:
     environment: *service-env-mac
+    depends_on:
+      voicestudio-host:
+        condition: service_healthy
+      ffmpeg-proxy-host:
+        condition: service_healthy
   api:
     environment: *service-env-mac
+    depends_on:
+      voicestudio-host:
+        condition: service_healthy
+      ffmpeg-proxy-host:
+        condition: service_healthy

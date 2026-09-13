@@ -1,6 +1,7 @@
 # Exclude common Python files and directories
 venv/
 .venv/
+.mpt-host/
 __pycache__/
 *.pyc
 *.pyo
