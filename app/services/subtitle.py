@@ -1,8 +1,10 @@
 import json
 import os.path
 import re
+import sys
 from types import SimpleNamespace
 from timeit import default_timer as timer
+from typing import Dict, List
 
 import requests
 
@@ -10,6 +12,15 @@ try:
     from faster_whisper import WhisperModel
 except ImportError:
     WhisperModel = None
+# mlx-whisper dispatches Whisper through Apple's MLX framework (Metal on
+# Apple Silicon, with some operators landing on the Neural Engine via
+# Core ML). On Mac hosts this is the fastest local path -- 3-5x faster
+# than faster-whisper's CPU-only CTranslate2 backend -- and the primary
+# choice when the VoiceStudio LaunchAgent is not reachable.
+try:
+    import mlx_whisper
+except ImportError:
+    mlx_whisper = None
 from loguru import logger
 
 from app.config import config
@@ -17,24 +28,18 @@ from app.services import guardrails
 from app.utils import utils
 
 model_size = config.whisper.get("model_size", "large-v3")
-# "auto" lets CTranslate2 use an attached NVIDIA GPU and fall back to the CPU
-# otherwise. It has no ROCm or Metal backend, which is why Apple hosts route
-# through _remote_transcribe below instead of relying on this.
-device = config.whisper.get("device", "auto")
 compute_type = config.whisper.get("compute_type", "default")
 initial_prompt = config.whisper.get("initial_prompt", "") or None
 model = None
 
 
 def _remote_transcribe(audio_file: str):
-    """Transcribe on the host-side GPU server, or return None to fall back.
+    """Transcribe on the host-side GPU server, or return None when unavailable.
 
     faster-whisper's CTranslate2 backend is cpu/cuda only, so inside a Linux
     container on a Mac whisper can never leave the CPU. The VoiceStudio server
     already runs natively on the host for the same reason (see `make mac-setup`);
-    it exposes /transcribe backed by MLX, which does run on Metal. Any failure
-    here -- server down, no mlx, non-Mac host -- returns None so the caller
-    loads faster-whisper locally exactly as before.
+    it exposes /transcribe backed by MLX, which does run on Metal.
     """
     from app.services import voice
 
@@ -45,19 +50,18 @@ def _remote_transcribe(audio_file: str):
                 f"{base_url}/transcribe",
                 data=fh.read(),
                 headers={"Content-Type": "application/octet-stream"},
-                timeout=600,
+                timeout=(2, 60),
             )
     except Exception as e:
         logger.warning(
-            f"remote whisper unavailable ({type(e).__name__}), falling back to the "
-            f"local model at {base_url} -- on a Mac this means CPU transcription"
+            f"remote GPU whisper unavailable at {base_url}: {type(e).__name__}"
         )
         return None
 
     if response.status_code != 200:
         logger.warning(
-            f"remote whisper returned status {response.status_code}, falling back to "
-            f"the local model -- on a Mac this means CPU transcription"
+            f"remote GPU whisper returned status {response.status_code}: "
+            f"{response.text[:300]}"
         )
         return None
 
@@ -81,16 +85,116 @@ def _remote_transcribe(audio_file: str):
     return segments, info
 
 
+def _has_cuda_whisper() -> bool:
+    """Return whether CTranslate2 can see a CUDA device."""
+    try:
+        import ctranslate2
+
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+def log_gpu_backend_status() -> None:
+    """Log the accelerated Whisper backend available on this host."""
+    if os.environ.get("VOICESTUDIO_BASE_URL"):
+        logger.info("Whisper backend: remote accelerator")
+    elif sys.platform == "darwin" and mlx_whisper is not None:
+        logger.info("Whisper backend: mlx-whisper (Apple Silicon Metal)")
+    elif _has_cuda_whisper():
+        logger.info("Whisper backend: faster-whisper (CUDA)")
+    else:
+        logger.warning("no accelerated Whisper backend; CPU transcription is disabled")
+
+
+def _mlx_transcribe(audio_file: str):
+    """Transcribe on the local MLX runtime (Apple Silicon Metal + ANE).
+
+    mlx-whisper is the preferred local path on Mac because it dispatches
+    Whisper through Apple's MLX framework, which targets Metal on Apple
+    Silicon GPUs and routes a growing subset of operators to the Neural
+    Engine via Core ML. That makes it 3-5x faster than faster-whisper
+    (CPU-only CTranslate2) and removes the dependency on the VoiceStudio
+    LaunchAgent being up.
+
+    Returns a (segments, info) tuple in the same shape as the other
+    backends, or None when the runtime is unavailable / fails.
+    """
+    if mlx_whisper is None or sys.platform != "darwin":
+        return None
+    mlx_model = str(
+        config.whisper.get("mlx_model", "mlx-community/whisper-large-v3-turbo")
+    )
+    try:
+        logger.info(f"mlx-whisper local transcription: model={mlx_model}")
+        result = mlx_whisper.transcribe(
+            audio_file,
+            path_or_hf_repo=mlx_model,
+            word_timestamps=True,
+            verbose=False,
+            **({"initial_prompt": initial_prompt} if initial_prompt else {}),
+        )
+    except Exception as exc:
+        logger.warning(f"mlx-whisper local transcription failed: {exc}")
+        return None
+
+    if not result or not isinstance(result, dict):
+        return None
+
+    raw_segments = result.get("segments") or []
+    segments = []
+    for raw in raw_segments:
+        words_raw = raw.get("words") or []
+        words = [
+            SimpleNamespace(
+                start=float(w.get("start", 0.0)),
+                end=float(w.get("end", 0.0)),
+                word=str(w.get("word", "")),
+            )
+            for w in words_raw
+            if w.get("word") is not None
+        ]
+        segments.append(
+            SimpleNamespace(
+                text=str(raw.get("text", "") or ""),
+                start=float(raw.get("start", 0.0)),
+                end=float(raw.get("end", 0.0)),
+                words=words,
+            )
+        )
+    info = SimpleNamespace(
+        language=str(result.get("language", "en") or "en"),
+        language_probability=float(result.get("language_probability", 1.0) or 1.0),
+    )
+    logger.info("mlx-whisper local transcription succeeded")
+    return segments, info
+
+
 def create(audio_file, subtitle_file: str = "", word_level: bool = False):
     global model
+
+    # Order on Mac hosts:
+    #   1. local mlx-whisper (Metal + ANE, fast, no server required)
+    #   2. VoiceStudio remote (MLX, only if local MLX is unavailable)
+    #   3. faster-whisper on CUDA
+    # CPU inference is deliberately disabled on every platform.
+    if sys.platform == "darwin" and mlx_whisper is not None:
+        mlx_result = _mlx_transcribe(audio_file)
+        if mlx_result is not None:
+            segments, info = mlx_result
+            return _write_subtitle(
+                segments, info, audio_file, subtitle_file, word_level
+            )
 
     remote = _remote_transcribe(audio_file)
     if remote is not None:
         segments, info = remote
         return _write_subtitle(segments, info, audio_file, subtitle_file, word_level)
 
-    if WhisperModel is None:
-        logger.warning("faster_whisper not available, skipping whisper subtitle generation")
+    if WhisperModel is None or not _has_cuda_whisper():
+        logger.warning(
+            "no accelerated Whisper backend is available; skipping transcription"
+        )
         return ""
     if not model:
         model_path = f"{utils.root_dir()}/models/whisper-{model_size}"
@@ -99,11 +203,11 @@ def create(audio_file, subtitle_file: str = "", word_level: bool = False):
             model_path = model_size
 
         logger.info(
-            f"loading model: {model_path}, device: {device}, compute_type: {compute_type}"
+            f"loading model: {model_path}, device: cuda, compute_type: {compute_type}"
         )
         try:
             model = WhisperModel(
-                model_size_or_path=model_path, device=device, compute_type=compute_type
+                model_size_or_path=model_path, device="cuda", compute_type=compute_type
             )
         except Exception as e:
             logger.error(
@@ -118,7 +222,7 @@ def create(audio_file, subtitle_file: str = "", word_level: bool = False):
 
     segments, info = model.transcribe(
         audio_file,
-        beam_size=5,
+        beam_size=1,
         word_timestamps=True,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=500),
@@ -139,6 +243,11 @@ def _write_subtitle(segments, info, audio_file, subtitle_file, word_level):
 
     start = timer()
     subtitles = []
+    # word-level entries captured during the same segment walk. Kept as
+    # compact {"w","s","e"} dicts so the JSON sidecar stays under a few
+    # hundred KB even for a 10-minute video. A real-time player reads
+    # this file to drive karaoke-style highlighting without re-encoding.
+    word_entries: List[Dict[str, float]] = []
 
     def recognized(seg_text, seg_start, seg_end):
         seg_text = seg_text.strip()
@@ -153,6 +262,22 @@ def _write_subtitle(segments, info, audio_file, subtitle_file, word_level):
         )
 
     for segment in segments:
+        # Capture every word regardless of mode: the JSON sidecar is a
+        # progressive enhancement that costs a tiny dict append per word
+        # and unlocks the real-time karaoke player for every subtitle file,
+        # not only the explicitly word-level ones.
+        if segment.words:
+            for word in segment.words:
+                cleaned_word = word.word.strip()
+                if cleaned_word:
+                    word_entries.append(
+                        {
+                            "w": cleaned_word,
+                            "s": float(word.start),
+                            "e": float(word.end),
+                        }
+                    )
+
         if word_level and segment.words:
             for word in segment.words:
                 cleaned_word = word.word.strip()
@@ -225,6 +350,49 @@ def _write_subtitle(segments, info, audio_file, subtitle_file, word_level):
     with open(subtitle_file, "w", encoding="utf-8") as f:
         f.write(sub)
     logger.info(f"subtitle file created: {subtitle_file}")
+
+    # Word-level JSON sidecar. The SRT is the source of truth for legacy
+    # burn-in paths; the JSON drives the real-time player that reads word
+    # timestamps and styles them at playback. The two share the same guardrail
+    # pass above, so timing stays consistent.
+    if word_entries:
+        try:
+            from app.config import config as _cfg
+
+            style_preset = str(
+                _cfg.ui.get("subtitle_style_preset", "custom") or "custom"
+            )
+            font_size = int(_cfg.ui.get("font_size", 60) or 60)
+        except Exception:
+            style_preset = "custom"
+            font_size = 60
+
+        json_path = os.path.splitext(subtitle_file)[0] + ".words.json"
+        cue_payload = [
+            {
+                "i": i + 1,
+                "s": s.get("start_time"),
+                "e": s.get("end_time"),
+                "t": s.get("msg"),
+            }
+            for i, s in enumerate(subtitles)
+            if s.get("msg")
+        ]
+        payload = {
+            "version": 1,
+            "language": info.language,
+            "style": {"preset": style_preset, "fontSize": font_size},
+            "cues": cue_payload,
+            "words": word_entries,
+        }
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+            logger.info(f"word-level subtitle json created: {json_path}")
+        except Exception as exc:
+            # The JSON is a progressive enhancement; failing to write it must
+            # not break the SRT path the rest of the pipeline depends on.
+            logger.warning(f"failed to write word-level subtitle json: {exc}")
 
 
 def file_to_subtitles(filename):
@@ -375,24 +543,3 @@ def correct(subtitle_file, video_script):
         logger.info("Subtitle corrected")
     else:
         logger.success("Subtitle is correct")
-
-
-if __name__ == "__main__":
-    task_id = "c12fd1e6-4b0a-4d65-a075-c87abe35a072"
-    task_dir = utils.task_dir(task_id)
-    subtitle_file = f"{task_dir}/subtitle.srt"
-    audio_file = f"{task_dir}/audio.mp3"
-
-    subtitles = file_to_subtitles(subtitle_file)
-    print(subtitles)
-
-    script_file = f"{task_dir}/script.json"
-    with open(script_file, "r") as f:
-        script_content = f.read()
-    s = json.loads(script_content)
-    script = s.get("script")
-
-    correct(subtitle_file, script)
-
-    subtitle_file = f"{task_dir}/subtitle-test.srt"
-    create(audio_file, subtitle_file)

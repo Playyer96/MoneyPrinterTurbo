@@ -134,7 +134,7 @@ def get_video_cache_stats(max_age_days: int | None = None) -> VideoCacheStats:
     """
 
     _validate_max_age_days(max_age_days)
-    now_ns = time.time_ns()
+    now_ns = int(time.time() * 1e9)
     file_count = 0
     total_size = 0
     oldest_mtime_ns = None
@@ -172,7 +172,7 @@ def clean_video_cache(max_age_days: int | None = None) -> VideoCacheCleanupResul
     """
 
     _validate_max_age_days(max_age_days)
-    now_ns = time.time_ns()
+    now_ns = int(time.time() * 1e9)
     logger.info(
         f"start cleaning video cache: max_age_days={max_age_days}"
     )

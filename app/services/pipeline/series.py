@@ -9,6 +9,8 @@ bar; intra-chapter updates feed the parent to keep the bar moving.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from loguru import logger
 
 from app.models import const
@@ -24,6 +26,7 @@ from app.services.pipeline import stages
 _SERIES_HEAD_PROGRESS = 5
 _SERIES_BODY_PROGRESS = 90
 _SERIES_TAIL_PROGRESS = 5
+_SERIES_WORKERS = 2
 
 
 def resolve_series_outline(params: VideoParams) -> list[str]:
@@ -160,67 +163,71 @@ def run_series_video(
     from app.services import task as _task
 
     parts: list[dict] = []
-    videos: list[str] = []
-    scripts: list[str] = []
     warnings: list[dict] = []
-    for index, chapter in enumerate(outline, start=1):
+    scripts: dict[int, str] = {}
+
+    def run_part(index: int, chapter: str):
         part_task_id = f"{task_id}/part-{index:02d}"
         logger.info(f"\n\n## series part {index}/{total}: {chapter}")
-        # Announce the chapter before invoking the inner pipeline so the
-        # WebUI's "chapter X/Y" indicator updates as soon as the chapter
-        # starts, not after it finishes. Without this, the indicator would
-        # only advance on completion and lag a full chapter behind.
         sm.state.update_task(
             task_id,
             current_part=index,
             current_chapter=chapter,
         )
-        result = _task._run_pipeline(
+        return _task._run_pipeline(
             part_task_id,
             build_series_part_params(params, outline, index),
             stop_at=stop_at,
             allow_server_file_input=allow_server_file_input,
         )
-        if result.get("state") == const.TASK_STATE_FAILED:
-            # One failed chapter must not throw away the parts that did render.
-            logger.error(
-                f"series part failed: task_id={task_id}, part={index}, "
-                f"error={result.get('error')}"
-            )
-            warnings.append(
-                {
-                    "code": "series_part_failed",
-                    "part": index,
-                    "subject": chapter,
-                    "error": result.get("error"),
-                }
-            )
-        else:
-            videos.extend(result.get("videos") or [])
-            scripts.append(result.get("script") or "")
-            parts.append(
-                {
-                    "part": index,
-                    "subject": chapter,
-                    "task_id": part_task_id,
-                    "videos": result.get("videos") or [],
-                }
-            )
 
-        # Update the parent after each chapter instead of waiting on the inner
-        # pipeline, so a long chapter still leaves a moving progress bar in
-        # the WebUI. ``index`` is 1-based; the body band caps at 95% before
-        # the tail finalize step.
-        sm.state.update_task(
-            task_id,
-            state=const.TASK_STATE_PROCESSING,
-            progress=_series_body_progress(index, total),
-        )
+    workers = min(_SERIES_WORKERS, total)
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="mpt-series") as executor:
+        futures = {
+            executor.submit(run_part, index, chapter): (index, chapter)
+            for index, chapter in enumerate(outline, start=1)
+        }
+        for completed, future in enumerate(as_completed(futures), start=1):
+            index, chapter = futures[future]
+            part_task_id = f"{task_id}/part-{index:02d}"
+            result = future.result()
+            if result.get("state") == const.TASK_STATE_FAILED:
+                logger.error(
+                    f"series part failed: task_id={task_id}, part={index}, "
+                    f"error={result.get('error')}"
+                )
+                warnings.append(
+                    {
+                        "code": "series_part_failed",
+                        "part": index,
+                        "subject": chapter,
+                        "error": result.get("error"),
+                    }
+                )
+            else:
+                scripts[index] = result.get("script") or ""
+                parts.append(
+                    {
+                        "part": index,
+                        "subject": chapter,
+                        "task_id": part_task_id,
+                        "videos": result.get("videos") or [],
+                    }
+                )
+
+            sm.state.update_task(
+                task_id,
+                state=const.TASK_STATE_PROCESSING,
+                progress=_series_body_progress(completed, total),
+            )
 
     if not parts:
         return stages.mark_task_failed(task_id, "series", "every part of the series failed")
 
-    video_script = "\n\n".join(script for script in scripts if script)
+    parts.sort(key=lambda part: part["part"])
+    warnings.sort(key=lambda warning: warning["part"])
+    videos = [video for part in parts for video in part["videos"]]
+    video_script = "\n\n".join(scripts[index] for index in sorted(scripts) if scripts[index])
     # The parent directory keeps its own script.json, so a series appears in the
     # task history and stays restorable just like a single video task.
     stages.save_script_data(task_id, video_script, [], params)

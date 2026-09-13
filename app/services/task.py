@@ -34,8 +34,8 @@ from loguru import logger
 
 from app.config import config
 from app.models import const
-from app.models.schema import VideoConcatMode, VideoParams
-from app.services import (
+from app.models.schema import VideoConcatMode, VideoParams  # noqa: F401
+from app.services import (  # noqa: F401
     bgm as bgm_service,
     elevenlabs_music,
     llm,
@@ -57,7 +57,7 @@ from app.services.pipeline import stages
 from app.services.pipeline import series as _series_pipeline
 from app.services.pipeline import single as _single_pipeline
 from app.services.pipeline import start as start
-from app.utils import file_security, utils
+from app.utils import file_security, utils  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # Re-exports for backward compatibility.
@@ -709,13 +709,3 @@ def schedule_manual_cross_post(
         return False, scheduling_error, 429
 
     return True, None, 202
-
-
-if __name__ == "__main__":
-    task_id = "task_id"
-    params = VideoParams(
-        video_subject="the role of money",
-        voice_name="zh-CN-XiaoyiNeural-Female",
-        voice_rate=1.0,
-    )
-    start(task_id, params, stop_at="video")

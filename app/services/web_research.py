@@ -24,6 +24,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, quote_plus, urlsplit
 
 import requests
@@ -37,7 +38,7 @@ DEFAULT_FETCH_PAGES = 3
 MAX_PAGE_CHARS = 3000
 MAX_SNIPPET_CHARS = 400
 MAX_WIKIPEDIA_CHARS = 1500
-_TIMEOUT = (10, 25)
+_TIMEOUT = (3, 10)
 # Lightpanda renders a page in well under a second; anything slower is a site
 # fighting us, and research must not stall a video render.
 LIGHTPANDA_TIMEOUT = 20.0
@@ -230,9 +231,8 @@ def search(
         provider, backend = "duckduckgo", _search_duckduckgo
     try:
         results = backend(query, max_results, app_config=app_config)
-        if results or provider == "duckduckgo":
+        if results or provider in ("duckduckgo", "searxng"):
             return results
-        logger.warning(f"{provider} returned no results; retrying on duckduckgo")
     except Exception as e:
         logger.warning(f"web search failed ({provider}): {e}")
         if provider == "duckduckgo":
@@ -484,13 +484,27 @@ def research(
     logger.info(f"researching subject on the web: {subject}")
     sections = []
 
-    encyclopedia = wikipedia_summary(subject, language=language, app_config=app_config)
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mpt-research") as executor:
+        encyclopedia_future = executor.submit(
+            wikipedia_summary,
+            subject,
+            language=language,
+            app_config=app_config,
+        )
+        search_future = executor.submit(
+            search,
+            subject,
+            max_results=max_results * 2,
+            app_config=app_config,
+        )
+        encyclopedia = encyclopedia_future.result()
+        found = search_future.result()
+
     if encyclopedia:
         sections.append(f"## Background (Wikipedia)\n{encyclopedia}")
 
     # Ask for more than we keep: the quality filter throws some away, and a
     # brief built from four solid sources beats one built from eight thin ones.
-    found = search(subject, max_results=max_results * 2, app_config=app_config)
     results = guardrails.filter_research_results(found)[:max_results]
     if found and not results:
         logger.warning(
@@ -498,21 +512,40 @@ def research(
         )
 
     pages_read = 0
-    for result in results:
+    page_texts: dict[int, str] = {}
+    next_result = 0
+    while pages_read < fetch_pages and next_result < len(results):
+        batch_size = min(fetch_pages - pages_read, len(results) - next_result)
+        batch = results[next_result : next_result + batch_size]
+        with ThreadPoolExecutor(
+            max_workers=batch_size, thread_name_prefix="mpt-page"
+        ) as executor:
+            fetched = list(
+                executor.map(
+                    lambda result: fetch_page(
+                        result["url"], app_config=app_config
+                    ),
+                    batch,
+                )
+            )
+        for offset, page_text in enumerate(fetched):
+            result_index = next_result + offset
+            if page_text and guardrails.is_usable_page(page_text):
+                page_texts[result_index] = page_text
+                pages_read += 1
+            elif page_text:
+                logger.debug(
+                    "research: page has no usable prose, snippet only: "
+                    f"{results[result_index]['url']}"
+                )
+        next_result += batch_size
+
+    for result_index, result in enumerate(results):
         block = [f"### {result['title'] or result['url']}\nSource: {result['url']}"]
         if result["snippet"]:
             block.append(result["snippet"])
-        if pages_read < fetch_pages:
-            page_text = fetch_page(result["url"], app_config=app_config)
-            if page_text and guardrails.is_usable_page(page_text):
-                block.append(page_text)
-                pages_read += 1
-            elif page_text:
-                # A paywall stub or a cookie wall is worse than no source at
-                # all: it reads like content and says nothing.
-                logger.debug(
-                    f"research: page has no usable prose, snippet only: {result['url']}"
-                )
+        if result_index in page_texts:
+            block.append(page_texts[result_index])
         sections.append("\n".join(block))
 
     if not sections:

@@ -6,7 +6,8 @@ import re
 import shutil
 import subprocess
 import tempfile
-from time import perf_counter
+import threading
+from time import perf_counter, sleep
 from typing import List
 
 from loguru import logger
@@ -21,6 +22,13 @@ from app.services import web_research as web_research_service
 from app.utils import utils
 
 _max_retries = 5
+_PROVIDER_RETRY_ATTEMPTS = 3
+_TRANSIENT_LLM_ERROR_RE = re.compile(
+    r"(?:\b(?:408|425|429|500|502|503|504)\b|unavailable|resource_exhausted|"
+    r"deadline_exceeded|high demand|rate.?limit|timed? out|timeout|temporar|"
+    r"connection (?:reset|closed|aborted))",
+    re.IGNORECASE,
+)
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
 MAX_SCRIPT_PARAGRAPH_NUMBER = 10
 MAX_SCRIPT_PROMPT_LENGTH = 2000
@@ -282,7 +290,251 @@ def _extract_qwen_generation_text(response) -> str:
     return _normalize_text_response(text, "qwen")
 
 
-def _generate_response(prompt: str, app_config=None) -> str:
+def _cache_key(provider: str, model: str, base_url: str, prompt: str) -> str:
+    """Stable cache key for an LLM response. Includes the inputs that
+    actually drive the answer (provider + model + endpoint) but never the
+    prompt itself, so prompt contents do not leak into file names."""
+    import hashlib
+
+    h = hashlib.sha256()
+    h.update(provider.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(model.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(base_url.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(prompt.encode("utf-8"))
+    return h.hexdigest()
+
+
+def _response_cache_path(provider: str, model: str, base_url: str, prompt: str) -> str:
+    """Disk-backed cache file path for an LLM response."""
+    cache_root = os.path.join(utils.storage_dir(create=True), "llm_cache")
+    key = _cache_key(provider, model, base_url, prompt)
+    sub_dir = os.path.join(cache_root, provider, key[:2])
+    os.makedirs(sub_dir, exist_ok=True)
+    return os.path.join(sub_dir, key + ".json")
+
+
+# Replays the same response within this window. Long enough that an
+# impatient user clicking "Generate" twice gets an instant second run,
+# short enough that a model upgrade or prompt tweak still picks up
+# after a few hours.
+LLM_CACHE_TTL_SECONDS = 60 * 60
+
+# In-memory hit cache layered on top of the disk cache. Hot prompts in a
+# single process skip the disk read entirely; cold prompts still go to disk
+# once and then stay hot until LLM_CACHE_TTL_SECONDS expires. 256 entries
+# covers a long generation session without unbounded memory growth (FIFO
+# eviction). ponytail: bounded LRU; raise when many distinct prompts per
+# process is the norm.
+_LLM_HIT_CACHE_MAX_SIZE = 256
+_LLM_HIT_CACHE: dict[tuple[str, str, str, str], tuple[float, str]] = {}
+_LLM_HIT_CACHE_LOCK = threading.Lock()
+
+
+def _read_response_cache(provider: str, model: str, base_url: str, prompt: str):
+    """Return the cached response text if one exists and is fresh, else None.
+
+    Reads go through a small in-memory layer first. Hot prompts (retried
+    within LLM_CACHE_TTL_SECONDS) skip the disk read entirely, which is
+    the single biggest wall-clock win for a user iterating on the same
+    script/terms: each retry was a ~5-10ms disk hit, now ~microseconds.
+    """
+    import time as _time
+
+    cache_key = (provider, model, base_url, prompt)
+    now = _time.time()
+
+    # Fast path: same-process hit; in-memory check + TTL is microseconds.
+    with _LLM_HIT_CACHE_LOCK:
+        cached = _LLM_HIT_CACHE.get(cache_key)
+        if cached is not None and (now - cached[0]) < LLM_CACHE_TTL_SECONDS:
+            return cached[1]
+
+    # Slow path: disk read. Failures here fall through to the network call,
+    # which is the same behavior as before this optimization landed.
+    path = _response_cache_path(provider, model, base_url, prompt)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            payload = json.load(fp)
+    except (OSError, ValueError):
+        return None
+    cached_at = payload.get("cached_at")
+    if not isinstance(cached_at, (int, float)):
+        return None
+    if (now - cached_at) > LLM_CACHE_TTL_SECONDS:
+        return None
+    text = payload.get("text")
+    if not isinstance(text, str):
+        return None
+
+    # Promote disk hit to the in-memory layer; FIFO evict if at capacity so
+    # memory cannot grow unbounded across long-lived processes.
+    with _LLM_HIT_CACHE_LOCK:
+        if len(_LLM_HIT_CACHE) >= _LLM_HIT_CACHE_MAX_SIZE:
+            oldest_key = next(iter(_LLM_HIT_CACHE))
+            _LLM_HIT_CACHE.pop(oldest_key, None)
+        _LLM_HIT_CACHE[cache_key] = (now, text)
+    return text
+
+
+def _write_response_cache(
+    provider: str, model: str, base_url: str, prompt: str, text: str
+) -> None:
+    """Persist a successful LLM response to disk. Never raises."""
+    import time as _time
+
+    try:
+        path = _response_cache_path(provider, model, base_url, prompt)
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump({"cached_at": _time.time(), "text": text}, fp)
+    except OSError:
+        pass
+
+
+def _generate_claude_code_response(
+    prompt: str,
+    llm_provider: str,
+    model_name: str,
+    provider,
+    extra_values: dict,
+) -> str:
+    """Generate plain text through an isolated Claude Code subscription call."""
+    configured_cli = (extra_values.get("cli_path") or "").strip() or "claude"
+    cli_path = shutil.which(configured_cli)
+    if not cli_path and os.path.isfile(configured_cli):
+        cli_path = configured_cli
+    if not cli_path:
+        raise ValueError(
+            f"{llm_provider}: claude CLI not found ('{configured_cli}'), "
+            f"install it in the runtime or set "
+            f"{provider.config_key('cli_path')} in the config.toml file."
+        )
+
+    try:
+        timeout_seconds = coerce_claude_code_timeout(
+            extra_values.get("timeout"), provider.config_key("timeout")
+        )
+    except ValueError as timeout_error:
+        raise ValueError(f"{llm_provider}: {timeout_error}") from None
+
+    command = [
+        cli_path,
+        "-p",
+        prompt,
+        "--output-format",
+        "json",
+        "--system-prompt",
+        CLAUDE_CODE_SYSTEM_PROMPT,
+        "--tools",
+        "",
+        "--safe-mode",
+    ]
+    if model_name:
+        command += ["--model", model_name]
+
+    cli_env, removed_env = build_claude_code_env()
+    if removed_env:
+        logger.warning(
+            f"{llm_provider}: ignoring conflicting environment variables "
+            f"so the subscription login is used: {', '.join(removed_env)}"
+        )
+
+    logger.info(f"invoking claude cli, model: {model_name or 'cli default'}")
+    with tempfile.TemporaryDirectory() as work_dir:
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                cwd=work_dir,
+                env=cli_env,
+            )
+        except subprocess.TimeoutExpired:
+            raise Exception(
+                f"[{llm_provider}] claude cli timed out after {timeout_seconds:.0f}s"
+            )
+
+    stdout = (completed.stdout or "").strip()
+    try:
+        payload = json.loads(stdout) if stdout else None
+    except json.JSONDecodeError:
+        payload = None
+
+    if payload is None:
+        detail = (completed.stderr or stdout or "").strip()
+        if "unknown option" in detail.lower():
+            raise Exception(
+                f"[{llm_provider}] the installed claude CLI does not support "
+                f"the required isolation flags; upgrade to "
+                f"{CLAUDE_CODE_MIN_CLI_VERSION} or newer: {detail[:300]}"
+            )
+        if completed.returncode != 0:
+            raise Exception(
+                f"[{llm_provider}] claude cli exited with code "
+                f"{completed.returncode}: {detail[:500]}"
+            )
+        raise Exception(
+            f'[{llm_provider}] returned an invalid response: "{detail[:500]}"'
+        )
+
+    if payload.get("is_error") or completed.returncode != 0:
+        reason = str(payload.get("result") or "").strip() or (
+            f"claude cli exited with code {completed.returncode}"
+        )
+        if "login" in reason.lower():
+            reason += (
+                " (run `claude setup-token` on the host and pass the token "
+                "to the container as CLAUDE_CODE_OAUTH_TOKEN)"
+            )
+        raise Exception(
+            f'[{llm_provider}] returned an error response: "{reason[:500]}"'
+        )
+
+    return _normalize_text_response(payload.get("result"), llm_provider)
+
+
+def is_transient_error(error: object) -> bool:
+    """Return whether retrying a failed provider request can reasonably succeed."""
+    return bool(_TRANSIENT_LLM_ERROR_RE.search(str(error or "")))
+
+
+def _generate_response_once(prompt: str, app_config=None) -> str:
+    # Resolve provider/model/endpoint once so the cache key matches what
+    # would actually be hit on a live call. Cached responses skip the
+    # network round-trip entirely, which is the single biggest speed win
+    # for users who retry a generation.
+    _runtime_app_config_e = app_config if app_config is not None else config.app
+    _llm_provider_e = str(
+        _runtime_app_config_e.get("llm_provider", DEFAULT_LLM_PROVIDER_ID)
+    ).lower()
+    _provider_obj_e = get_llm_provider(_llm_provider_e)
+    _configured_model_e = ""
+    _base_url_e = ""
+    if _provider_obj_e is not None:
+        _configured_model_e = str(
+            _runtime_app_config_e.get(_provider_obj_e.config_key("model_name"), "") or ""
+        )
+        _configured_base_url_e = str(
+            _runtime_app_config_e.get(_provider_obj_e.config_key("base_url"), "") or ""
+        )
+        _base_url_e = _provider_obj_e.resolve_base_url(_configured_base_url_e)
+    _cached_text = _read_response_cache(
+        _llm_provider_e, _configured_model_e, _base_url_e, prompt
+    )
+    if _cached_text is not None:
+        logger.info(
+            f"llm cache hit: provider={_llm_provider_e} "
+            f"model={_configured_model_e or '(default)'} "
+            f"chars={len(_cached_text)}"
+        )
+        response_text = _cached_text
+        return response_text
+    response_text = ""
     try:
         # The WebUI lets the user prepare the next script while a video is being
         # generated. Callers can pass the config snapshot taken at submit time, so
@@ -376,7 +628,9 @@ def _generate_response(prompt: str, app_config=None) -> str:
                             f'[{llm_provider}] returned an error response: "{response}"'
                         )
 
-                    return _extract_qwen_generation_text(response)
+                    response_text = _extract_qwen_generation_text(response)
+                    response_text = response_text
+                    return response_text
                 else:
                     raise Exception(
                         f'[{llm_provider}] returned an invalid response: "{response}"'
@@ -433,7 +687,8 @@ def _generate_response(prompt: str, app_config=None) -> str:
                 logger.warning(f"gemini returned invalid response content: {str(e)}")
                 raise ValueError(f"[{llm_provider}] returned invalid response content")
 
-            return _normalize_text_response(generated_text, llm_provider)
+            response_text = _normalize_text_response(generated_text, llm_provider)
+            return response_text
 
         if adapter == "cloudflare_ai_gateway":
             account_id = extra_values["account_id"]
@@ -453,7 +708,8 @@ def _generate_response(prompt: str, app_config=None) -> str:
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
             )
-            return _extract_chat_completion_text(response, llm_provider)
+            response_text = _extract_chat_completion_text(response, llm_provider)
+            return response_text
 
         if adapter == "litellm":
             import litellm
@@ -474,7 +730,8 @@ def _generate_response(prompt: str, app_config=None) -> str:
             if not getattr(response, "choices", None):
                 raise ValueError(f"[{llm_provider}] returned empty response")
 
-            return _extract_chat_completion_text(response, llm_provider)
+            response_text = _extract_chat_completion_text(response, llm_provider)
+            return response_text
 
         if adapter == "azure":
             # The Azure OpenAI SDK builds its own request URL from
@@ -494,7 +751,8 @@ def _generate_response(prompt: str, app_config=None) -> str:
             )
             if response:
                 if isinstance(response, ChatCompletion):
-                    return _extract_chat_completion_text(response, llm_provider)
+                    response_text = _extract_chat_completion_text(response, llm_provider)
+                    return response_text
                 else:
                     raise Exception(
                         f'[{llm_provider}] returned an invalid response: "{response}", please check your network '
@@ -506,123 +764,14 @@ def _generate_response(prompt: str, app_config=None) -> str:
                 )
 
         if adapter == "claude_code":
-            # A Claude subscription (Pro / Max / Team) issues no API key, and its
-            # credentials can only be used by the official Claude Code client. So
-            # instead of calling the Anthropic API directly, the locally logged-in
-            # claude CLI is invoked headless (`claude -p`): the CLI handles auth
-            # and script generation only consumes the text it returns.
-            configured_cli = (extra_values.get("cli_path") or "").strip() or "claude"
-            cli_path = shutil.which(configured_cli)
-            if not cli_path and os.path.isfile(configured_cli):
-                cli_path = configured_cli
-            if not cli_path:
-                raise ValueError(
-                    f"{llm_provider}: claude CLI not found ('{configured_cli}'), "
-                    f"install it in the runtime or set "
-                    f"{provider.config_key('cli_path')} in the config.toml file."
-                )
-
-            try:
-                timeout_seconds = coerce_claude_code_timeout(
-                    extra_values.get("timeout"), provider.config_key("timeout")
-                )
-            except ValueError as timeout_error:
-                raise ValueError(f"{llm_provider}: {timeout_error}") from None
-
-            command = [
-                cli_path,
-                "-p",
+            response_text = _generate_claude_code_response(
                 prompt,
-                "--output-format",
-                "json",
-                "--system-prompt",
-                CLAUDE_CODE_SYSTEM_PROMPT,
-                # Disable every built-in tool, so this is text generation only.
-                "--tools",
-                "",
-                # Disable user-level customization (CLAUDE.md, skills, hooks,
-                # plugins, MCP); auth and model selection are unaffected (--bare
-                # cannot be used, it would disable OAuth).
-                "--safe-mode",
-            ]
-            # An empty model name keeps the CLI's own default model, so no model
-            # id hardcoded here can go stale as the subscription's available
-            # models change.
-            if model_name:
-                command += ["--model", model_name]
-
-            cli_env, removed_env = build_claude_code_env()
-            if removed_env:
-                # Log the variable names only, never their values, so no secret
-                # reaches the log.
-                logger.warning(
-                    f"{llm_provider}: ignoring conflicting environment variables "
-                    f"so the subscription login is used: {', '.join(removed_env)}"
-                )
-
-            logger.info(f"invoking claude cli, model: {model_name or 'cli default'}")
-            # The CLI reads CLAUDE.md and project settings from the working
-            # directory, and that content would pollute the copy, so it always
-            # runs in an empty temporary directory.
-            with tempfile.TemporaryDirectory() as work_dir:
-                try:
-                    completed = subprocess.run(
-                        command,
-                        capture_output=True,
-                        text=True,
-                        timeout=timeout_seconds,
-                        cwd=work_dir,
-                        env=cli_env,
-                    )
-                except subprocess.TimeoutExpired:
-                    raise Exception(
-                        f"[{llm_provider}] claude cli timed out after "
-                        f"{timeout_seconds:.0f}s"
-                    )
-
-            # Failures such as not being logged in or running out of quota also
-            # return JSON (`is_error` true, `result` a readable reason) but with a
-            # non-zero exit code. Parse stdout first, and fall back to the exit
-            # code and stderr only when no JSON is available.
-            stdout = (completed.stdout or "").strip()
-            try:
-                payload = json.loads(stdout) if stdout else None
-            except json.JSONDecodeError:
-                payload = None
-
-            if payload is None:
-                detail = (completed.stderr or stdout or "").strip()
-                if "unknown option" in detail.lower():
-                    raise Exception(
-                        f"[{llm_provider}] the installed claude CLI does not support "
-                        f"the required isolation flags; upgrade to "
-                        f"{CLAUDE_CODE_MIN_CLI_VERSION} or newer: {detail[:300]}"
-                    )
-                if completed.returncode != 0:
-                    raise Exception(
-                        f"[{llm_provider}] claude cli exited with code "
-                        f"{completed.returncode}: {detail[:500]}"
-                    )
-                raise Exception(
-                    f'[{llm_provider}] returned an invalid response: "{detail[:500]}"'
-                )
-
-            if payload.get("is_error") or completed.returncode != 0:
-                reason = str(payload.get("result") or "").strip() or (
-                    f"claude cli exited with code {completed.returncode}"
-                )
-                # An interactive /login is impossible inside a container, so name
-                # the auth methods that do work.
-                if "login" in reason.lower():
-                    reason += (
-                        " (run `claude setup-token` on the host and pass the token "
-                        "to the container as CLAUDE_CODE_OAUTH_TOKEN)"
-                    )
-                raise Exception(
-                    f'[{llm_provider}] returned an error response: "{reason[:500]}"'
-                )
-
-            return _normalize_text_response(payload.get("result"), llm_provider)
+                llm_provider,
+                model_name,
+                provider,
+                extra_values,
+            )
+            return response_text
 
         if adapter == "modelscope":
             content = ""
@@ -647,7 +796,8 @@ def _generate_response(prompt: str, app_config=None) -> str:
                 if not content.strip():
                     raise ValueError("Empty content in stream response")
 
-                return _normalize_text_response(content, llm_provider)
+                response_text = _normalize_text_response(content, llm_provider)
+                return response_text
             else:
                 raise Exception(f"[{llm_provider}] returned an empty response")
 
@@ -661,7 +811,8 @@ def _generate_response(prompt: str, app_config=None) -> str:
         )
         if response:
             if isinstance(response, ChatCompletion):
-                return _extract_chat_completion_text(response, llm_provider)
+                response_text = _extract_chat_completion_text(response, llm_provider)
+                return response_text
             else:
                 raise Exception(
                     f'[{llm_provider}] returned an invalid response: "{response}", please check your network '
@@ -674,6 +825,28 @@ def _generate_response(prompt: str, app_config=None) -> str:
 
     except Exception as e:
         return f"Error: {_sanitize_error_message(e)}"
+    finally:
+        if response_text and not response_text.startswith("Error:"):
+            _write_response_cache(
+                _llm_provider_e, _configured_model_e, _base_url_e, prompt, response_text,
+            )
+
+
+def _generate_response(prompt: str, app_config=None) -> str:
+    """Generate once, retrying only transient provider failures."""
+    response = ""
+    for attempt in range(1, _PROVIDER_RETRY_ATTEMPTS + 1):
+        response = _generate_response_once(prompt, app_config=app_config)
+        if not response.startswith("Error:") or not is_transient_error(response):
+            return response
+        if attempt < _PROVIDER_RETRY_ATTEMPTS:
+            delay = 0.5 * (2 ** (attempt - 1))
+            logger.warning(
+                f"transient LLM failure; retrying in {delay:g}s "
+                f"(attempt {attempt + 1}/{_PROVIDER_RETRY_ATTEMPTS})"
+            )
+            sleep(delay)
+    return response
 
 
 def test_connection() -> tuple[bool, str, float]:
@@ -1472,17 +1645,3 @@ def generate_social_metadata(
 
     logger.warning("falling back to heuristic social metadata")
     return _fallback_social_metadata(video_subject, video_script, platform)
-
-
-if __name__ == "__main__":
-    video_subject = "what is the meaning of life"
-    script = generate_script(
-        video_subject=video_subject, language="zh-CN", paragraph_number=1
-    )
-    print("######################")
-    print(script)
-    search_terms = generate_terms(
-        video_subject=video_subject, video_script=script, amount=5
-    )
-    print("######################")
-    print(search_terms)

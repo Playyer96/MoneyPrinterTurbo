@@ -8,6 +8,9 @@ chapter inside ``app.services.pipeline.series``.
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 from loguru import logger
 
 from app.config import config
@@ -42,7 +45,8 @@ from app.services.pipeline.stages import (  # noqa: F401  - re-exported for call
 # single task and a series chapter both report progress with the same shape.
 _PROGRESS_AFTER_PREFLIGHT = 5
 _PROGRESS_AFTER_SCRIPT = 10
-_PROGRESS_AFTER_TERMS = 20
+# terms and audio run concurrently below; the bar jumps from script to
+# "post-TTS" the moment both stages finish, mirroring the original audio gate.
 _PROGRESS_AFTER_AUDIO = 30
 _PROGRESS_AFTER_SUBTITLE = 40
 _PROGRESS_AFTER_MATERIALS = 50
@@ -70,13 +74,25 @@ def run_single_video(
     from app.services import task as _task
 
     logger.info(f"start single-video task: {task_id}, stop_at: {stop_at}")
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=_PROGRESS_AFTER_PREFLIGHT)
+    logger.info(
+        f"task config: video_source={params.video_source}, voice={params.voice_name!r}, "
+        f"video_count={params.video_count}, aspect={params.video_aspect}, "
+        f"clip_duration={params.video_clip_duration}s, subtitle_enabled={params.subtitle_enabled}, "
+        f"title_enabled={params.title_enabled}, bgm_type={params.bgm_type!r}"
+    )
+    sm.state.update_task(
+        task_id, state=const.TASK_STATE_PROCESSING, progress=_PROGRESS_AFTER_PREFLIGHT
+    )
 
-    preflight_failure = _check_preflight(task_id, params, stop_at)
-    if preflight_failure is not None:
-        return preflight_failure
+    if os.environ.get("MPT_SKIP_PIPELINE_PREFLIGHT") != "1":
+        preflight_failure = _check_preflight(task_id, params, stop_at)
+        if preflight_failure is not None:
+            logger.warning(f"task {task_id} failed preflight")
+            return preflight_failure
+        logger.info(f"task {task_id} preflight passed")
 
     # 1. Generate script
+    logger.info(f"task {task_id} stage: generating script")
     video_script = _task.generate_script(task_id, params)
     if not video_script or "Error: " in video_script:
         error = (
@@ -84,9 +100,16 @@ def run_single_video(
             if isinstance(video_script, str) and "Error: " in video_script
             else "failed to generate video script"
         )
+        logger.error(f"task {task_id} script stage failed: {error}")
         return stages.mark_task_failed(task_id, "script", error)
+    logger.info(
+        f"task {task_id} script stage done: "
+        f"{len(video_script)} chars, {video_script.count(chr(10) + chr(10)) + 1} paragraphs"
+    )
 
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=_PROGRESS_AFTER_SCRIPT)
+    sm.state.update_task(
+        task_id, state=const.TASK_STATE_PROCESSING, progress=_PROGRESS_AFTER_SCRIPT
+    )
 
     if stop_at == "script":
         sm.state.update_task(
@@ -94,43 +117,83 @@ def run_single_video(
         )
         return {"script": video_script}
 
-    # 2. Generate terms
-    video_terms = ""
-    if params.video_source != "local":
+    # 2 + 3. Terms and audio both depend only on ``video_script`` and used to
+    # run sequentially; on a 60-second script the LLM terms call adds ~3-10s
+    # of wall clock for no reason. Run them concurrently so this section is
+    # bounded by max(terms, audio) instead of terms + audio. ``save_script_data``
+    # only needs terms and is cheap enough to defer until both finish.
+    # Stop-at ``terms`` and ``audio`` still take the synchronous path because
+    # callers expect to receive exactly the product they asked for.
+    # ponytail: 2-worker pool; raise when GPU-TTS or batched LLM providers land.
+    if stop_at == "terms":
         video_terms = _task.generate_terms(task_id, params, video_script)
         if not video_terms:
             return stages.mark_task_failed(
-                task_id,
-                "terms",
-                "failed to generate video search terms",
+                task_id, "terms", "failed to generate video search terms"
             )
-
-    _task.save_script_data(task_id, video_script, video_terms, params)
-
-    if stop_at == "terms":
+        _task.save_script_data(task_id, video_script, video_terms, params)
         sm.state.update_task(
             task_id, state=const.TASK_STATE_COMPLETE, progress=100, terms=video_terms
         )
         return {"script": video_script, "terms": video_terms}
 
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=_PROGRESS_AFTER_TERMS)
-
-    # 3. Generate audio
-    audio_file, audio_duration, sub_maker = _task.generate_audio(
-        task_id,
-        params,
-        video_script,
-        voice_preview=voice_preview,
-        allow_server_file_input=allow_server_file_input,
-    )
-    if not audio_file:
-        return stages.mark_task_failed(
-            task_id,
-            "audio",
-            "failed to prepare narration audio",
+    needs_terms = params.video_source != "local"
+    if needs_terms:
+        logger.info(
+            f"task {task_id} stage: generating terms + audio in parallel "
+            f"(voice={params.voice_name!r}, audio_rate={params.voice_rate}, "
+            f"audio_volume={params.voice_volume})"
+        )
+    else:
+        logger.info(
+            f"task {task_id} stage: generating audio (local material, terms skipped); "
+            f"voice={params.voice_name!r}"
         )
 
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=_PROGRESS_AFTER_AUDIO)
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mpt-stage") as executor:
+        terms_future = (
+            executor.submit(_task.generate_terms, task_id, params, video_script)
+            if needs_terms
+            else None
+        )
+        audio_future = executor.submit(
+            _task.generate_audio,
+            task_id,
+            params,
+            video_script,
+            voice_preview=voice_preview,
+            allow_server_file_input=allow_server_file_input,
+        )
+
+        audio_file, audio_duration, sub_maker = audio_future.result()
+        if not audio_file:
+            # audio stage already records its own failure on the task; just bail.
+            logger.error(f"task {task_id} audio stage failed")
+            return stages.mark_task_failed(
+                task_id, "audio", "failed to prepare narration audio"
+            )
+
+        video_terms = []
+        if terms_future is not None:
+            video_terms = terms_future.result()
+            if not video_terms:
+                logger.error(f"task {task_id} terms stage failed")
+                return stages.mark_task_failed(
+                    task_id, "terms", "failed to generate video search terms"
+                )
+
+    logger.info(
+        f"task {task_id} audio done: duration={audio_duration}s, "
+        f"voice={params.voice_name!r}"
+    )
+    if needs_terms:
+        logger.info(f"task {task_id} terms done: {len(video_terms)} search terms")
+
+    sm.state.update_task(
+        task_id, state=const.TASK_STATE_PROCESSING, progress=_PROGRESS_AFTER_AUDIO
+    )
+
+    _task.save_script_data(task_id, video_script, video_terms, params)
 
     if stop_at == "audio":
         sm.state.update_task(
@@ -141,12 +204,14 @@ def run_single_video(
         )
         return {"audio_file": audio_file, "audio_duration": audio_duration}
 
-    # 4. Generate subtitle
-    subtitle_path = _task.generate_subtitle(
-        task_id, params, video_script, sub_maker, audio_file
-    )
-
     if stop_at == "subtitle":
+        logger.info(
+            f"task {task_id} stage: generating subtitle "
+            f"(provider={config.app.get('subtitle_provider', 'edge')})"
+        )
+        subtitle_path = _task.generate_subtitle(
+            task_id, params, video_script, sub_maker, audio_file
+        )
         sm.state.update_task(
             task_id,
             state=const.TASK_STATE_COMPLETE,
@@ -155,16 +220,41 @@ def run_single_video(
         )
         return {"subtitle_path": subtitle_path}
 
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=_PROGRESS_AFTER_SUBTITLE)
-
-    # 5. Get video materials
-    downloaded_videos = _task.get_video_materials(
-        task_id,
-        params,
-        video_terms,
-        audio_duration,
-        loomloom_video_request=loomloom_video_request,
+    # Subtitle generation and material acquisition only share the completed
+    # audio duration, so overlap their two slow I/O/GPU paths.
+    logger.info(
+        f"task {task_id} stage: generating subtitles + materials in parallel "
+        f"(source={params.video_source})"
     )
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mpt-stage") as executor:
+        subtitle_future = executor.submit(
+            _task.generate_subtitle,
+            task_id,
+            params,
+            video_script,
+            sub_maker,
+            audio_file,
+        )
+        materials_future = executor.submit(
+            _task.get_video_materials,
+            task_id,
+            params,
+            video_terms,
+            audio_duration,
+            loomloom_video_request=loomloom_video_request,
+        )
+        subtitle_path = subtitle_future.result()
+        downloaded_videos = materials_future.result()
+    logger.info(
+        f"task {task_id} subtitles done: path={subtitle_path}, "
+        f"materials done: "
+        f"{len(downloaded_videos) if downloaded_videos else 0} clips"
+    )
+
+    sm.state.update_task(
+        task_id, state=const.TASK_STATE_PROCESSING, progress=_PROGRESS_AFTER_SUBTITLE
+    )
+
     if not downloaded_videos:
         return stages.mark_task_failed(
             task_id,
@@ -181,7 +271,9 @@ def run_single_video(
         )
         return {"materials": downloaded_videos}
 
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=_PROGRESS_AFTER_MATERIALS)
+    sm.state.update_task(
+        task_id, state=const.TASK_STATE_PROCESSING, progress=_PROGRESS_AFTER_MATERIALS
+    )
 
     # Only the full video generation pipeline needs to process video concat mode;
     # this prevents /subtitle and /audio requests from accessing non-existent fields.
@@ -281,6 +373,7 @@ def _cross_post_owner_field(should_cross_post: bool) -> str | None:
     if not should_cross_post:
         return None
     from app.services.task import _cross_post_process_owner
+
     return _cross_post_process_owner
 
 
@@ -298,6 +391,7 @@ def _schedule_cross_post(
     # this module focused on the single-video pipeline without a circular
     # top-level dependency.
     from app.services.task import _schedule_cross_post as _impl
+
     return _impl(
         task_id=task_id,
         video_paths=video_paths,
@@ -426,6 +520,7 @@ def _check_preflight(task_id: str, params: VideoParams, stop_at: str):
 def _is_openai_image_enabled() -> bool:
     """Wrap material.is_openai_image_enabled to keep the preflight signature flat."""
     from app.services import material
+
     return material.is_openai_image_enabled(
         config.snapshot_config_with_pending(config.app)
     )

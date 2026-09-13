@@ -399,17 +399,23 @@ def generate_audio(
                 "exact provider error.",
             )
             return None, None, None
-        # Measure the real written audio_file, not sub_maker.cues[-1].end:
-        # the latter is the last WORD BOUNDARY, and TTS leaves a fixed tail
-        # past it (Edge TTS: ~0.88s at any length - 19% of a 7-word clip but
-        # 1.4% of a 153-word one, so short scripts suffer most). The
+        # Measure audio length. Non-real-word providers (Gemini, SiliconFlow,
+        # MiniMax, ...) populate sub_maker.duration from the actual rendered
+        # audio length, so the file probe is pure overhead. Edge TTS and
+        # Azure v2 return word boundaries instead, leaving a fixed audio tail
+        # (~0.88s for Edge) past the last boundary that only the file probe
+        # exposes. The probe still runs for those two providers because the
         # under-count sizes paid generate_bgm() calls, is reported as
         # audio_duration to the API/WebUI, and under-sources
         # download_videos() material, scaled by video_count.
-        file_duration = voice.get_audio_duration(audio_file)
-        audio_duration = math.ceil(
-            file_duration if file_duration > 0 else voice.get_audio_duration(sub_maker)
-        )
+        audio_duration = 0.0
+        if sub_maker is not None and not voice.has_real_word_timestamps(sub_maker):
+            audio_duration = getattr(sub_maker, "duration", 0.0) or 0.0
+        if audio_duration <= 0:
+            audio_duration = voice.get_audio_duration(audio_file)
+        if audio_duration <= 0:
+            audio_duration = voice.get_audio_duration(sub_maker)
+        audio_duration = math.ceil(audio_duration)
         if audio_duration == 0:
             mark_task_failed(task_id, "audio", "generated audio duration is zero")
             return None, None, None
@@ -458,18 +464,13 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         )
         return ""
 
-    # `subtitle_provider=edge` effectively means "use the word-level timeline
-    # returned by TTS", but only Azure v1/v2 actually returns WordBoundary;
-    # providers like Gemini/ElevenLabs/Fish Audio/Kokoro/Chatterbox/MiniMax/MiMo/
-    # SiliconFlow estimate duration linearly by character count via
-    # `populate_legacy_submaker_with_full_text`, which causes whole-segment
-    # drift when used as subtitle timeline. Detecting an estimated timeline here
-    # auto-switches to Whisper so any TTS gets properly synced subtitles under
-    # default config.
+    # The regular path favors precise Whisper alignment for estimated TTS
+    # timelines. Docker's fast-pipeline mode already has the complete script and
+    # uses the TTS estimate directly, avoiding a redundant transcription pass.
     if (
         subtitle_provider == "edge"
-        and subtitle_provider != "whisper"
         and not voice.has_real_word_timestamps(sub_maker)
+        and os.environ.get("MPT_SKIP_PIPELINE_PREFLIGHT") != "1"
     ):
         logger.warning(
             "TTS provider did not return real word-level timestamps; "
@@ -753,6 +754,11 @@ def generate_final_videos(
     video_transition_mode = params.video_transition_mode
 
     _progress = 50
+    # Cross-part clip dedup: track which (source, start, end) tuples have
+    # already been used so each part of a multi-video task shows different
+    # scenes instead of recycling the same handful of clips. combine_videos
+    # mutates this set in place with the clips it consumed.
+    used_clip_fingerprints: set = set()
     for i in range(params.video_count):
         index = i + 1
         combined_video_path = path.join(
@@ -770,6 +776,9 @@ def generate_final_videos(
             max_clip_duration=params.video_clip_duration,
             threads=params.n_threads,
             clip_speed=params.video_clip_speed,
+            exclude_clip_fingerprints=used_clip_fingerprints,
+            part_index=i,
+            task_id=task_id,
         )
 
         _progress += 50 / params.video_count / 2

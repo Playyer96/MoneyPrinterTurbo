@@ -6,6 +6,7 @@ import random
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, List
 from urllib.parse import quote_plus, urlencode, urlsplit, urlunsplit
@@ -1655,6 +1656,152 @@ def _search_videos_with_cache(
         return items
 
 
+# Stock-API material searches are independent HTTP GETs against the same
+# provider. They used to run serially; with N keywords at ~0.5s per call
+# that's N*0.5s of wall clock wasted. 4 workers stays below the typical
+# per-host rate limit; raise when an operator knows their provider allows
+# more concurrency. ponytail: small pool, bump with operator-supplied evidence.
+_MATERIAL_SEARCH_WORKERS = 4
+# Stock-API material downloads were historically serial: a 5-keyword task
+# made 5+ HTTP GETs one at a time. 3 workers stay below the typical per-host
+# rate limit; raise when an operator knows their provider allows more
+# concurrency. ponytail: small pool, bump with operator-supplied evidence.
+_MATERIAL_DOWNLOAD_WORKERS = 3
+
+
+def _search_terms_parallel(
+    search_terms: List[str],
+    search_videos: Callable[..., List[MaterialInfo]],
+    minimum_duration: int,
+    video_aspect: VideoAspect,
+) -> List[tuple[str, List[MaterialInfo]]]:
+    """Run per-keyword stock searches concurrently and return (term, items) pairs.
+
+    The cache layer locks per (provider, term, duration, aspect), so concurrent
+    distinct-term searches run in parallel and concurrent identical-term
+    searches dedupe through the same lock — both safe.
+    """
+    if not search_terms:
+        return []
+    workers = min(len(search_terms), _MATERIAL_SEARCH_WORKERS)
+    results: list[tuple[str, List[MaterialInfo]]] = []
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="mpt-search"
+    ) as executor:
+        futures = {
+            executor.submit(
+                search_videos,
+                search_term=term,
+                minimum_duration=minimum_duration,
+                video_aspect=video_aspect,
+            ): term
+            for term in search_terms
+        }
+        for future in as_completed(futures):
+            term = futures[future]
+            try:
+                results.append((term, future.result()))
+            except Exception as exc:
+                logger.warning(
+                    f"search failed for {term!r}: {type(exc).__name__}: {exc}"
+                )
+                results.append((term, []))
+    return results
+
+
+def _save_material_item(item: MaterialInfo, save_dir: str):
+    """Wrap save_video so a failure logs once and the executor can stay dumb."""
+    try:
+        path = save_video(video_url=item.url, save_dir=save_dir)
+        return item, path
+    except Exception as exc:
+        logger.error(
+            "failed to download material video: "
+            f"provider={item.provider}, error={type(exc).__name__}, "
+            f"detail={_redact_request_error(exc, item.url)}"
+        )
+        return item, ""
+
+
+def _download_candidate_pool(
+    *,
+    task_id: str,
+    candidate_pool: List[MaterialInfo],
+    audio_duration: float,
+    max_clip_duration: int,
+    material_directory: str,
+) -> List[str]:
+    """Download a filtered stock pool in parallel until audio_duration is met.
+
+    The pool is bounded by ``ceil(audio_duration / max_clip_duration) * 2`` so
+    a short clip or a transient failure cannot leave the run short, plus the
+    worker count for in-flight headroom. Anything beyond that is wasted
+    bandwidth — narration has a fixed duration and the video service already
+    loops clips to fill it.
+    """
+    if not candidate_pool:
+        logger.success("downloaded 0 videos")
+        _persist_material_sources(task_id, [])
+        return []
+
+    n_clips_needed = max(1, math.ceil(audio_duration / max_clip_duration))
+    capped_pool = candidate_pool[
+        : n_clips_needed * 2 + _MATERIAL_DOWNLOAD_WORKERS
+    ]
+    logger.info(
+        "downloading material pool in parallel: "
+        f"candidates={len(capped_pool)}, "
+        f"workers={_MATERIAL_DOWNLOAD_WORKERS}"
+    )
+
+    video_paths: List[str] = []
+    material_sources: list[dict[str, Any]] = []
+    total_duration = 0.0
+
+    with ThreadPoolExecutor(
+        max_workers=_MATERIAL_DOWNLOAD_WORKERS,
+        thread_name_prefix="mpt-mat",
+    ) as executor:
+        future_to_item = {
+            executor.submit(_save_material_item, item, material_directory): item
+            for item in capped_pool
+        }
+        for future in as_completed(future_to_item):
+            item = future_to_item[future]
+            try:
+                _, saved_video_path = future.result()
+            except Exception:
+                # _save_material_item already logged the failure.
+                continue
+            if not saved_video_path:
+                continue
+            logger.info(f"video saved: {saved_video_path}")
+            video_paths.append(saved_video_path)
+            try:
+                material_sources.append(
+                    _material_source_record(item, saved_video_path)
+                )
+            except Exception as source_error:
+                # 来源记录异常不能把已经成功下载的素材视为下载失败，更不能
+                # 阻断视频生成；保留供应商和异常类型用于后续定位。
+                logger.warning(
+                    "failed to prepare material source record: "
+                    f"provider={item.provider}, "
+                    f"error={type(source_error).__name__}, detail={source_error}"
+                )
+            seconds = min(max_clip_duration, item.duration)
+            total_duration += seconds
+            if total_duration > audio_duration:
+                logger.info(
+                    f"total duration of downloaded videos: {total_duration} seconds, skip downloading more"
+                )
+                break
+
+    logger.success(f"downloaded {len(video_paths)} videos")
+    _persist_material_sources(task_id, material_sources)
+    return video_paths
+
+
 def download_videos(
     task_id: str,
     search_terms: List[str],
@@ -1768,13 +1915,13 @@ def download_videos(
     valid_video_items = []
     valid_video_urls = []
     found_duration = 0.0
-    for search_term in search_terms:
-        video_items = search_videos(
-            search_term=search_term,
-            minimum_duration=max_clip_duration,
-            video_aspect=video_aspect,
-        )
-        logger.info(f"found {len(video_items)} videos for '{search_term}'")
+    for term, video_items in _search_terms_parallel(
+        search_terms=search_terms,
+        search_videos=search_videos,
+        minimum_duration=max_clip_duration,
+        video_aspect=video_aspect,
+    ):
+        logger.info(f"found {len(video_items)} videos for '{term}'")
 
         for item in video_items:
             if item.url not in valid_video_urls:
@@ -1792,48 +1939,19 @@ def download_videos(
     if concat_mode_value == VideoConcatMode.random.value:
         random.shuffle(valid_video_items)
 
-    total_duration = 0.0
-    for item in valid_video_items:
-        try:
-            source_info = item.source_info if isinstance(item.source_info, dict) else {}
-            logger.info(
-                f"downloading {item.provider} video: "
-                f"asset_id={source_info.get('asset_id') or 'unknown'}"
-            )
-            saved_video_path = save_video(
-                video_url=item.url, save_dir=material_directory
-            )
-            if saved_video_path:
-                logger.info(f"video saved: {saved_video_path}")
-                video_paths.append(saved_video_path)
-                try:
-                    material_sources.append(
-                        _material_source_record(item, saved_video_path)
-                    )
-                except Exception as source_error:
-                    # 来源记录异常不能把已经成功下载的素材视为下载失败，更不能
-                    # 阻断视频生成；保留供应商和异常类型用于后续定位。
-                    logger.warning(
-                        "failed to prepare material source record: "
-                        f"provider={item.provider}, "
-                        f"error={type(source_error).__name__}, detail={source_error}"
-                    )
-                seconds = min(max_clip_duration, item.duration)
-                total_duration += seconds
-                if total_duration > audio_duration:
-                    logger.info(
-                        f"total duration of downloaded videos: {total_duration} seconds, skip downloading more"
-                    )
-                    break
-        except Exception as e:
-            logger.error(
-                "failed to download material video: "
-                f"provider={item.provider}, error={type(e).__name__}, "
-                f"detail={_redact_request_error(e, item.url)}"
-            )
-    logger.success(f"downloaded {len(video_paths)} videos")
-    _persist_material_sources(task_id, material_sources)
-    return video_paths
+    # Download stock videos in parallel. Each save_video is a single HTTP GET
+    # and the stock APIs are I/O-bound, so wall clock scales with in-flight
+    # workers rather than the candidate pool size. 3 workers stays under the
+    # typical per-host rate limit; raise when an operator knows their provider
+    # allows more concurrency.
+    # ponytail: 3-worker pool; raise when stock APIs lift per-host rate limits.
+    return _download_candidate_pool(
+        task_id=task_id,
+        candidate_pool=valid_video_items,
+        audio_duration=audio_duration,
+        max_clip_duration=max_clip_duration,
+        material_directory=material_directory,
+    )
 
 
 def _download_videos_wavespeed_on_demand(
@@ -1856,53 +1974,151 @@ def _download_videos_wavespeed_on_demand(
     video_paths: List[str] = []
     material_sources: list[dict[str, Any]] = []
     total_duration = 0.0
-    for search_term in search_terms:
-        try:
-            video_items = generate_videos_wavespeed(
-                search_term=search_term,
+    # Predictive upper bound on total_duration: each in-flight gen may
+    # contribute up to max_clip_duration. Used to stop submitting paid
+    # generations before the audio threshold is met; on gen failure or dl
+    # completion the corresponding slice is decremented.
+    max_possible_duration = 0.0
+    stop_submitting = False
+    next_term_idx = 0
+
+    def _next_search_term() -> str | None:
+        nonlocal next_term_idx
+        if next_term_idx >= len(search_terms):
+            return None
+        term = search_terms[next_term_idx]
+        next_term_idx += 1
+        return term
+
+    def _submit_gen(term: str):
+        nonlocal max_possible_duration
+        max_possible_duration += max_clip_duration
+        return (
+            term,
+            executor.submit(
+                generate_videos_wavespeed,
+                search_term=term,
                 minimum_duration=max_clip_duration,
                 video_aspect=video_aspect,
-            )
-        except WaveSpeedUnconfirmedTaskError as e:
-            # 已提交的付费任务状态不明：远端可能仍在运行或已经完成并计费。
-            # 继续为后续关键词下单会造成重复生成和重复扣费，因此就地停止，
-            # 并把 prediction id 留在日志里供人工在控制台找回产物。
-            logger.error(
-                "stop submitting new wavespeed tasks, the last submitted task "
-                f"is unconfirmed: prediction_id={e.prediction_id or 'unknown'}, "
-                f"detail={e}"
-            )
-            break
-        for item in video_items:
-            saved_video_path = _save_generated_video_with_retry(
-                item.url, material_directory, "wavespeed"
-            )
-            if not saved_video_path:
-                continue
-            logger.info(f"video saved: {saved_video_path}")
-            video_paths.append(saved_video_path)
+            ),
+        )
+
+    # Pipeline: while the download of clip N is in flight, start the paid
+    # generation of clip N+1. The two operations run serially per clip
+    # (one paid call, one download), but they can overlap across clips —
+    # the cheap download of clip N runs while the expensive generation of
+    # clip N+1 is paying. Generation stays sequential to keep cost
+    # control: every paid call is its own decision, and an
+    # unconfirmed-task error on clip N still stops further submissions.
+    # ponytail: 2-worker pool; one for in-flight generation, one for download.
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mpt-wspd") as executor:
+        dl_pending: list[tuple[str, MaterialInfo, "concurrent.futures.Future[str]"]] = []
+        gen_state = None
+
+        first_term = _next_search_term()
+        if first_term is not None:
+            gen_state = _submit_gen(first_term)
+
+        while gen_state is not None or dl_pending:
+            # Generation finished: kick off its download and decide whether
+            # to commit to the next paid generation.
+            if gen_state is not None and gen_state[1].done():
+                term, gen_future = gen_state
+                gen_state = None
+                video_items: list[MaterialInfo] = []
+                try:
+                    video_items = gen_future.result()
+                except WaveSpeedUnconfirmedTaskError as e:
+                    # Paid task state is unknown: do NOT submit more, since
+                    # those would create duplicate billing.
+                    logger.error(
+                        "stop submitting new wavespeed tasks, the last submitted "
+                        f"task is unconfirmed: prediction_id={e.prediction_id or 'unknown'}, "
+                        f"detail={e}"
+                    )
+                    stop_submitting = True
+                except Exception as e:
+                    logger.error(
+                        f"wavespeed generation failed for {term!r}: "
+                        f"{type(e).__name__}: {e}"
+                    )
+
+                # Either the gen failed (exception or empty list) or it
+                # succeeded. In the failure case the predicted slice must
+                # come out of max_possible_duration or we'd silently stop
+                # submitting even though we still need material.
+                if not video_items:
+                    max_possible_duration -= max_clip_duration
+
+                if video_items:
+                    item = video_items[0]
+                    dl_pending.append(
+                        (
+                            term,
+                            item,
+                            executor.submit(
+                                _save_generated_video_with_retry,
+                                item.url,
+                                material_directory,
+                                "wavespeed",
+                            ),
+                        )
+                    )
+
+                # Submit next gen only if total + predicted < audio, so a
+                # failed gen doesn't leave us short. The check uses
+                # total_duration (only updated when dls complete) plus
+                # max_possible_duration (every in-flight gen's contribution).
+                if not stop_submitting and (total_duration + max_possible_duration) < audio_duration:
+                    next_term = _next_search_term()
+                    if next_term is not None:
+                        gen_state = _submit_gen(next_term)
+
+            # Process any completed downloads (FIFO, one per iter so the
+            # loop stays responsive to completed gens in the same pass).
+            if dl_pending and dl_pending[0][2].done():
+                term, item, dl_future = dl_pending.pop(0)
+                try:
+                    saved_video_path = dl_future.result() or ""
+                except Exception as e:
+                    logger.error(
+                        f"wavespeed download failed for {term!r}: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    saved_video_path = ""
+
+                if saved_video_path:
+                    logger.info(f"video saved: {saved_video_path}")
+                    video_paths.append(saved_video_path)
+                    try:
+                        material_sources.append(_material_source_record(item, saved_video_path))
+                    except Exception as source_error:
+                        logger.warning(
+                            "failed to prepare material source record: "
+                            f"provider={item.provider}, "
+                            f"error={type(source_error).__name__}, detail={source_error}"
+                        )
+                    total_duration += min(max_clip_duration, item.duration)
+                    # The just-settled gen is no longer in-flight.
+                    max_possible_duration -= max_clip_duration
+                    if total_duration >= audio_duration:
+                        gen_state = None
+                        # Let in-flight dls finish; they were already paid.
+                        break
+
+            if gen_state is not None or dl_pending:
+                time.sleep(0.01)
+
+        # Wait for any in-flight downloads so their paths are returned to the caller.
+        for term, item, dl_future in dl_pending:
             try:
-                material_sources.append(_material_source_record(item, saved_video_path))
-            except Exception as source_error:
-                # 与库存源一致：来源记录异常不能把已经付费生成并成功下载的
-                # 素材当作失败，更不能阻断视频生成。
-                logger.warning(
-                    "failed to prepare material source record: "
-                    f"provider={item.provider}, "
-                    f"error={type(source_error).__name__}, detail={source_error}"
-                )
-            total_duration += min(max_clip_duration, item.duration)
-            # 用 >= 判断:累计时长恰好等于所需时长时已经够用,再生成会
-            # 多付一次费用。内外两处判断必须保持同一语义。
-            if total_duration >= audio_duration:
-                break
-        if total_duration >= audio_duration:
-            logger.info(
-                "generated materials cover the required duration, stop "
-                f"generating more clips: generated={total_duration:.1f}s, "
-                f"required={audio_duration:.1f}s"
-            )
-            break
+                saved_video_path = dl_future.result() or ""
+                if saved_video_path:
+                    video_paths.append(saved_video_path)
+                    material_sources.append(_material_source_record(item, saved_video_path))
+            except Exception:
+                pass
+
     logger.success(f"generated and downloaded {len(video_paths)} videos")
     _persist_material_sources(task_id, material_sources)
     return video_paths
@@ -2257,19 +2473,24 @@ def _download_videos_by_script_order(
     脚本主题就排不上时间线。这里按关键词分组后轮询下载：
     第 1 轮取每个关键词的第 1 个候选，第 2 轮取每个关键词的第 2 个候选。
     这样在不重写视频合成引擎的前提下，尽量保证素材顺序贴近文案顺序。
+
+    The search phase runs in parallel across keywords (HTTP I/O dominates).
+    Within a round, downloads also run in parallel — but only as many as
+    ceil(remaining / max_clip_duration) so the threshold check still stops
+    the loop without spending bandwidth on items we'd discard.
     """
     logger.info("downloading videos with script-order material matching")
     candidate_groups = []
     valid_video_urls = set()
     found_duration = 0.0
 
-    for search_term in search_terms:
-        video_items = search_videos(
-            search_term=search_term,
-            minimum_duration=max_clip_duration,
-            video_aspect=video_aspect,
-        )
-        logger.info(f"found {len(video_items)} videos for '{search_term}'")
+    for term, video_items in _search_terms_parallel(
+        search_terms=search_terms,
+        search_videos=search_videos,
+        minimum_duration=max_clip_duration,
+        video_aspect=video_aspect,
+    ):
+        logger.info(f"found {len(video_items)} videos for '{term}'")
 
         term_items = []
         for item in video_items:
@@ -2280,7 +2501,7 @@ def _download_videos_by_script_order(
             found_duration += item.duration
 
         if term_items:
-            candidate_groups.append((search_term, term_items))
+            candidate_groups.append((term, term_items))
 
     logger.info(
         f"found total ordered video candidates: {sum(len(items) for _, items in candidate_groups)}, "
@@ -2292,53 +2513,76 @@ def _download_videos_by_script_order(
     total_duration = 0.0
     candidate_index = 0
     while candidate_groups and total_duration <= audio_duration:
-        has_candidate = False
+        # Collect this round's items (one per active keyword), preserving
+        # the round-robin order so cross-round ordering stays intact.
+        items_this_round: list[tuple[str, MaterialInfo]] = []
         for search_term, term_items in candidate_groups:
-            if candidate_index >= len(term_items):
-                continue
+            if candidate_index < len(term_items):
+                items_this_round.append((search_term, term_items[candidate_index]))
 
-            has_candidate = True
-            item = term_items[candidate_index]
-            try:
-                source_info = (
-                    item.source_info if isinstance(item.source_info, dict) else {}
-                )
-                logger.info(
-                    f"downloading ordered {item.provider} video for {search_term!r}: "
-                    f"asset_id={source_info.get('asset_id') or 'unknown'}"
-                )
-                saved_video_path = save_video(
-                    video_url=item.url, save_dir=material_directory
-                )
-                if saved_video_path:
-                    logger.info(f"video saved: {saved_video_path}")
-                    video_paths.append(saved_video_path)
-                    try:
-                        material_sources.append(
-                            _material_source_record(item, saved_video_path)
-                        )
-                    except Exception as source_error:
-                        logger.warning(
-                            "failed to prepare ordered material source record: "
-                            f"provider={item.provider}, "
-                            f"error={type(source_error).__name__}, "
-                            f"detail={source_error}"
-                        )
-                    total_duration += min(max_clip_duration, item.duration)
-                    if total_duration > audio_duration:
-                        logger.info(
-                            f"total duration of downloaded videos: {total_duration} seconds, skip downloading more"
-                        )
-                        break
-            except Exception as e:
-                logger.error(
-                    "failed to download ordered material video: "
-                    f"provider={item.provider}, error={type(e).__name__}, "
-                    f"detail={_redact_request_error(e, item.url)}"
-                )
-
-        if not has_candidate:
+        if not items_this_round:
             break
+
+        # Predict how many this round actually needs. ceil(remaining / clip)
+        # is the tight bound; if the candidate pool has fewer, submit them
+        # all. Oversubmitting wastes bandwidth on items the threshold check
+        # would have skipped.
+        remaining = max(0.0, audio_duration - total_duration)
+        items_needed = min(
+            len(items_this_round),
+            max(1, math.ceil(remaining / max_clip_duration)),
+        )
+        items_to_download = items_this_round[:items_needed]
+
+        round_workers = min(len(items_to_download), _MATERIAL_DOWNLOAD_WORKERS)
+        round_paths: list[str] = [""] * len(items_to_download)
+        with ThreadPoolExecutor(
+            max_workers=round_workers, thread_name_prefix="mpt-matord"
+        ) as executor:
+            future_to_index = {
+                executor.submit(save_video, item.url, material_directory): idx
+                for idx, (_, item) in enumerate(items_to_download)
+            }
+            for future in as_completed(future_to_index):
+                idx = future_to_index[future]
+                try:
+                    round_paths[idx] = future.result() or ""
+                except Exception as exc:
+                    logger.error(
+                        "failed to download ordered material video: "
+                        f"error={type(exc).__name__}, "
+                        f"detail={_redact_request_error(exc, items_to_download[idx][1].url)}"
+                    )
+                    round_paths[idx] = ""
+
+        for (search_term, item), saved_video_path in zip(
+            items_to_download, round_paths
+        ):
+            if not saved_video_path:
+                continue
+            logger.info(
+                f"downloaded ordered {item.provider} video for {search_term!r}: "
+                f"path={saved_video_path}"
+            )
+            video_paths.append(saved_video_path)
+            try:
+                material_sources.append(
+                    _material_source_record(item, saved_video_path)
+                )
+            except Exception as source_error:
+                logger.warning(
+                    "failed to prepare ordered material source record: "
+                    f"provider={item.provider}, "
+                    f"error={type(source_error).__name__}, "
+                    f"detail={source_error}"
+                )
+            total_duration += min(max_clip_duration, item.duration)
+            if total_duration > audio_duration:
+                logger.info(
+                    f"total duration of downloaded videos: {total_duration} seconds, skip downloading more"
+                )
+                break
+
         candidate_index += 1
 
     logger.success(f"downloaded {len(video_paths)} ordered videos")

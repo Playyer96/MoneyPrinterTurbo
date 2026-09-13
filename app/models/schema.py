@@ -127,7 +127,7 @@ class VideoParams(BaseModel):
     {
       "video_subject": "",
       "video_aspect": "landscape 16:9 (Xigua Video)",
-      "voice_name": "female - Xiaoxiao",
+      "voice_name": "voicestudio:boy_voice",
       "bgm_name": "random",
       "font_name": "STHeitiMedium (Heiti SC Medium)",
       "text_color": "#FFFFFF",
@@ -159,7 +159,7 @@ class VideoParams(BaseModel):
     )
     video_language: Optional[str] = ""  # auto detect
 
-    voice_name: Optional[str] = ""
+    voice_name: Optional[str] = "voicestudio:boy_voice"
     voice_volume: Optional[float] = 1.0
     voice_rate: Optional[float] = 1.0
     bgm_type: Optional[str] = "random"
