@@ -10,7 +10,7 @@ import time
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 # add project root to python path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -1629,10 +1629,156 @@ class TestVoiceStudioVoice(unittest.TestCase):
             result = vs.get_voicestudio_voices()
         self.assertEqual(result, [])
 
-    def test_voicestudio_tts_success(self):
+    def test_voicestudio_tts_applies_voice_volume(self):
+        """A user-set voice_volume != 1.0 must trigger an ffmpeg volume pass
+        that rewrites the source wav in place. The pipeline's downstream
+        MultiplyVolume only attenuates, so values > 1.0 (louder) have to
+        be baked into the audio file here.
+        """
+        import subprocess
+
+        audio_bytes = b"\x00" * 4096
+        volume_args: list[str] = []
+
         class _FakeResponse:
             status_code = 200
-            content = b"S" * 200
+            content = audio_bytes
+            text = ""
+
+        class _FakeClip:
+            duration = 3.0
+
+            def close(self):
+                pass
+
+        def _fake_run(command, **_kwargs):
+            volume_args.append(command)
+            # Pretend ffmpeg wrote the new wav at the second positional arg
+            # (after -y -i input -af volume=... -acodec ...).
+            output_path = command[-1]
+            Path(output_path).write_bytes(audio_bytes)
+            result = MagicMock()
+            result.returncode = 0
+            result.stderr = ""
+            return result
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.dict(
+            os.environ, {"VOICESTUDIO_BASE_URL": ""}
+        ), patch.object(
+            vs.config, "voicestudio", {"base_url": "http://localhost:8780"}
+        ), patch.object(
+            vs.requests, "post", return_value=_FakeResponse()
+        ), patch.object(
+            vs, "AudioFileClip", return_value=_FakeClip()
+        ), patch.object(
+            vs.subprocess, "run", side_effect=_fake_run
+        ):
+            voice_file = str(Path(tmp_dir) / "vaudio.wav")
+            vs.voicestudio_tts(
+                text="Hello world.",
+                voice_preset="narrator",
+                voice_file=voice_file,
+                voice_volume=1.5,
+            )
+
+        # Exactly one ffmpeg invocation with a non-1.0 volume filter.
+        self.assertEqual(len(volume_args), 1)
+        self.assertIn("volume=1.500", volume_args[0])
+
+    def test_voicestudio_tts_skips_volume_pass_when_one(self):
+        """voice_volume == 1.0 must not invoke ffmpeg just to multiply by 1."""
+        audio_bytes = b"\x00" * 4096
+
+        class _FakeResponse:
+            status_code = 200
+            content = audio_bytes
+            text = ""
+
+        class _FakeClip:
+            duration = 3.0
+
+            def close(self):
+                pass
+
+        def _fake_run(_command, **_kwargs):
+            self.fail("ffmpeg should not be invoked when voice_volume is 1.0")
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.dict(
+            os.environ, {"VOICESTUDIO_BASE_URL": ""}
+        ), patch.object(
+            vs.config, "voicestudio", {"base_url": "http://localhost:8780"}
+        ), patch.object(
+            vs.requests, "post", return_value=_FakeResponse()
+        ), patch.object(
+            vs, "AudioFileClip", return_value=_FakeClip()
+        ), patch.object(
+            vs.subprocess, "run", side_effect=_fake_run
+        ):
+            voice_file = str(Path(tmp_dir) / "vaudio.wav")
+            vs.voicestudio_tts(
+                text="Hello world.",
+                voice_preset="narrator",
+                voice_file=voice_file,
+                voice_volume=1.0,
+            )
+
+    def test_voicestudio_tts_rejects_zero_duration(self):
+        """When the response is valid audio but reports duration 0, the
+        pipeline must retry instead of returning a SubMaker with empty
+        cues that breaks downstream subtitle alignment."""
+        import subprocess
+
+        audio_bytes = b"\x00" * 4096
+
+        class _FakeResponse:
+            status_code = 200
+            content = audio_bytes
+            text = ""
+
+        class _ZeroClip:
+            duration = 0.0
+
+            def close(self):
+                pass
+
+        post_call_count = 0
+
+        def _fake_post(_url, **_kwargs):
+            nonlocal post_call_count
+            post_call_count += 1
+            return _FakeResponse()
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.dict(
+            os.environ, {"VOICESTUDIO_BASE_URL": ""}
+        ), patch.object(
+            vs.config, "voicestudio", {"base_url": "http://localhost:8780"}
+        ), patch.object(
+            vs.requests, "post", side_effect=_fake_post
+        ), patch.object(
+            vs, "AudioFileClip", return_value=_ZeroClip()
+        ), patch.object(
+            vs.subprocess, "run"
+        ):
+            voice_file = str(Path(tmp_dir) / "vaudio.wav")
+            result = vs.voicestudio_tts(
+                text="Hello world.",
+                voice_preset="narrator",
+                voice_file=voice_file,
+            )
+
+        # All 3 retries fire before giving up.
+        self.assertIsNone(result)
+        self.assertEqual(post_call_count, 3)
+
+    def test_voicestudio_tts_success(self):
+        # Real OmniVoice output is several KB of 24 kHz WAV per second; 4 KB
+        # here is large enough to clear the "empty or invalid audio data"
+        # guard but small enough to keep the test fast.
+        audio_bytes = b"\x00" * 4096
+
+        class _FakeResponse:
+            status_code = 200
+            content = audio_bytes
             text = ""
 
         class _FakeClip:
@@ -1672,7 +1818,7 @@ class TestVoiceStudioVoice(unittest.TestCase):
             json={"text": "Hello world. Second sentence.", "voice": "narrator"},
             timeout=1800,
         )
-        self.assertEqual(generated_audio, b"S" * 200)
+        self.assertEqual(generated_audio, audio_bytes)
         self.assertIsNotNone(sub_maker)
         self.assertTrue(getattr(sub_maker, "subs", []))
 

@@ -1,14 +1,13 @@
-"""运行实际 Streamlit 页面，验证 Kokoro 音色刷新、断线和配置切换。"""
+"""Run the real Streamlit page and verify Kokoro voice state changes."""
 
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 from streamlit.testing.v1 import AppTest
 
 from app.config import config
-from app.services import voice
+from app.services import version_checker, voice
 
 
 @pytest.fixture
@@ -19,6 +18,11 @@ def ui(monkeypatch):
                                               api_key="", model_id="kokoro", voices=[]))
     monkeypatch.setattr(config, "save_config", Mock())
     monkeypatch.setattr(config, "try_save_config", Mock(return_value=True))
+    monkeypatch.setattr(
+        version_checker,
+        "poll_available_update",
+        Mock(return_value=version_checker.UpdateCheckSnapshot(complete=True)),
+    )
     page = AppTest.from_file(str(Path(__file__).parents[2] / "webui/Main.py"), default_timeout=30)
     page.session_state["ui_language"] = "zh"
     return page
@@ -30,14 +34,14 @@ def selected_voice(page):
 
 
 def test_online_offline_recovery_retains_selection(monkeypatch, ui):
-    """真实 rerun 穿过一次成功、一次断线、恢复，不能把保存音色改为默认值。"""
+    """A disconnect and recovery must preserve the saved voice."""
     get = Mock(side_effect=[["kokoro:af_heart", "kokoro:zf_xiaobei"], [],
                            ["kokoro:af_heart", "kokoro:zf_xiaobei"]])
     monkeypatch.setattr(voice, "get_kokoro_voices", get)
     ui.run()
     assert selected_voice(ui).value == "kokoro:zf_xiaobei"
     ui.run()
-    assert get.call_count == 1  # 缓存期内不重复访问服务。
+    assert get.call_count == 1  # Do not query the service again while cached.
     ui.session_state["kokoro_voice_catalog"]["checked_at"] = -100
     ui.run()
     assert selected_voice(ui).value == "kokoro:zf_xiaobei"
@@ -73,11 +77,13 @@ def test_endpoint_or_credential_change_invalidates_cache(monkeypatch, ui, input_
 
 
 def test_manual_voices_and_clearing_them(monkeypatch, ui):
-    """手填音色立即使用；清空后自动发现，新版对象列表显示为简洁 ID。"""
+    """Use manual voices immediately and auto-discover after clearing them."""
     config.kokoro["voices"] = ["zf_xiaobei", "af_heart"]
-    get = Mock(return_value=SimpleNamespace(status_code=200, json=lambda: {
+    response = Mock(status_code=200)
+    response.json.return_value = {
         "voices": [{"id": "zf_xiaobei"}, {"id": "af_heart"}],
-    }))
+    }
+    get = Mock(return_value=response)
     monkeypatch.setattr(voice.requests, "get", get)
     ui.run()
     get.assert_not_called()

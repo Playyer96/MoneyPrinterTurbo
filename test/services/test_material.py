@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1547,6 +1548,57 @@ class TestWaveSpeedProvider(unittest.TestCase):
         }
         return item
 
+    def test_download_videos_wavespeed_pipelines_generation_with_download(self):
+        """Generation of clip N+1 must run while download of clip N is in
+        flight. The first dl and the second gen block on a 2-party barrier
+        so they can only make progress concurrently — sequential execution
+        would deadlock the first party until the 1-second barrier timeout
+        fires. The barrier is single-use; only the first dl call waits,
+        since by then gen2 has already arrived and the barrier is consumed.
+        """
+        import threading
+
+        rendezvous = threading.Barrier(2, timeout=1)
+        save_calls: list[str] = []
+        generated = {
+            "term-1": [self._generated_item("term-1", "https://cdn.example.com/1.mp4")],
+            "term-2": [self._generated_item("term-2", "https://cdn.example.com/2.mp4")],
+        }
+
+        def fake_generate(search_term, minimum_duration, video_aspect):
+            if search_term == "term-2":
+                # gen2 must arrive at the barrier while dl1 is also waiting.
+                rendezvous.wait()
+            return generated[search_term]
+
+        def fake_save_video(video_url, save_dir=""):
+            save_calls.append(video_url)
+            if len(save_calls) == 1:
+                # Only the first dl call waits. The barrier is single-use,
+                # so later dls proceed straight through without re-blocking.
+                rendezvous.wait()
+            return f"/tmp/{video_url.rsplit('/', 1)[-1]}"
+
+        with (
+            patch.dict(config.app, {"material_directory": ""}),
+            patch.object(
+                material, "generate_videos_wavespeed", side_effect=fake_generate
+            ),
+            patch.object(material, "save_video", side_effect=fake_save_video),
+        ):
+            result = material.download_videos(
+                task_id="test-wavespeed-pipeline",
+                search_terms=["term-1", "term-2"],
+                source="wavespeed",
+                audio_duration=10,
+                max_clip_duration=5,
+            )
+
+        # Passing the barrier proves dl1 and gen2 were running concurrently.
+        # A regression to fully-sequential execution would have left dl1
+        # waiting alone at the barrier until the 1s timeout fired.
+        self.assertEqual(result, ["/tmp/1.mp4", "/tmp/2.mp4"])
+
     def test_download_videos_wavespeed_generates_on_demand_and_stops(self):
         """
         生成按条计费,不能先为全部关键词生成再挑选。素材必须逐段按需生成,
@@ -1654,6 +1706,56 @@ class TestWaveSpeedProvider(unittest.TestCase):
 
         self.assertEqual(generate.call_count, 2)
         self.assertEqual(result, ["/tmp/wavespeed-2.mp4"])
+
+
+class TestMaterialParallelSearch(unittest.TestCase):
+    """Per-keyword stock searches used to run serially; verify they overlap."""
+
+    def test_searches_run_in_parallel(self):
+        # All N searches block on the same N-party barrier. If they ran
+        # sequentially the first one would block until the timeout fires.
+        rendezvous = threading.Barrier(3, timeout=1)
+        search_calls = []
+
+        def fake_search_videos(*_args, **_kwargs):
+            search_calls.append(1)
+            rendezvous.wait()
+            return []
+
+        item = material.MaterialInfo(
+            provider="pexels",
+            url="https://v.example/a.mp4",
+            duration=5,
+            source_info={"provider": "pexels", "asset_id": "a"},
+        )
+
+        with (
+            patch.dict(config.app, {"material_directory": ""}),
+            patch.object(
+                material, "search_videos_pexels", side_effect=fake_search_videos
+            ),
+            patch.object(material, "save_video", return_value="/tmp/a.mp4"),
+            patch.object(
+                material.material_cache,
+                "load_material_search_cache",
+                return_value=None,
+            ),
+            patch.object(material.material_cache, "save_material_search_cache"),
+            patch.object(
+                material.task_artifacts, "patch_script_data", return_value=True
+            ),
+        ):
+            material.download_videos(
+                task_id="parallel-search",
+                search_terms=["term-a", "term-b", "term-c"],
+                source="pexels",
+                audio_duration=5,
+                max_clip_duration=5,
+            )
+
+        # All three searches should have been dispatched; passing the barrier
+        # means the executor submitted them concurrently rather than serially.
+        self.assertEqual(len(search_calls), 3)
 
 
 if __name__ == "__main__":

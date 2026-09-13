@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import sys
 import tempfile
 import tomllib
@@ -326,6 +327,19 @@ class TestLLMConnection(unittest.TestCase):
 class TestLiteLLMProvider(unittest.TestCase):
     def setUp(self):
         self.original_app_config = dict(config.app)
+        # The on-disk LLM cache makes repeated runs of the same prompt
+        # return instantly from disk instead of going through the mocked
+        # provider. Wipe it so each test exercises the live code path.
+        try:
+            from app.utils import utils as _utils
+
+            cache_root = os.path.join(
+                _utils.storage_dir(create=True), "llm_cache"
+            )
+            if os.path.isdir(cache_root):
+                shutil.rmtree(cache_root)
+        except Exception:
+            pass
 
     def tearDown(self):
         config.app.clear()
@@ -1650,6 +1664,19 @@ class TestClaudeCodeProvider(unittest.TestCase):
         config.app["claude_code_model_name"] = ""
         config.app["claude_code_cli_path"] = ""
         config.app["claude_code_timeout"] = ""
+        # Same cache wipe as TestLiteLLMProvider: the on-disk LLM cache
+        # would short-circuit the mocked providers and assert_called_once
+        # would fire zero times.
+        try:
+            from app.utils import utils as _utils
+
+            cache_root = os.path.join(
+                _utils.storage_dir(create=True), "llm_cache"
+            )
+            if os.path.isdir(cache_root):
+                shutil.rmtree(cache_root)
+        except Exception:
+            pass
 
     def tearDown(self):
         config.app.clear()
@@ -2325,6 +2352,87 @@ class TestRetryWarningBoundary(unittest.TestCase):
             llm._max_retries - 1,
             "Warning must not fire on the final attempt — no further retry will occur",
         )
+
+
+class TestLlmInMemoryCache(unittest.TestCase):
+    """The LLM response cache layers an in-memory hit map over the disk
+    cache so hot prompts skip the disk read on repeat calls within a
+    single process. Disk writes still happen so a fresh process can
+    rehydrate the layer."""
+
+    def setUp(self):
+        # Make sure each test starts with a clean in-memory layer.
+        llm._LLM_HIT_CACHE.clear()
+
+    def test_second_call_does_not_open_disk_cache_file(self):
+        cache_dir = tempfile.mkdtemp(prefix="mpt-llm-cache-test-")
+        try:
+            with (
+                patch.object(llm.utils, "storage_dir", return_value=cache_dir),
+                patch.object(
+                    llm,
+                    "_response_cache_path",
+                    wraps=llm._response_cache_path,
+                ) as path_resolver,
+            ):
+                # Prime the disk + memory cache with one read.
+                llm._write_response_cache("openai", "gpt", "https://x", "prompt-A", "body-A")
+                llm._read_response_cache("openai", "gpt", "https://x", "prompt-A")
+
+                # Reset the call counter on the wrapped resolver so the next
+                # assertion only counts reads from the second call onwards.
+                original_path = path_resolver.call_args
+                path_resolver.reset_mock()
+
+                # Second call: must hit the in-memory layer and not
+                # re-resolve the cache file path.
+                result = llm._read_response_cache("openai", "gpt", "https://x", "prompt-A")
+
+            self.assertEqual(result, "body-A")
+            # If the in-memory layer is wired up, the path resolver is
+            # never called on a warm hit; a disk-only implementation would
+            # always re-resolve. ponytail: 0 calls = correct; >0 = regressed.
+            self.assertEqual(path_resolver.call_count, 0)
+        finally:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+
+    def test_in_memory_hit_expires_with_disk_ttl(self):
+        cache_dir = tempfile.mkdtemp(prefix="mpt-llm-cache-test-")
+        try:
+            with (
+                patch.object(llm.utils, "storage_dir", return_value=cache_dir),
+                patch.object(llm, "LLM_CACHE_TTL_SECONDS", 0),
+            ):
+                llm._write_response_cache("openai", "gpt", "https://x", "prompt-A", "body-A")
+                # TTL of 0 means the in-memory entry is stale on the next read.
+                self.assertIsNone(llm._read_response_cache("openai", "gpt", "https://x", "prompt-A"))
+        finally:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+
+    def test_in_memory_cache_evicts_when_full(self):
+        cache_dir = tempfile.mkdtemp(prefix="mpt-llm-cache-test-")
+        try:
+            llm._LLM_HIT_CACHE.clear()
+            # Force a tiny capacity so the test exercises eviction without
+            # having to write hundreds of entries.
+            original_max = llm._LLM_HIT_CACHE_MAX_SIZE
+            llm._LLM_HIT_CACHE_MAX_SIZE = 3
+            try:
+                with patch.object(llm.utils, "storage_dir", return_value=cache_dir):
+                    for index in range(5):
+                        llm._write_response_cache(
+                            "openai", "gpt", "https://x", f"prompt-{index}", f"body-{index}"
+                        )
+                        llm._read_response_cache(
+                            "openai", "gpt", "https://x", f"prompt-{index}"
+                        )
+                    # Capacity is 3; the first two entries must have been
+                    # evicted (FIFO) so the in-memory layer stays bounded.
+                    self.assertLessEqual(len(llm._LLM_HIT_CACHE), 3)
+            finally:
+                llm._LLM_HIT_CACHE_MAX_SIZE = original_max
+        finally:
+            shutil.rmtree(cache_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

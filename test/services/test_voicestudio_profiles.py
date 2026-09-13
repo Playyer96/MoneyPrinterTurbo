@@ -55,6 +55,12 @@ class TestProfileDiscovery(unittest.TestCase):
         self.assertIn("myclone", names)
         self.assertIn("narrator", names)
 
+    def test_presets_only_use_supported_omnivoice_instructions(self):
+        from omnivoice.models.omnivoice import _resolve_instruct
+
+        for instruct in server.VOICE_PRESETS.values():
+            self.assertEqual(instruct, _resolve_instruct(instruct))
+
 
 class TestProfileDeletion(unittest.TestCase):
     def setUp(self):

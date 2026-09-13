@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import unittest
@@ -39,10 +40,14 @@ class TestSubtitleService(unittest.TestCase):
 
     def test_create_returns_none_when_whisper_model_cannot_load(self):
         """A failed model download or init must return a failure result so the task layer can update status."""
-        with patch.object(subtitle, "model", None), patch.object(
-            subtitle,
-            "WhisperModel",
-            side_effect=RuntimeError("model unavailable"),
+        with (
+            patch.object(subtitle, "_has_cuda_whisper", return_value=True),
+            patch.object(subtitle, "model", None),
+            patch.object(
+                subtitle,
+                "WhisperModel",
+                side_effect=RuntimeError("model unavailable"),
+            ),
         ):
             self.assertIsNone(subtitle.create("audio.mp3"))
 
@@ -74,10 +79,14 @@ class TestSubtitleService(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             subtitle_file = Path(tmp_dir) / "generated.srt"
-            with patch.object(subtitle, "model", None), patch.object(
-                subtitle,
-                "WhisperModel",
-                _FakeWhisperModel,
+            with (
+                patch.object(subtitle, "_has_cuda_whisper", return_value=True),
+                patch.object(subtitle, "model", None),
+                patch.object(
+                    subtitle,
+                    "WhisperModel",
+                    _FakeWhisperModel,
+                ),
             ):
                 subtitle.create("audio.mp3", str(subtitle_file))
 
@@ -86,7 +95,7 @@ class TestSubtitleService(unittest.TestCase):
         self.assertEqual([item[2] for item in items], ["Hello world", "Again"])
 
     def test_create_word_level_writes_each_whisper_word_with_its_timing(self):
-        """逐词模式应保留 Whisper 的每个词及其独立起止时间。"""
+        """Word-level mode preserves each Whisper word and its timestamps."""
         transcribe_kwargs = {}
 
         class _FakeWhisperModel:
@@ -105,10 +114,14 @@ class TestSubtitleService(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             subtitle_file = Path(tmp_dir) / "word-level.srt"
-            with patch.object(subtitle, "model", None), patch.object(
-                subtitle,
-                "WhisperModel",
-                _FakeWhisperModel,
+            with (
+                patch.object(subtitle, "_has_cuda_whisper", return_value=True),
+                patch.object(subtitle, "model", None),
+                patch.object(
+                    subtitle,
+                    "WhisperModel",
+                    _FakeWhisperModel,
+                ),
             ):
                 subtitle.create(
                     "audio.mp3",
@@ -123,6 +136,54 @@ class TestSubtitleService(unittest.TestCase):
         self.assertIs(transcribe_kwargs["vad_filter"], True)
         self.assertIn("00:00:00,100 --> 00:00:00,400", items[0][1])
         self.assertIn("00:00:00,400 --> 00:00:00,800", items[1][1])
+
+    def test_create_word_level_writes_word_level_json_sidecar(self):
+        """Word-level mode must also write a JSON sidecar the real-time player
+        reads for karaoke-style highlighting without re-encoding the video."""
+
+        class _FakeWhisperModel:
+            def __init__(self, **_kwargs):
+                pass
+
+            def transcribe(self, _audio_file, **_kwargs):
+                words = [
+                    SimpleNamespace(start=0.1, end=0.4, word="Hello"),
+                    SimpleNamespace(start=0.4, end=0.8, word="world"),
+                ]
+                segment = SimpleNamespace(start=0.1, end=0.8, words=words)
+                info = SimpleNamespace(language="en", language_probability=0.99)
+                return [segment], info
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "word-level.srt"
+            with (
+                patch.object(subtitle, "_has_cuda_whisper", return_value=True),
+                patch.object(subtitle, "model", None),
+                patch.object(
+                    subtitle,
+                    "WhisperModel",
+                    _FakeWhisperModel,
+                ),
+            ):
+                subtitle.create(
+                    "audio.mp3",
+                    str(subtitle_file),
+                    word_level=True,
+                )
+
+            json_path = Path(tmp_dir) / "word-level.words.json"
+            self.assertTrue(json_path.exists())
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["language"], "en")
+            self.assertEqual(payload["version"], 1)
+            self.assertEqual(
+                [w["w"] for w in payload["words"]],
+                ["Hello", "world"],
+            )
+            self.assertEqual(
+                [(w["s"], w["e"]) for w in payload["words"]],
+                [(0.1, 0.4), (0.4, 0.8)],
+            )
 
     def test_correct_ignores_markdown_separator_lines(self):
         """
@@ -270,24 +331,26 @@ class TestSubtitleService(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             subtitle_file = Path(tmp_dir) / "subtitle.srt"
-            with patch.object(subtitle, "_remote_transcribe", return_value=remote), \
-                    patch.object(subtitle, "WhisperModel", None):
+            with (
+                patch.object(subtitle, "_remote_transcribe", return_value=remote),
+                patch.object(subtitle, "WhisperModel", None),
+            ):
                 subtitle.create("audio.mp3", str(subtitle_file))
             items = subtitle.file_to_subtitles(str(subtitle_file))
 
         self.assertEqual([item[2] for item in items], ["Hello world"])
 
-    def test_create_falls_back_to_local_model_when_remote_unavailable(self):
+    def test_create_skips_cpu_when_remote_gpu_is_unavailable(self):
         """
-        A dead or non-Mac GPU server must not break subtitles.
-
-        `_remote_transcribe` returns None on any failure, and `create()` then
-        follows the original local-model path -- here that path is unavailable,
-        so the pre-existing empty-string contract still holds.
+        A dead GPU server must not trigger a slow CPU model load.
         """
-        with patch.object(subtitle, "_remote_transcribe", return_value=None), \
-                patch.object(subtitle, "WhisperModel", None):
+        with (
+            patch.object(subtitle, "_remote_transcribe", return_value=None),
+            patch.object(subtitle, "_has_cuda_whisper", return_value=False),
+            patch.object(subtitle, "WhisperModel") as whisper_model,
+        ):
             self.assertEqual(subtitle.create("audio.mp3"), "")
+        whisper_model.assert_not_called()
 
     def test_remote_transcribe_returns_none_when_server_is_unreachable(self):
         """A connection error is a fallback signal, not an exception to propagate."""

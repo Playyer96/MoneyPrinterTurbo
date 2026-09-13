@@ -657,10 +657,12 @@ class TestTaskService(unittest.TestCase):
 
     def test_start_stops_before_materials_when_term_provider_fails(self):
         """
-        关键词 Provider 失败后，任务必须立即结束，不能继续生成音频或下载素材。
+        关键词 Provider 失败后，任务必须立即结束，不能继续下载素材。
 
         这里从任务入口覆盖完整的错误传播路径，避免未来只修服务层返回类型，
         却又在任务编排层把空列表转换成其它真值后继续执行外部请求。
+        Audio may have been scheduled in parallel and is harmless to discard
+        when terms fails — the safety property is "no material download".
         """
         params = VideoParams(
             video_subject="startup story",
@@ -680,13 +682,17 @@ class TestTaskService(unittest.TestCase):
         ):
             result = tm.start("term-provider-error", params)
 
-        generate_audio.assert_not_called()
         get_video_materials.assert_not_called()
         failed_task = state.get_task("term-provider-error")
         self.assertEqual(result, failed_task)
         self.assertEqual(failed_task["state"], tm.const.TASK_STATE_FAILED)
         self.assertEqual(failed_task["failed_stage"], "terms")
         self.assertTrue(failed_task["error"])
+        # Audio may have been submitted in parallel before terms failed; the
+        # important assertion is that the pipeline stopped before any expensive
+        # material step. generate_audio was either never called or was called
+        # exactly once (it is discarded without progressing the pipeline).
+        self.assertLessEqual(generate_audio.call_count, 1)
 
     def test_generate_audio_uses_custom_file_inside_task_directory(self):
         task_id = "test-custom-audio-safe"
@@ -977,6 +983,45 @@ class TestTaskService(unittest.TestCase):
         mark_task_failed.assert_called_once_with(
             task_id, "audio", "generated audio duration is zero"
         )
+
+    def test_generate_audio_skips_file_probe_for_non_real_word_providers(self):
+        # Non-real-word providers (Gemini, SiliconFlow, MiniMax, ...) populate
+        # sub_maker.duration with the actual rendered audio length, so the
+        # file probe is pure overhead. The skip is the largest wall-clock
+        # win for those providers on every audio stage (~500ms-1s each).
+        task_id = "test-tts-skip-file-probe"
+        task_dir = utils.task_dir(task_id)
+        audio_path = os.path.join(task_dir, "audio.mp3")
+        params = VideoParams(
+            video_subject="tts audio",
+            video_script="",
+            voice_name="test-voice",
+        )
+        # Real MagicMock autovivifies _has_real_word_timestamps as truthy,
+        # which routes to the file-probe path; explicitly set it to False
+        # to test the non-real-word branch.
+        sub_maker = MagicMock()
+        sub_maker._has_real_word_timestamps = False
+        sub_maker.duration = 7.4  # would round to 7; force a non-integer to catch math.ceil regressions
+
+        try:
+            with (
+                patch.object(tm.voice, "tts", return_value=sub_maker) as tts,
+                patch.object(
+                    tm.voice, "get_audio_duration"
+                ) as get_duration,
+            ):
+                audio_file, audio_duration, result_sub_maker = tm.generate_audio(
+                    task_id, params, "script"
+                )
+        finally:
+            shutil.rmtree(task_dir, ignore_errors=True)
+
+        self.assertEqual(audio_file, audio_path)
+        self.assertEqual(audio_duration, 8)  # ceil(7.4) = 8
+        self.assertIs(result_sub_maker, sub_maker)
+        tts.assert_called_once()
+        get_duration.assert_not_called()
 
     def test_generate_subtitle_uses_whisper_for_custom_audio_without_sub_maker(self):
         """

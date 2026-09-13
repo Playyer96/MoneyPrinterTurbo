@@ -269,14 +269,15 @@ class TestSearchFallback(unittest.TestCase):
         ):
             self.assertEqual(wr.search("anything", app_config={}), ddg_results)
 
-    def test_empty_searxng_result_falls_back_to_duckduckgo(self):
-        ddg_results = [{"title": "T", "url": "https://a.test/1", "snippet": "S"}]
+    def test_empty_searxng_result_does_not_repeat_the_same_search(self):
         with (
             patch.dict(os.environ, {"WEB_SEARCH_PROVIDER": "searxng"}),
             patch.object(wr, "_search_searxng", return_value=[]),
-            patch.object(wr, "_search_duckduckgo", return_value=ddg_results),
+            patch.object(wr, "_search_duckduckgo") as duckduckgo,
         ):
-            self.assertEqual(wr.search("anything", app_config={}), ddg_results)
+            self.assertEqual(wr.search("anything", app_config={}), [])
+
+        duckduckgo.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import importlib.util
+from array import array
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,17 +34,37 @@ class TestPickDevice(unittest.TestCase):
 
     def test_no_gpu_refuses_instead_of_silently_using_cpu(self):
         """The whole point: a containerised Mac must fail loudly, not crawl."""
-        with patch.dict(server.os.environ, {}, clear=False):
-            server.os.environ.pop("VOICESTUDIO_ALLOW_CPU", None)
+        with patch.dict(server.os.environ, {"VOICESTUDIO_ALLOW_CPU": "1"}):
             with self.assertRaises(RuntimeError) as ctx:
                 server._pick_device(_fake_torch(cuda=False, mps=False))
-        self.assertIn("mac-setup", str(ctx.exception))
+        self.assertIn("docker-compose.mac.yml", str(ctx.exception))
 
-    def test_cpu_allowed_when_explicitly_opted_in(self):
-        with patch.dict(server.os.environ, {"VOICESTUDIO_ALLOW_CPU": "1"}):
-            self.assertEqual(
-                server._pick_device(_fake_torch(cuda=False, mps=False))[0], "cpu"
-            )
+    @patch.object(server, "_load_model")
+    def test_warmup_loads_model_once_before_video_requests(self, load_model):
+        self.assertEqual(server.warmup(), {"ok": True})
+        load_model.assert_called_once_with()
+
+    @patch.object(server, "_load_model")
+    def test_generate_uses_better_default_quality_settings(self, load_model):
+        load_model.return_value.generate.return_value = [array("f", [0.0] * 240)]
+
+        response = server.generate_audio(
+            SimpleNamespace(text="Hello world", voice="narrator", speed=None)
+        )
+
+        self.assertEqual(response.media_type, "audio/wav")
+        self.assertTrue(response.body.startswith(b"RIFF"))
+        # 16 steps is the new default: noticeably better output than OmniVoice's
+        # 8-step greedy default at roughly 2x render time. Operators who need
+        # the fast path can still set OMNIVOICE_NUM_STEPS=8 in the env.
+        self.assertEqual(
+            load_model.return_value.generate.call_args.kwargs["num_step"], 16
+        )
+        # Position temperature > 0 keeps cloned voices from sounding flat.
+        self.assertEqual(
+            load_model.return_value.generate.call_args.kwargs["position_temperature"],
+            0.2,
+        )
 
 
 if __name__ == "__main__":

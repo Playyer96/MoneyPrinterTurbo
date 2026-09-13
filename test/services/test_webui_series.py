@@ -12,6 +12,16 @@ from app.services import llm
 
 @pytest.fixture
 def ui(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        "ui",
+        dict(
+            config.ui,
+            series_enabled=False,
+            series_parts=0,
+            series_continuity=True,
+        ),
+    )
     monkeypatch.setattr(config, "save_config", Mock())
     monkeypatch.setattr(config, "try_save_config", Mock(return_value=True))
     page = AppTest.from_file(

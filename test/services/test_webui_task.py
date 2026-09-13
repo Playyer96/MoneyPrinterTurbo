@@ -201,6 +201,9 @@ def test_completed_task_renders_subject_named_video_download(
         def error(self, _message):
             pass
 
+        def markdown(self, _body, **_kwargs):
+            pass
+
     video_path = tmp_path / "final-1.mp4"
     video_path.write_bytes(b"video-content")
     fake_st = FakeStreamlit()
@@ -216,6 +219,8 @@ def test_completed_task_renders_subject_named_video_download(
         "re": re,
         "st": fake_st,
         "tr": lambda key: key,
+        "urllib": __import__("urllib"),
+        "utils": __import__("app.utils.utils", fromlist=["utils"]),
         "_render_generation_logs": lambda _task_id: None,
     }
     module = ast.fix_missing_locations(ast.Module(body=selected_nodes, type_ignores=[]))

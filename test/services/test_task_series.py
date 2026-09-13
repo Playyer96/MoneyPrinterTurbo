@@ -1,4 +1,6 @@
 import sys
+import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -52,6 +54,20 @@ class TestSeriesOutline(unittest.TestCase):
         with patch.object(llm, "_generate_response", return_value="Error: no key"):
             self.assertEqual([], llm.generate_series_outline("beekeeping"))
 
+    def test_transient_provider_error_is_retried(self):
+        with (
+            patch.object(
+                llm,
+                "_generate_response_once",
+                side_effect=["Error: 503 UNAVAILABLE", "ready"],
+            ) as generate,
+            patch.object(llm, "sleep") as sleep,
+        ):
+            self.assertEqual("ready", llm._generate_response("prompt"))
+
+        self.assertEqual(2, generate.call_count)
+        sleep.assert_called_once_with(0.5)
+
 
 class TestSeriesPartParams(unittest.TestCase):
     def test_each_part_gets_its_own_subject_script_and_keywords(self):
@@ -91,6 +107,40 @@ class TestSeriesPartParams(unittest.TestCase):
         self.assertEqual("keep it funny", part.video_script_prompt)
 
 
+class TestFastSubtitlePath(unittest.TestCase):
+    def test_fast_pipeline_uses_tts_timeline_without_whisper(self):
+        params = VideoParams(video_subject="beekeeping", subtitle_enabled=True)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task_dir = Path(tmp_dir) / "task"
+            task_dir.mkdir()
+
+            def write_subtitle(*, subtitle_file, **kwargs):
+                Path(subtitle_file).write_text(
+                    "1\n00:00:00,000 --> 00:00:01,000\nBees\n",
+                    encoding="utf-8",
+                )
+
+            with (
+                patch.dict("os.environ", {"MPT_SKIP_PIPELINE_PREFLIGHT": "1"}),
+                patch.object(tm.utils, "task_dir", return_value=str(task_dir)),
+                patch.object(tm.voice, "has_real_word_timestamps", return_value=False),
+                patch.object(tm.voice, "create_subtitle", side_effect=write_subtitle),
+                patch.object(tm.subtitle, "create") as whisper,
+                patch.object(
+                    tm.subtitle,
+                    "file_to_subtitles",
+                    return_value=[(0, 1, "Bees")],
+                ),
+            ):
+                result = tm.generate_subtitle(
+                    "task", params, "Bees", object(), "audio.mp3"
+                )
+
+        self.assertTrue(result.endswith("subtitle.srt"))
+        whisper.assert_not_called()
+
+
 class TestRunSeries(unittest.TestCase):
     def setUp(self):
         self.states = []
@@ -119,7 +169,7 @@ class TestRunSeries(unittest.TestCase):
                 ("task-1/part-02", "two"),
                 ("task-1/part-03", "three"),
             ],
-            calls,
+            sorted(calls),
         )
         self.assertEqual(3, len(result["videos"]))
         self.assertEqual(["one", "two", "three"], result["series_outline"])
@@ -127,6 +177,26 @@ class TestRunSeries(unittest.TestCase):
         self.assertEqual(
             const.TASK_STATE_COMPLETE, self.states[-1][1]["state"]
         )
+
+    def test_runs_two_parts_concurrently_and_keeps_output_order(self):
+        params = _series_params(series_outline=["one", "two"])
+        gate = threading.Barrier(2)
+
+        def fake_pipeline(task_id, part_params, **kwargs):
+            gate.wait(timeout=2)
+            return {
+                "videos": [f"{task_id}/final-1.mp4"],
+                "script": part_params.video_subject,
+            }
+
+        with patch.object(tm, "_run_pipeline", side_effect=fake_pipeline):
+            result = tm._run_series("task-1", params)
+
+        self.assertEqual(
+            ["task-1/part-01/final-1.mp4", "task-1/part-02/final-1.mp4"],
+            result["videos"],
+        )
+        self.assertEqual("one\n\ntwo", result["script"])
 
     def test_a_failed_part_is_reported_but_the_others_still_render(self):
         params = _series_params(series_outline=["one", "two"])
