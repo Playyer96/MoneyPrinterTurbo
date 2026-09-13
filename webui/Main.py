@@ -6826,7 +6826,10 @@ def _render_audio_settings(panel, params):
 
             # Get the sound list based on the selected TTS server
             filtered_voices = []
-            saved_voice_name = config.ui.get("voice_name", "")
+            # Honour the operator-configured default voice when the WebUI
+            # hasn't pinned one. This lets a fresh install clone a VoiceStudio
+            # profile and adopt it via config.toml without touching code.
+            saved_voice_name = config.ui.get("voice_name", "") or config.default_voice_name
             elevenlabs_api_key_rendered = False
 
             if not tts_mode_enabled:

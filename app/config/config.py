@@ -558,6 +558,12 @@ chatterbox = _SynchronizedConfig(_cfg.get("chatterbox", {}))
 kokoro = _SynchronizedConfig(_cfg.get("kokoro", {}))
 fish_audio = _SynchronizedConfig(_cfg.get("fish_audio", {}))
 voicestudio = _SynchronizedConfig(_cfg.get("voicestudio", {}))
+
+# Default voice used when the WebUI/API doesn't pass one. An empty string
+# keeps the previous behaviour: fall through to Azure TTS. Set this in
+# config.toml (or via the VOICE_NAME env var) to e.g. "voicestudio:boy_voice"
+# once a cloned profile exists on the local VoiceStudio bridge.
+default_voice_name = str(_cfg.get("default_voice_name", "")).strip()
 ui = _SynchronizedConfig(
     _cfg.get(
         "ui",
