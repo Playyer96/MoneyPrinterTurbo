@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 import webbrowser
 from collections.abc import Mapping
 from datetime import datetime
@@ -66,14 +67,16 @@ from app.services import version_checker
 from app.utils.logging_utils import configure_terminal_logger
 from app.utils import utils
 
-# Auto-launch the bundled VoiceStudio (OmniVoice) server so the WebUI's
-# preview buttons work out of the box. The probe inside the helper makes the
-# call idempotent — a server already running externally is left alone, and
-# streamlit's hot-reload does not spawn a duplicate process. The boolean is
-# remembered so the preview pane can show an actionable hint when the
-# configured endpoint is still unreachable (e.g. macOS host server not yet
-# bootstrapped with `make mac-setup`).
-st.session_state["voicestudio_reachable"] = voice.ensure_voicestudio_server_running()
+# Only probe or launch VoiceStudio when it is the selected TTS provider.
+if (
+    config.ui.get("voice_mode", "tts") == "tts"
+    and config.ui.get("tts_server") == "voicestudio"
+):
+    st.session_state["voicestudio_reachable"] = (
+        voice.ensure_voicestudio_server_running()
+    )
+else:
+    st.session_state.setdefault("voicestudio_reachable", False)
 
 st.set_page_config(
     page_title="MoneyPrinterTurbo",
@@ -2085,43 +2088,15 @@ def _render_generation_logs(task_id):
 
 
 def _render_generation_task_snapshot(task_id, task):
-    """Render progress, failure reason, or final film based on snapshots in the state store."""
+    """Render task status, failure reason, or final film from the state store."""
     if not task:
         st.info(tr("Generating Video"))
         _render_generation_logs(task_id)
         return
 
     state = _normalize_task_state(task.get("state"))
-    progress = max(0, min(100, int(task.get("progress", 0) or 0)))
     if state == const.TASK_STATE_PROCESSING:
         st.info(tr("Generating Video"))
-        # When the pipeline is rendering a multi-chapter series, the parent
-        # task's progress curve only jumps between chapters and would leave
-        # the WebUI bar stuck inside a long chapter. The series pipeline
-        # writes ``current_part``/``total_parts``/``current_chapter`` as
-        # each chapter starts, so we surface that here as a "chapter X/Y"
-        # caption that follows the inner pipeline in real time.
-        current_part = task.get("current_part")
-        total_parts = task.get("total_parts")
-        current_chapter = str(task.get("current_chapter") or "").strip()
-        progress_text = f"{tr('Task Progress')}: {progress}%"
-        if (
-            current_part
-            and total_parts
-            and int(current_part) > 0
-            and int(total_parts) > 0
-        ):
-            progress_text = tr(
-                "Series Chapter Progress"
-            ).format(
-                current=int(current_part),
-                total=int(total_parts),
-                subject=current_chapter or "—",
-            )
-        st.progress(
-            progress,
-            text=progress_text,
-        )
         _render_generation_logs(task_id)
         return
 
@@ -2172,6 +2147,18 @@ def _render_generation_task_snapshot(task_id, task):
         # row keeps the original centred proportions for a single video and
         # stops the columns from shrinking into unplayable slivers.
         videos_per_row = 3
+        # The word-level subtitle JSON sidecar lives next to subtitle.srt in
+        # the task dir. When it exists, expose a "karaoke" link that opens
+        # the real-time subtitle player (resource/public/subtitle-player.html)
+        # so the user can preview the video with karaoke highlighting and
+        # tweak captions without re-encoding.
+        karaoke_words_url = (
+            f"/tasks/{task_id}/subtitle.words.json"
+            if os.path.isfile(
+                os.path.join(utils.task_dir(task_id), "subtitle.words.json")
+            )
+            else None
+        )
         for row_start in range(0, len(video_files), videos_per_row):
             row_videos = video_files[row_start : row_start + videos_per_row]
             player_cols = st.columns(len(row_videos) * 2 + 1)
@@ -2179,6 +2166,18 @@ def _render_generation_task_snapshot(task_id, task):
                 i = row_start + offset
                 with player_cols[offset * 2 + 1]:
                     st.video(url)
+                    if karaoke_words_url:
+                        player_href = (
+                            "/subtitle-player.html?video="
+                            + urllib.parse.quote(url, safe="/?&=:")
+                            + "&words="
+                            + urllib.parse.quote(karaoke_words_url, safe="/?&=:")
+                        )
+                        st.markdown(
+                            f"[🎤 karaoke preview]({player_href})",
+                            help="Open the real-time subtitle player "
+                            "to preview captions with word-level highlighting.",
+                        )
                     if not os.path.isfile(url):
                         logger.warning(
                             f"generated video is unavailable for download: "
@@ -5584,12 +5583,13 @@ def _render_video_settings(panel, params):
             _set_runtime_config("ui", "video_clip_speed", params.video_clip_speed)
             video_count_options = [1, 2, 3, 4, 5]
             params.video_count = stable_selectbox(
-                tr("Number of Videos Generated Simultaneously"),
+                tr("Variant Videos Count"),
                 options=video_count_options,
                 default_value=_saved_ui_choice(
                     "video_count", video_count_options, 1
                 ),
                 key="video_count_select",
+                help=tr("Variant Videos Count Help"),
             )
             _set_runtime_config("ui", "video_count", params.video_count)
 
@@ -5599,6 +5599,7 @@ def _render_video_settings(panel, params):
                 ("NVIDIA NVENC (h264_nvenc)", "h264_nvenc"),
                 ("AMD AMF (h264_amf)", "h264_amf"),
                 ("Intel QSV (h264_qsv)", "h264_qsv"),
+                ("Linux VAAPI (h264_vaapi)", "h264_vaapi"),
                 ("Windows MediaFoundation (h264_mf)", "h264_mf"),
                 ("macOS VideoToolbox (h264_videotoolbox)", "h264_videotoolbox"),
             ]
