@@ -1,0 +1,286 @@
+<!doctype html>
+<!--
+  Real-time subtitle player for MoneyPrinterTurbo.
+
+  Reads a video file and the word-level JSON sidecar written by
+  app/services/subtitle.py, then overlays karaoke-style captions at
+  playback time. The video itself is never re-encoded: every style
+  change (font, color, highlight, animation) is a CSS edit and an
+  instant browser repaint, not a minute-long ffmpeg pass.
+
+  Usage:
+    /subtitle-player.html?video=/tasks/<id>/final-1.mp4&words=/tasks/<id>/<file>.words.json
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Subtitle Player</title>
+  <style>
+    :root {
+      --caption-color: #ffffff;
+      --caption-highlight: #b8ff20;
+      --caption-stroke: rgba(0, 0, 0, 0.85);
+      --caption-bg: rgba(0, 0, 0, 0.35);
+      --caption-shadow: 0 2px 12px rgba(0, 0, 0, 0.6);
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #000;
+      color: #eee;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      min-height: 100vh;
+    }
+    .player {
+      position: relative;
+      max-width: 540px;
+      margin: 24px auto;
+      background: #000;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+    }
+    .player video {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: #000;
+    }
+    .caption-layer {
+      position: absolute;
+      left: 0; right: 0;
+      bottom: 14%;
+      padding: 0 12px;
+      pointer-events: none;
+      display: flex;
+      justify-content: center;
+    }
+    .caption-line {
+      max-width: 90%;
+      padding: 8px 14px;
+      border-radius: 8px;
+      background: var(--caption-bg);
+      text-align: center;
+      font-weight: 700;
+      line-height: 1.25;
+      font-size: clamp(20px, 5.5vw, 36px);
+      text-shadow: var(--caption-shadow);
+    }
+    .caption-line .word {
+      display: inline-block;
+      margin: 0 1px;
+      color: var(--caption-color);
+      -webkit-text-stroke: 0.6px var(--caption-stroke);
+      transition: color 80ms linear, transform 80ms linear;
+    }
+    .caption-line .word.active {
+      color: var(--caption-highlight);
+      transform: translateY(-2px) scale(1.06);
+      -webkit-text-stroke: 0;
+    }
+    .caption-line .word.spoken {
+      color: var(--caption-color);
+      opacity: 0.85;
+    }
+    .controls {
+      max-width: 540px;
+      margin: 0 auto 24px;
+      padding: 0 12px;
+      color: #aaa;
+      font-size: 13px;
+    }
+    .controls a { color: #7cf; text-decoration: none; }
+    .status {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: #1c1c1c;
+      margin-right: 8px;
+      font-variant-numeric: tabular-nums;
+    }
+    .status.ok { color: #6f6; }
+    .status.err { color: #f66; }
+  </style>
+</head>
+<body>
+  <div class="player">
+    <video id="video" controls playsinline preload="metadata"></video>
+    <div class="caption-layer">
+      <div class="caption-line" id="caption"></div>
+    </div>
+  </div>
+  <div class="controls">
+    <span class="status" id="status">loading…</span>
+    <span id="meta"></span>
+    &nbsp;·&nbsp;
+    <a href="#" id="replay">replay</a>
+  </div>
+
+  <script>
+  (function () {
+    "use strict";
+
+    var params = new URLSearchParams(location.search);
+    var videoUrl = params.get("video");
+    var wordsUrl = params.get("words");
+    var statusEl = document.getElementById("status");
+    var metaEl = document.getElementById("meta");
+    var captionEl = document.getElementById("caption");
+    var videoEl = document.getElementById("video");
+
+    function setStatus(text, kind) {
+      statusEl.textContent = text;
+      statusEl.className = "status " + (kind || "");
+    }
+
+    if (!videoUrl || !wordsUrl) {
+      setStatus("missing ?video= and ?words= params", "err");
+      return;
+    }
+
+    videoEl.src = videoUrl;
+
+    var data = null;
+    var cues = [];
+    var words = [];
+    var cueEls = []; // one DOM node per cue, populated lazily
+
+    function formatTime(t) {
+      var m = Math.floor(t / 60);
+      var s = (t - m * 60).toFixed(2);
+      return m + ":" + s.padStart(5, "0");
+    }
+
+    function buildCueDom(idx) {
+      var cue = cues[idx];
+      var line = document.createElement("div");
+      line.className = "caption-line";
+      // Each cue owns its word spans so we can highlight within it.
+      var wordIdxs = cue.wordIdxs;
+      var spans = new Array(wordIdxs.length);
+      for (var k = 0; k < wordIdxs.length; k++) {
+        var span = document.createElement("span");
+        span.className = "word";
+        span.textContent = words[wordIdxs[k]].w;
+        if (cue.text && cue.text !== "") {
+          // cue.text is the rendered phrase; spans hold the word list.
+          // When text differs (corrected / punctuated) we still show the
+          // spans -- the highlight stays word-level regardless.
+        }
+        line.appendChild(span);
+        if (k < wordIdxs.length - 1) line.appendChild(document.createTextNode(" "));
+        spans[k] = span;
+      }
+      captionEl.replaceChildren(line);
+      cueEls[idx] = { line: line, spans: spans };
+    }
+
+    function findCueIndex(t) {
+      // cues sorted by start; binary search for the largest start <= t.
+      var lo = 0, hi = cues.length - 1, ans = -1;
+      while (lo <= hi) {
+        var mid = (lo + hi) >> 1;
+        if (cues[mid].s <= t) { ans = mid; lo = mid + 1; }
+        else { hi = mid - 1; }
+      }
+      // also require end > t
+      if (ans >= 0 && cues[ans].e > t) return ans;
+      return -1;
+    }
+
+    var lastCue = -1;
+    var lastWord = -1;
+
+    function onTimeUpdate() {
+      var t = videoEl.currentTime;
+      var ci = findCueIndex(t);
+      if (ci !== lastCue) {
+        if (ci < 0) {
+          captionEl.replaceChildren();
+        } else if (cueEls[ci] === undefined) {
+          buildCueDom(ci);
+        } else {
+          captionEl.replaceChildren(cueEls[ci].line);
+        }
+        lastCue = ci;
+        lastWord = -1;
+      }
+      if (ci < 0) return;
+      var spans = cueEls[ci].spans;
+      var wordIdxs = cues[ci].wordIdxs;
+      // Find the word whose [s, e] window contains t.
+      var wi = -1;
+      for (var k = 0; k < wordIdxs.length; k++) {
+        var w = words[wordIdxs[k]];
+        if (t >= w.s && t < w.e) { wi = k; break; }
+      }
+      if (wi === lastWord) return;
+      for (var k2 = 0; k2 < spans.length; k2++) {
+        spans[k2].classList.toggle("active", k2 === wi);
+        spans[k2].classList.toggle("spoken", k2 < wi);
+      }
+      lastWord = wi;
+    }
+
+    function mapCuesToWords(cues, words) {
+      // For each cue, find the contiguous run of words whose [s,e] sits
+      // inside the cue's [s,e]. Words list is already flat and sorted.
+      var result = new Array(cues.length);
+      var wi = 0;
+      for (var ci = 0; ci < cues.length; ci++) {
+        var cue = cues[ci];
+        var idxs = [];
+        while (wi < words.length && words[wi].s < cue.e) {
+          if (words[wi].e > cue.s && words[wi].s < cue.e) idxs.push(wi);
+          // word entirely before the cue: skip
+          if (words[wi].e <= cue.s) { /* skip */ }
+          wi++;
+        }
+        // words are flat-sorted; wi may have stepped past cue.e. back it
+        // up to the first word whose start is >= cue.s so the next cue
+        // can re-scan from there.
+        while (wi > 0 && words[wi - 1].e > cue.s && words[wi - 1].s >= cue.e) {
+          wi--;
+        }
+        result[ci] = { s: cue.s, e: cue.e, text: cue.t, wordIdxs: idxs };
+      }
+      return result;
+    }
+
+    fetch(wordsUrl, { credentials: "same-origin" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("http " + r.status);
+        return r.json();
+      })
+      .then(function (j) {
+        data = j;
+        words = (j.words || []).slice().sort(function (a, b) { return a.s - b.s; });
+        var rawCues = (j.cues || []).map(function (c) {
+          return { s: +c.s, e: +c.e, t: c.t || "" };
+        });
+        cues = mapCuesToWords(rawCues, words);
+        setStatus(
+          "ready · " + cues.length + " cues · " + words.length + " words",
+          "ok"
+        );
+        metaEl.textContent =
+          "lang=" + (j.language || "?") +
+          " · preset=" + ((j.style && j.style.preset) || "custom") +
+          " · v" + (j.version || 1);
+        videoEl.addEventListener("timeupdate", onTimeUpdate);
+        videoEl.play().catch(function () { /* autoplay may be blocked */ });
+      })
+      .catch(function (err) {
+        setStatus("words json failed: " + err.message, "err");
+      });
+
+    document.getElementById("replay").addEventListener("click", function (e) {
+      e.preventDefault();
+      videoEl.currentTime = 0;
+      videoEl.play();
+    });
+  })();
+  </script>
+</body>
+</html>
