@@ -6,11 +6,11 @@ STATE_DIR="$REPO/.mpt-host"
 BIN_DIR="$STATE_DIR/bin"
 VENV_DIR="$STATE_DIR/venv"
 LOG_DIR="$REPO/storage/logs"
-VOICE_LABEL="com.moneyprinterturbo.voicestudio"
+VOICE_LABEL="com.moneyprinterturbo.omnivoice"
 FFMPEG_LABEL="com.moneyprinterturbo.ffmpeg-proxy"
 VOICE_PLIST="$STATE_DIR/$VOICE_LABEL.plist"
 FFMPEG_PLIST="$STATE_DIR/$FFMPEG_LABEL.plist"
-REQUIREMENTS="$REPO/vendor/voice_studio/requirements.txt"
+REQUIREMENTS="$REPO/vendor/omnivoice/requirements.txt"
 REQUIREMENTS_STAMP="$STATE_DIR/requirements.cksum"
 RUNTIME_STAMP="$STATE_DIR/runtime.cksum"
 
@@ -74,7 +74,7 @@ bootstrap_uv() {
 
 prepare_runtime() {
     mkdir -p "$BIN_DIR" "$LOG_DIR" "$STATE_DIR/models" "$STATE_DIR/voice_profiles"
-    legacy_profiles="$REPO/vendor/voice_studio/voice_profiles"
+    legacy_profiles="$REPO/vendor/omnivoice/voice_profiles"
     if [ -d "$legacy_profiles" ]; then
         cp -n "$legacy_profiles"/* "$STATE_DIR/voice_profiles/" 2>/dev/null || true
     fi
@@ -88,7 +88,7 @@ prepare_runtime() {
 
     if [ ! -x "$python_bin" ] || [ "$current_stamp" != "$installed_stamp" ]; then
         info "Preparing the cached Apple Silicon acceleration runtime"
-        UV_PYTHON_PREFERENCE=managed "$uv_bin" venv --python 3.11 "$VENV_DIR" >&2
+        UV_PYTHON_PREFERENCE=managed "$uv_bin" venv --python 3.11 --clear "$VENV_DIR" >&2
         "$uv_bin" pip install --python "$python_bin" -r "$REQUIREMENTS" >&2
         printf '%s\n' "$current_stamp" > "$REQUIREMENTS_STAMP"
     fi
@@ -118,12 +118,12 @@ write_plists() {
         "<key>Label</key><string>$VOICE_LABEL</string>" \
         '<key>ProgramArguments</key><array>' \
         "<string>$python_xml</string>" \
-        "<string>$repo_xml/vendor/voice_studio/server.py</string>" \
+        "<string>$repo_xml/vendor/omnivoice/server.py</string>" \
         '</array>' \
         '<key>EnvironmentVariables</key><dict>' \
-        '<key>VOICESTUDIO_HOST</key><string>0.0.0.0</string>' \
-        '<key>VOICESTUDIO_PORT</key><string>8780</string>' \
-        "<key>VOICESTUDIO_PROFILES_DIR</key><string>$state_xml/voice_profiles</string>" \
+        '<key>OMNIVOICE_HOST</key><string>0.0.0.0</string>' \
+        '<key>OMNIVOICE_PORT</key><string>8780</string>' \
+        "<key>OMNIVOICE_PROFILES_DIR</key><string>$state_xml/voice_profiles</string>" \
         "<key>HF_HOME</key><string>$state_xml/models</string>" \
         "<key>PATH</key><string>$bin_xml:/usr/bin:/bin:/usr/sbin:/sbin</string>" \
         '</dict>' \
@@ -131,8 +131,8 @@ write_plists() {
         '<key>RunAtLoad</key><true/>' \
         '<key>KeepAlive</key><true/>' \
         '<key>ProcessType</key><string>Interactive</string>' \
-        "<key>StandardOutPath</key><string>$repo_xml/storage/logs/voicestudio.log</string>" \
-        "<key>StandardErrorPath</key><string>$repo_xml/storage/logs/voicestudio.log</string>" \
+        "<key>StandardOutPath</key><string>$repo_xml/storage/logs/omnivoice.log</string>" \
+        "<key>StandardErrorPath</key><string>$repo_xml/storage/logs/omnivoice.log</string>" \
         '</dict></plist>' > "$VOICE_PLIST"
 
     printf '%s\n' \
@@ -180,7 +180,7 @@ start_services() {
     current_runtime=$(cksum \
         "$0" \
         "$REQUIREMENTS" \
-        "$REPO/vendor/voice_studio/server.py" \
+        "$REPO/vendor/omnivoice/server.py" \
         "$REPO/scripts/ffmpeg_mac_proxy.py" | cksum)
     installed_runtime=""
     if [ -f "$RUNTIME_STAMP" ]; then
@@ -202,7 +202,7 @@ start_services() {
     sleep 1
     launchctl bootstrap "$domain" "$VOICE_PLIST" >&2
     launchctl bootstrap "$domain" "$FFMPEG_PLIST" >&2
-    wait_for_health "http://127.0.0.1:8780/health" "VoiceStudio" 60
+    wait_for_health "http://127.0.0.1:8780/health" "OmniVoice" 60
     wait_for_health "http://127.0.0.1:8781/health" "FFmpeg VideoToolbox proxy" 20
     info "Warming the OmniVoice model on Apple Metal"
     curl -fsS -X POST http://127.0.0.1:8780/warmup >/dev/null || \
