@@ -47,6 +47,8 @@ from app.services.voice.providers import (  # noqa: F401  - re-exported
     gemini_tts,
     get_gemini_tts_models,
     get_minimax_voice_catalog,
+    get_minimax_tts_api_key,
+    get_minimax_tts_endpoint,
     get_edge_tts_timeout_seconds,
     _stream_edge_tts_sync_with_timeout,
     stream_edge_tts_chunks,

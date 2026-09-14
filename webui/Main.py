@@ -3264,15 +3264,290 @@ def _render_settings_dialog():
         # Key recovery writes back the configuration and clears the password control state and must be performed before rendering these controls below.
         _render_key_backup_settings(key_backup_panel)
 
-        # Middle Panel - LLM Setup
+        with middle_config_panel:
+            # Drop-down order, default label and stable provider id all come from Registry; locale
+            # Only the display copy is covered, and Main.py no longer maintains a second Provider list.
+            llm_provider_ids = [
+                provider.provider_id for provider in LLM_PROVIDER_REGISTRY
+            ]
+            llm_provider_labels = {
+                provider.provider_id: get_llm_provider_label(provider)
+                for provider in LLM_PROVIDER_REGISTRY
+            }
+            saved_llm_provider = config.app.get(
+                "llm_provider", DEFAULT_LLM_PROVIDER_ID
+            ).lower()
+            if saved_llm_provider not in llm_provider_ids:
+                saved_llm_provider = DEFAULT_LLM_PROVIDER_ID
 
-        settings_panels.render_llm_settings(
-            middle_config_panel,
-            tr=tr,
-            set_runtime_config=_set_runtime_config,
-            stable_selectbox=stable_selectbox,
-            localized_widget_key=localized_widget_key,
-        )
+            llm_provider = stable_selectbox(
+                tr("LLM Provider"),
+                options=llm_provider_ids,
+                default_value=saved_llm_provider,
+                key="llm_provider_select",
+                format_func=lambda provider_id: llm_provider_labels[provider_id],
+            )
+            # Display the configuration form and Provider description side by side, reducing line breaks in long descriptions in narrow columns.
+            # At the same time, make full use of the horizontal space of the basic settings panel.
+            llm_form_panel, llm_help_panel = st.columns(
+                [0.9, 1.1],
+                gap="large",
+                vertical_alignment="top",
+            )
+            llm_helper = llm_help_panel.container()
+            _set_runtime_config("app", "llm_provider", llm_provider)
+            llm_provider_spec = get_llm_provider(llm_provider)
+            if llm_provider_spec is None:
+                # Under normal circumstances, all drop-down options come from the Registry and will not enter this branch; reserved
+                # Explicit errors are used to diagnose corrupted session state or missed subsequent access.
+                raise RuntimeError(f"unsupported llm provider: {llm_provider}")
+
+            llm_api_key = config.app.get(llm_provider_spec.config_key("api_key"), "")
+            configured_llm_base_url = config.app.get(
+                llm_provider_spec.config_key("base_url"), ""
+            )
+            llm_default_base_url = llm_provider_spec.effective_default_base_url
+            llm_base_url = configured_llm_base_url or llm_default_base_url
+            llm_model_name = llm_provider_spec.resolve_model_name(
+                config.app.get(llm_provider_spec.config_key("model_name"), "")
+            )
+
+            provider_tip_context = {}
+            selected_service_endpoint = None
+            if llm_provider_spec.service_endpoints:
+                # Providers such as Kimi use different account systems for their Chinese and international sites. Only allow users
+                # Select the service area, and then use the Registry synchronization API to apply for the entrance and Base URL.
+                # Avoid manual assembly errors. If there is an empty Base URL configuration, the Chinese site will continue to be used. Only
+                # For new configurations that have not yet filled in the Key, the corresponding entry will be recommended based on the interface language.
+                selected_service_endpoint = (
+                    llm_provider_spec.select_service_endpoint(
+                        configured_llm_base_url,
+                        has_api_key=bool(str(llm_api_key).strip()),
+                        prefer_international=(
+                            st.session_state.get("ui_language", "en") != "zh"
+                        ),
+                    )
+                )
+                endpoint_options = [
+                    endpoint.endpoint_id
+                    for endpoint in llm_provider_spec.service_endpoints
+                ] + [CUSTOM_LLM_ENDPOINT_ID]
+                default_endpoint_id = (
+                    selected_service_endpoint.endpoint_id
+                    if selected_service_endpoint
+                    else CUSTOM_LLM_ENDPOINT_ID
+                )
+                endpoint_labels = {
+                    endpoint.endpoint_id: (
+                        tr_optional(
+                            llm_provider_spec.endpoint_label_key(endpoint.endpoint_id),
+                            fallback_language="en",
+                        )
+                        or endpoint.default_label
+                    )
+                    for endpoint in llm_provider_spec.service_endpoints
+                }
+                endpoint_labels[CUSTOM_LLM_ENDPOINT_ID] = (
+                    tr_optional("Custom API Endpoint", fallback_language="en")
+                    or "Custom API Endpoint"
+                )
+                with llm_form_panel:
+                    selected_endpoint_id = stable_selectbox(
+                        tr_optional(
+                            llm_provider_spec.endpoint_selector_label_key,
+                            fallback_language="en",
+                        )
+                        or tr("API Platform"),
+                        options=endpoint_options,
+                        default_value=default_endpoint_id,
+                        key=f"{llm_provider}_service_endpoint_select",
+                        format_func=lambda endpoint_id: endpoint_labels[endpoint_id],
+                        help=(
+                            tr_optional(
+                                llm_provider_spec.endpoint_selector_help_key,
+                                fallback_language="en",
+                            )
+                            or None
+                        ),
+                    )
+                selected_service_endpoint = next(
+                    (
+                        endpoint
+                        for endpoint in llm_provider_spec.service_endpoints
+                        if endpoint.endpoint_id == selected_endpoint_id
+                    ),
+                    None,
+                )
+                if selected_service_endpoint:
+                    llm_base_url = selected_service_endpoint.base_url
+                    provider_tip_context.update(
+                        {
+                            "api_key_url": selected_service_endpoint.api_key_url,
+                            "default_base_url": selected_service_endpoint.base_url,
+                            "model_docs_url": selected_service_endpoint.model_docs_url,
+                        }
+                    )
+                else:
+                    # Custom mode only retains addresses explicitly saved by the user and does not disguise a standard area
+                    # into a custom value. When the input is empty, the configuration will not be persisted and will return to the compatible default next time.
+                    llm_base_url = str(configured_llm_base_url or "").strip()
+
+            if llm_provider == "ollama":
+                llm_default_base_url = config.get_default_ollama_base_url()
+                if not llm_base_url:
+                    llm_base_url = llm_default_base_url
+                docker_hint = ""
+                if config.is_running_in_container():
+                    docker_hint = tr_optional(
+                        "llm_provider_tips.ollama.docker_hint",
+                        fallback_language="en",
+                    )
+                provider_tip_context["docker_hint"] = docker_hint
+
+            tips = get_llm_provider_tips(llm_provider, **provider_tip_context)
+            if tips:
+                with llm_helper:
+                    st.info(tips)
+
+            st_llm_api_key = llm_api_key
+            if llm_provider_spec.show_api_key:
+                st_llm_api_key = llm_form_panel.text_input(
+                    tr("API Key"),
+                    value=llm_api_key,
+                    type="password",
+                    key=f"{llm_provider}_api_key_input",
+                )
+
+            st_llm_base_url = llm_base_url
+            if llm_provider_spec.show_base_url:
+                st_llm_base_url = llm_form_panel.text_input(
+                    tr("Base Url"),
+                    value=llm_base_url,
+                    key=(
+                        f"{llm_provider}_base_url_"
+                        f"{selected_service_endpoint.endpoint_id}_input"
+                        if selected_service_endpoint
+                        else f"{llm_provider}_base_url_custom_input"
+                    ),
+                    disabled=selected_service_endpoint is not None,
+                )
+            st_llm_model_name = ""
+            if llm_provider == "groq":
+                effective_api_key = st_llm_api_key or llm_api_key
+                effective_base_url = st_llm_base_url or llm_base_url
+                groq_models = get_groq_model_ids(
+                    api_key=effective_api_key,
+                    base_url=effective_base_url,
+                )
+
+                if groq_models:
+                    selected_index = 0
+                    if llm_model_name in groq_models:
+                        selected_index = groq_models.index(llm_model_name)
+
+                    st_llm_model_name = llm_form_panel.selectbox(
+                        tr("Model Name"),
+                        options=groq_models,
+                        index=selected_index,
+                        key="groq_model_name_select",
+                    )
+                else:
+                    st_llm_model_name = llm_form_panel.text_input(
+                        tr("Model Name"),
+                        value=llm_model_name,
+                        key="groq_model_name_input",
+                    )
+                    if effective_api_key:
+                        llm_form_panel.caption(tr("Groq Model List Load Failed"))
+                    else:
+                        llm_form_panel.caption(
+                            tr("Groq API Key Required for Model List")
+                        )
+            else:
+                st_llm_model_name = llm_form_panel.text_input(
+                    tr("Model Name"),
+                    value=llm_model_name,
+                    key=f"{llm_provider}_model_name_input",
+                )
+            # The input box displays the Registry default value, but the configuration only saves the actual user override value.
+            # In this way, after the default model and Base URL are updated, uncustomized users can automatically follow them.
+            _set_runtime_config(
+                "app",
+                llm_provider_spec.config_key("api_key"),
+                st_llm_api_key,
+            )
+            _set_runtime_config(
+                "app",
+                llm_provider_spec.config_key("base_url"),
+                normalize_provider_override(
+                    st_llm_base_url,
+                    llm_default_base_url,
+                ),
+            )
+            _set_runtime_config(
+                "app",
+                llm_provider_spec.config_key("model_name"),
+                normalize_provider_override(
+                    st_llm_model_name,
+                    llm_provider_spec.default_model,
+                ),
+            )
+
+            # Provider-specific fields are also declared by the Registry. For example Cloudflare AI Gateway
+            # Account ID is required; there is no need to add judgment in Main.py when adding similar fields in the future.
+            for field in llm_provider_spec.extra_fields:
+                field_config_key = llm_provider_spec.config_key(field.config_suffix)
+                field_value = llm_form_panel.text_input(
+                    tr(field.label_key),
+                    value=(config.app.get(field_config_key, "") or field.default_value),
+                    type="password" if field.secret else "default",
+                    key=f"{llm_provider}_{field.config_suffix}_input",
+                )
+                _set_runtime_config(
+                    "app",
+                    field_config_key,
+                    normalize_provider_override(
+                        field_value,
+                        field.default_value,
+                    ),
+                )
+
+            if llm_form_panel.button(
+                tr("Test LLM Connection"),
+                key="test_llm_connection_button",
+                use_container_width=True,
+                type="secondary",
+                icon=":material/network_check:",
+            ):
+                with config.try_runtime_config_lock() as lock_acquired:
+                    if not lock_acquired:
+                        llm_form_panel.warning(tr("Runtime Configuration Busy"))
+                    else:
+                        with llm_form_panel.spinner(tr("Testing LLM Connection")):
+                            connection_ok, connection_error, connection_elapsed = (
+                                llm.test_connection()
+                            )
+
+                if not lock_acquired:
+                    connection_ok = None
+                elif connection_ok:
+                    llm_form_panel.success(
+                        tr("LLM Connection Test Succeeded").format(
+                            provider=llm_provider_labels[llm_provider],
+                            model=st_llm_model_name or "-",
+                            elapsed=f"{connection_elapsed:.2f}",
+                        )
+                    )
+                else:
+                    connection_error = format_llm_connection_error(
+                        llm_provider,
+                        st_llm_base_url,
+                        connection_error,
+                    )
+                    llm_form_panel.error(
+                        tr("LLM Connection Test Failed").format(error=connection_error)
+                    )
+
         # Right panel - API key settings
         settings_panels.render_material_settings(
             right_config_panel,
@@ -3280,14 +3555,10 @@ def _render_settings_dialog():
             set_runtime_config=_set_runtime_config,
             get_material_api_keys=_get_material_api_keys,
             save_material_api_keys=_save_material_api_keys,
+            stable_selectbox=stable_selectbox,
         )
 
     _save_runtime_config()
-
-
-# -----------------------------------------------------------------------------
-# Main generation form: copywriting, video, audio and subtitle panels
-# -----------------------------------------------------------------------------
 
 
 def _create_loomloom_script_backend():
@@ -5583,250 +5854,6 @@ def _sync_elevenlabs_api_key_input():
     return entered_key
 
 
-def _render_elevenlabs_api_key_input(label_key):
-    """
-    Rendering the unique API Key input state that ElevenLabs TTS shares with the soundtrack.
-
-    If two widget keys are used for TTS and soundtrack on the same page, Streamlit will retain the old values ​​respectively.
-    Post-rendered input boxes also override the shared configuration. A key is used here and environment variables are processed centrally.
-    Backfilling, configuration updates, and sound cache invalidation ensure that interface display and background tasks always read the same value.
-    """
-    _sync_elevenlabs_api_key_input()
-    return st.text_input(
-        tr(label_key),
-        type="password",
-        key="elevenlabs_api_key_input",
-    ).strip()
-
-
-def _render_background_music_settings(params, elevenlabs_api_key_rendered=False):
-    """Render the background music source and volume settings, and return the uploaded file to be saved this time."""
-    uploaded_bgm_file = None
-    previous_bgm_type = st.session_state.get("last_rendered_bgm_type")
-    st.divider()
-    bgm_options = [
-        (tr("No Background Music"), ""),
-        (tr("Random Background Music"), "random"),
-        (tr("Preset Song"), "preset"),
-        (tr("Custom Background Music"), "custom"),
-        (tr("Sonilo Background Music"), "sonilo"),
-        (tr("ElevenLabs Background Music"), "elevenlabs"),
-    ]
-    selected_bgm_type = stable_selectbox(
-        tr("Background Music Source"),
-        options=[value for _, value in bgm_options],
-        default_value=_saved_ui_choice(
-            "bgm_type",
-            [value for _, value in bgm_options],
-            "random",
-        ),
-        key="bgm_type_select",
-        format_func=lambda value: dict((v, label) for label, v in bgm_options)[value],
-    )
-    params.bgm_type = selected_bgm_type
-    _set_runtime_config("ui", "bgm_type", params.bgm_type)
-    background_music.render_api_key_control(
-        params.bgm_type,
-        tr=tr,
-        set_runtime_config=_set_runtime_config,
-        render_elevenlabs_api_key_input=_render_elevenlabs_api_key_input,
-        elevenlabs_api_key_rendered=elevenlabs_api_key_rendered,
-    )
-
-    bgm_volume_options = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-    params.bgm_volume = stable_selectbox(
-        tr("Background Music Volume"),
-        options=bgm_volume_options,
-        default_value=_saved_ui_choice("bgm_volume", bgm_volume_options, 0.2),
-        key="bgm_volume_select",
-        format_func=lambda value: f"{int(value * 100)}%",
-        disabled=not params.bgm_type,
-    )
-    _set_runtime_config("ui", "bgm_volume", params.bgm_volume)
-    bgm_enabled = bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
-
-    if params.bgm_type == "custom":
-        uploaded_bgm_file = st.file_uploader(
-            tr("Upload Background Music"),
-            type=[
-                extension.removeprefix(".")
-                for extension in bgm_service.SUPPORTED_BGM_EXTENSIONS
-            ],
-            accept_multiple_files=False,
-            key="custom_bgm_uploader",
-            help=tr("Upload Background Music Help"),
-        )
-        if uploaded_bgm_file is not None and bgm_enabled:
-            try:
-                safe_name = bgm_service.sanitize_upload_filename(uploaded_bgm_file.name)
-                # Streamlit will re-execute the page after adjusting any controls such as volume. Use content hashing
-                # Differentiate uploaded files and cache the complete decoding results in the current session. You can neither rely on the same name,
-                # Misuse of old results for files of the same size also avoids calling FFmpeg repeatedly for each rerun.
-                validation_key = (
-                    safe_name,
-                    uploaded_bgm_file.size,
-                    hashlib.sha256(uploaded_bgm_file.getbuffer()).hexdigest(),
-                )
-                cached_validation = st.session_state.get("custom_bgm_validation")
-                if (
-                    not cached_validation
-                    or cached_validation.get("key") != validation_key
-                ):
-                    try:
-                        bgm_service.validate_bgm_upload(
-                            uploaded_bgm_file.name, uploaded_bgm_file
-                        )
-                    except bgm_service.BgmUploadError as exc:
-                        cached_validation = {
-                            "key": validation_key,
-                            "error": str(exc),
-                            "error_type": "upload",
-                        }
-                        # The failed results of the same file fingerprint will be entered into the session cache, so here only
-                        # Record it once when the verification is actually executed for the first time to avoid rerun of ordinary controls and refresh the screen.
-                        logger.warning(
-                            "WebUI background music validation rejected: "
-                            f"name={safe_name}, error={str(exc)}"
-                        )
-                    except bgm_service.BgmServiceError as exc:
-                        cached_validation = {
-                            "key": validation_key,
-                            "error": str(exc),
-                            "error_type": "service",
-                        }
-                        logger.error(
-                            "WebUI background music validation failed: "
-                            f"name={safe_name}, error={str(exc)}"
-                        )
-                    else:
-                        cached_validation = {
-                            "key": validation_key,
-                            "error": "",
-                            "error_type": "",
-                        }
-                    st.session_state["custom_bgm_validation"] = cached_validation
-
-                if cached_validation.get("error"):
-                    if cached_validation.get("error_type") == "service":
-                        raise bgm_service.BgmServiceError(cached_validation["error"])
-                    raise bgm_service.BgmUploadError(cached_validation["error"])
-            except bgm_service.BgmUploadError:
-                # Illegal files cannot inherit the name of the last valid upload, otherwise the task parameters may still point to
-                # Historical BGM. Keep the UploadedFile return value so that it will still be finalized when the user clicks Generate
-                # The server verifies the interception instead of silently generating a video without background music.
-                params.bgm_file = ""
-                st.error(tr("Invalid Background Music"))
-            except bgm_service.BgmServiceError:
-                params.bgm_file = ""
-                st.error(tr("Background Music Validation Failed"))
-            else:
-                # The player and "Ready" will be displayed only after the complete decoding verification is passed. Files are still only clicking
-                # Persisted on build, user merely previewing or subsequently removing files does not pollute storage/bgm.
-                uploaded_mime_type = str(getattr(uploaded_bgm_file, "type", "") or "")
-                preview_mime_type = (
-                    uploaded_mime_type
-                    if uploaded_mime_type.startswith("audio/")
-                    else mimetypes.guess_type(safe_name)[0] or "audio/mpeg"
-                )
-                st.audio(uploaded_bgm_file, format=preview_mime_type)
-                st.info(f"{tr('Background Music Ready')}: {safe_name}")
-                params.bgm_file = safe_name
-
-        # Streamlit cleans up the widget state of a conditional widget when it is temporarily not rendering.
-        # Use the persisted value to restore when switching back from other BGM sources; under the same source
-        # The previous_bgm_type does not change when the user actively clears it, so it will not be bounced by the old value.
-        if previous_bgm_type != "custom":
-            st.session_state["custom_bgm_file_input"] = _saved_ui_text(
-                "custom_bgm_file"
-            )
-        custom_bgm_file = st.text_input(
-            tr("Custom Background Music File"),
-            key="custom_bgm_file_input",
-            disabled=uploaded_bgm_file is not None,
-        )
-        _set_runtime_config(
-            "ui", "custom_bgm_file", custom_bgm_file.strip()
-        )
-        if uploaded_bgm_file is None and custom_bgm_file and bgm_enabled:
-            # The file name is mapped to storage/bgm or resource/songs by the service layer and then verified.
-            # The UI does not accept any paths outside of the two whitelisted directories.
-            params.bgm_file = custom_bgm_file.strip()
-        elif not bgm_enabled:
-            # The upload control continues to retain the files selected by the user, and the next rerun after turning up the volume will automatically
-            # Complete verification; the current task parameters must be cleared to prevent the 0 volume task from saving or parsing the file.
-            params.bgm_file = ""
-
-    if params.bgm_type == "preset":
-        # The service layer has uniformly completed extension, temporary file and symbolic link verification. Directly reuse it here
-        # As a result, the UI is prevented from maintaining a second set of enumeration rules, and differences will not occur when subsequent formats are added.
-        available_song_paths = bgm_service.list_builtin_bgm_files()
-        songs_by_name = {
-            os.path.basename(song_path): song_path for song_path in available_song_paths
-        }
-        available_songs = list(songs_by_name)
-        if not available_songs:
-            st.warning(tr("No Background Music Available"))
-            params.bgm_file = ""
-        else:
-            default_preset_song = _saved_ui_text("preset_song", available_songs[0])
-            requested_preset_song = st.session_state.get(
-                localized_widget_key("preset_song_select"), default_preset_song
-            )
-            if requested_preset_song not in available_songs:
-                # Settings exported from historical missions or other versions may reference songs that do not exist in the current installation.
-                # After a clear prompt, stable_selectbox will revert to the first song to avoid silently changing songs.
-                st.warning(tr("Selected Background Music Unavailable"))
-            selected_song = stable_selectbox(
-                tr("Preset Song"),
-                options=available_songs,
-                default_value=(
-                    default_preset_song
-                    if default_preset_song in available_songs
-                    else available_songs[0]
-                ),
-                key="preset_song_select",
-            )
-            _set_runtime_config("ui", "preset_song", selected_song)
-            # Online listening is provided immediately after the user selects the song. The player reads the data just passed through the service layer
-            # The real path obtained by whitelist verification does not accept any file path entered on the page.
-            selected_song_path = songs_by_name[selected_song]
-            preview_mime_type = (
-                mimetypes.guess_type(selected_song_path)[0] or "audio/mpeg"
-            )
-            preview_available = True
-            try:
-                # When Streamlit fails to read the path, it will wrap OSError into an internal exception, resulting in the following
-                # Unable to handle by file error. Read the bytes yourself first, which not only maintains the player behavior, but also allows
-                # Docker mounts that temporarily fail, permissions change, and other situations fall steadily into controllable branches.
-                selected_song_bytes = Path(selected_song_path).read_bytes()
-            except OSError as exc:
-                preview_available = False
-                # Files may be deleted by other processes after enumeration. If the audition fails, the page or video cannot be interrupted.
-                # Parameter editing, but logs need to be kept to locate running environment and mounting problems.
-                logger.warning(
-                    "failed to preview preset background music: "
-                    f"name={selected_song}, error={str(exc)}"
-                )
-                st.warning(tr("Background Music Preview Failed"))
-            else:
-                st.audio(selected_song_bytes, format=preview_mime_type)
-            if bgm_enabled and preview_available:
-                params.bgm_file = selected_song
-            else:
-                params.bgm_file = ""
-
-    background_music.render_music_prompt(
-        params,
-        previous_bgm_type,
-        bgm_enabled,
-        tr=tr,
-        saved_ui_text=_saved_ui_text,
-        set_runtime_config=_set_runtime_config,
-    )
-    st.session_state["last_rendered_bgm_type"] = params.bgm_type
-    return uploaded_bgm_file
-
-
 def _render_audio_settings(panel, params):
     """Render audio settings and return uploaded audio and current dubbing mode."""
     with panel:
@@ -6183,8 +6210,10 @@ def _render_audio_settings(panel, params):
                 selected_tts_server == "elevenlabs"
                 or (voice_name and voice.is_elevenlabs_voice(voice_name))
             ):
-                _render_elevenlabs_api_key_input(
+                background_music.render_elevenlabs_api_key_input(
                     "ElevenLabs API Key",
+                    tr=tr,
+                    sync_elevenlabs_api_key_input=_sync_elevenlabs_api_key_input,
                 )
                 elevenlabs_api_key_rendered = True
 
@@ -6345,9 +6374,16 @@ def _render_audio_settings(panel, params):
                             "Custom audio will be used directly. TTS synthesis will be skipped for this task."
                         )
                     )
-            uploaded_bgm_file = _render_background_music_settings(
+            uploaded_bgm_file = background_music.render_background_music_settings(
                 params,
                 elevenlabs_api_key_rendered=elevenlabs_api_key_rendered,
+                tr=tr,
+                set_runtime_config=_set_runtime_config,
+                saved_ui_choice=_saved_ui_choice,
+                saved_ui_text=_saved_ui_text,
+                stable_selectbox=stable_selectbox,
+                localized_widget_key=localized_widget_key,
+                render_elevenlabs_api_key_input=background_music.render_elevenlabs_api_key_input,
             )
     return uploaded_audio_file, uploaded_bgm_file, voice_mode
 

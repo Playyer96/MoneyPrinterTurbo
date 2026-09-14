@@ -53,7 +53,7 @@ def _running_app(harness, *, saved_video_source="pexels"):
         patch.object(config, "try_save_config", return_value=True),
         patch.object(
             voice,
-            "get_all_azure_voices",
+            "get_all_edge_voices",
             return_value=["en-US-JennyNeural-Female"],
         ),
     ):

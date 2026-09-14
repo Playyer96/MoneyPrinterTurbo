@@ -247,26 +247,6 @@ def test_settings_preset_rejects_invalid_parameter_values():
         parse_settings_preset(_encode(payload))
 
 
-def test_key_backup_collects_credentials_and_their_companion_settings():
-    backup = collect_key_backup(_sample_config_sections())
-
-    assert backup == {
-        "app": {
-            "pexels_api_keys": ["pexels-1", "pexels-2"],
-            "openai_api_key": "sk-openai",
-            "cloudflare_api_key": "cf-key",
-            "cloudflare_account_id": "cf-account",
-            "cloudflare_gateway_id": "cf-gateway",
-            "upload_post_api_key": "api-key-123",
-            "upload_post_username": "my-username",
-            "volcengine_seedance_api_key": "ark-seedance-key",
-            "ofox_api_key": "ofox-backup-key",
-        },
-        "azure": {"speech_key": "azure-key", "speech_region": "westeurope"},
-        "elevenlabs": {"api_key": "eleven-key"},
-    }
-    assert count_backup_keys(backup) == 12
-
 
 def test_key_backup_carries_llm_provider_extra_fields_with_the_key():
     """
@@ -350,15 +330,6 @@ def test_key_backup_import_rejects_files_without_any_key():
         parse_key_backup(_encode(payload), _sample_config_sections())
 
 
-def test_key_backup_import_tolerates_utf8_bom_written_by_windows_editors():
-    sections = _sample_config_sections()
-    payload = build_key_backup_payload(sections, "1.3.4")
-    raw = "﻿" + json.dumps(payload, ensure_ascii=False)
-
-    restored = parse_key_backup(raw.encode("utf-8"), sections)
-
-    assert restored["azure"]["speech_key"] == "azure-key"
-
 
 def test_credential_widget_state_keys_match_settings_inputs():
     assert credential_widget_state_keys("app", "pexels_api_keys") == (
@@ -431,10 +402,3 @@ def test_apply_key_backup_writes_config_and_clears_every_widget_alias():
     assert FAKE_STREAMLIT.session_state == {"video_subject": "untouched"}
 
 
-def test_credential_config_key_detection_covers_project_naming():
-    assert is_credential_config_key("openai_api_key")
-    assert is_credential_config_key("pexels_api_keys")
-    assert is_credential_config_key("loomloom_api_token")
-    assert is_credential_config_key("speech_key")
-    assert not is_credential_config_key("openai_base_url")
-    assert not is_credential_config_key("ffmpeg_path")

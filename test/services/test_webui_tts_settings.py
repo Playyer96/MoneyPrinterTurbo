@@ -27,7 +27,6 @@ TTS_API_KEY_LABELS = {
 }
 
 TTS_PROVIDER_WIDGETS = {
-    "azure-tts-v2": ("azure_speech_key_input", "Speech Key"),
     "siliconflow": ("siliconflow_api_key_input", "SiliconFlow API Key"),
     "gemini-tts": ("gemini_tts_api_key_input", "Gemini API Key"),
     "mimo-tts": ("mimo_tts_api_key_input", "MiMo API Key"),
@@ -76,7 +75,7 @@ def test_tts_provider_inputs_render_the_standardized_labels():
     with (
         patch.object(config, "ui", test_ui),
         patch.object(config, "save_config"),
-        patch.object(voice, "get_all_azure_voices", return_value=[]),
+        patch.object(voice, "get_all_edge_voices", return_value=[]),
         patch.object(voice, "get_siliconflow_voices", return_value=[]),
         patch.object(voice, "get_gemini_voices", return_value=[]),
         patch.object(voice, "get_mimo_voices", return_value=[]),
