@@ -165,6 +165,16 @@ class VideoParams(BaseModel):
     bgm_type: Optional[str] = "random"
     bgm_file: Optional[str] = ""
     bgm_volume: Optional[float] = 0.2
+    # When True, the source video clip's audio track is preserved in the final
+    # mix instead of being stripped. Combine with the existing voice_name /
+    # bgm_type fields to compose: voice-over-original, BGM-under-original,
+    # or original-only (no voiceover, no BGM). Default False preserves the
+    # original "voice + optional BGM, source audio discarded" behaviour.
+    keep_original_audio: bool = False
+    # Volume scale applied to the preserved source audio track. Honoured
+    # only when ``keep_original_audio`` is True. Defaults to 1.0 so the
+    # original audio plays at its native level.
+    original_audio_volume: float = Field(default=1.0, ge=0.0)
     # Shared music prompt across video music providers; new WebUI tasks always
     # write this field. The Sonilo-specific field below stays for compatibility
     # with old task records and the existing CLI argument.

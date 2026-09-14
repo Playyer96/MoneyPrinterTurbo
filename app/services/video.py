@@ -3387,14 +3387,36 @@ def generate_video(
     # failure, and on a write failure -- which above all keeps files from
     # staying locked on Windows.
     with ExitStack() as clip_stack:
+        # When ``keep_original_audio`` is set, the source clip's audio is
+        # preserved and mixed into the final track alongside the voiceover
+        # and any BGM. Otherwise the source audio is discarded at open
+        # time so only the narration (and optional BGM) reaches the output.
+        keep_original_audio = bool(
+            getattr(params, "keep_original_audio", False)
+        )
+        original_audio_volume = float(
+            getattr(params, "original_audio_volume", 1.0) or 0.0
+        )
         source_video_clip = clip_stack.enter_context(
-            _open_video_clip_quietly(video_path)
+            _open_video_clip_quietly(video_path, audio=keep_original_audio)
         )
         voice_source_clip = clip_stack.enter_context(AudioFileClip(audio_path))
         video_clip = source_video_clip
-        audio_clip = voice_source_clip.with_effects(
-            [afx.MultiplyVolume(params.voice_volume)]
-        )
+        audio_streams = [
+            voice_source_clip.with_effects(
+                [afx.MultiplyVolume(params.voice_volume)]
+            )
+        ]
+        if (
+            keep_original_audio
+            and source_video_clip.audio is not None
+            and original_audio_volume > 0
+        ):
+            audio_streams.append(
+                source_video_clip.audio.with_effects(
+                    [afx.MultiplyVolume(original_audio_volume)]
+                )
+            )
 
         def make_textclip(text):
             return TextClip(
@@ -3462,6 +3484,7 @@ def generate_video(
                 )
             )
         bgm_mix_succeeded = True
+        bgm_clip = None
         if bgm_file:
             try:
                 bgm_effects = [
@@ -3477,7 +3500,6 @@ def generate_video(
                     bgm_effects.append(afx.AudioLoop(duration=video_clip.duration))
                 bgm_source_clip = clip_stack.enter_context(AudioFileClip(bgm_file))
                 bgm_clip = bgm_source_clip.with_effects(bgm_effects)
-                audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
             except Exception:
                 bgm_mix_succeeded = False
                 # log the full stack and stable context so a file-decoding
@@ -3488,6 +3510,13 @@ def generate_video(
                     f"failed to mix background music: type={params.bgm_type}, "
                     f"file={bgm_file}"
                 )
+        if bgm_clip is not None:
+            audio_streams.append(bgm_clip)
+
+        if len(audio_streams) > 1:
+            audio_clip = CompositeAudioClip(audio_streams)
+        else:
+            audio_clip = audio_streams[0]
 
         final_video_clip = video_clip.with_audio(audio_clip)
         clip_stack.callback(final_video_clip.close)

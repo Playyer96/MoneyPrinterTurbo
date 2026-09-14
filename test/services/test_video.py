@@ -1886,5 +1886,186 @@ class TestCreateTitleClipHonorsUserSettings(unittest.TestCase):
         mock_logger.warning.assert_called()
 
 
+class TestKeepOriginalAudio(unittest.TestCase):
+    """``keep_original_audio`` lets the user preserve the source clip's audio
+    instead of always stripping it. These tests assert the wire-up without
+    encoding real videos."""
+
+    def setUp(self):
+        self.original_app_config = dict(config.app)
+        vd._runtime_disabled_video_codecs.clear()
+
+    def tearDown(self):
+        config.app.clear()
+        config.app.update(self.original_app_config)
+        vd._runtime_disabled_video_codecs.clear()
+
+    def _params(self, **overrides):
+        base = dict(
+            video_subject="test",
+            subtitle_enabled=False,
+            voice_volume=1.0,
+            bgm_type="",
+            bgm_volume=0.0,
+        )
+        base.update(overrides)
+        return vd.VideoParams(**base)
+
+    def test_keep_original_audio_opens_source_with_audio_true(self):
+        """The source clip must be opened with ``audio=True`` so its track is
+        available to the composite mixer."""
+        source_video = _FakeMoviePyClip()
+        source_video.audio = _FakeMoviePyClip()
+        params = self._params(keep_original_audio=True, original_audio_volume=1.0)
+
+        with (
+            patch.object(vd, "_open_video_clip_quietly", return_value=source_video) as open_clip,
+            patch.object(vd, "AudioFileClip", return_value=_FakeMoviePyClip()),
+            patch.object(vd, "CompositeAudioClip", return_value=_FakeMoviePyClip()),
+            patch.object(vd, "_write_videofile_with_codec_fallback"),
+            patch.object(vd, "_get_configured_video_codec", return_value="libx264"),
+        ):
+            vd.generate_video(
+                video_path="combined.mp4",
+                audio_path="voice.mp3",
+                subtitle_path="",
+                output_file="final.mp4",
+                params=params,
+            )
+
+        open_clip.assert_called_once_with("combined.mp4", audio=True)
+
+    def test_keep_original_audio_off_strips_source_audio_by_default(self):
+        """Backward compat: without the flag, source audio must still be
+        discarded at open time (matches the original behaviour)."""
+        source_video = _FakeMoviePyClip()
+        params = self._params(keep_original_audio=False)
+
+        with (
+            patch.object(vd, "_open_video_clip_quietly", return_value=source_video) as open_clip,
+            patch.object(vd, "AudioFileClip", return_value=_FakeMoviePyClip()),
+            patch.object(vd, "CompositeAudioClip", return_value=_FakeMoviePyClip()),
+            patch.object(vd, "_write_videofile_with_codec_fallback"),
+            patch.object(vd, "_get_configured_video_codec", return_value="libx264"),
+        ):
+            vd.generate_video(
+                video_path="combined.mp4",
+                audio_path="voice.mp3",
+                subtitle_path="",
+                output_file="final.mp4",
+                params=params,
+            )
+
+        open_clip.assert_called_once_with("combined.mp4", audio=False)
+
+    def test_keep_original_audio_composites_source_with_voice(self):
+        """With the flag on and source audio present, both the voice and
+        the original track must reach ``CompositeAudioClip`` together."""
+        source_video = _FakeMoviePyClip()
+        source_video.audio = _FakeMoviePyClip()
+        voice_source = _FakeMoviePyClip()
+        params = self._params(keep_original_audio=True, original_audio_volume=0.7)
+
+        with (
+            patch.object(vd, "_open_video_clip_quietly", return_value=source_video),
+            patch.object(vd, "AudioFileClip", return_value=voice_source),
+            patch.object(vd, "CompositeAudioClip", return_value=_FakeMoviePyClip()) as composite,
+            patch.object(vd, "_write_videofile_with_codec_fallback"),
+            patch.object(vd, "_get_configured_video_codec", return_value="libx264"),
+        ):
+            vd.generate_video(
+                video_path="combined.mp4",
+                audio_path="voice.mp3",
+                subtitle_path="",
+                output_file="final.mp4",
+                params=params,
+            )
+
+        composite.assert_called_once()
+        streams = composite.call_args.args[0]
+        # The composite must contain both the voice and the original-audio
+        # streams — not just the voice alone.
+        self.assertEqual(len(streams), 2)
+
+    def test_original_audio_volume_zero_drops_source_from_mix(self):
+        """``original_audio_volume=0`` is a valid mute switch — the source
+        audio must NOT be added to the composite in that case."""
+        source_video = _FakeMoviePyClip()
+        source_video.audio = _FakeMoviePyClip()
+        params = self._params(keep_original_audio=True, original_audio_volume=0.0)
+
+        with (
+            patch.object(vd, "_open_video_clip_quietly", return_value=source_video),
+            patch.object(vd, "AudioFileClip", return_value=_FakeMoviePyClip()),
+            patch.object(vd, "CompositeAudioClip", return_value=_FakeMoviePyClip()) as composite,
+            patch.object(vd, "_write_videofile_with_codec_fallback"),
+            patch.object(vd, "_get_configured_video_codec", return_value="libx264"),
+        ):
+            vd.generate_video(
+                video_path="combined.mp4",
+                audio_path="voice.mp3",
+                subtitle_path="",
+                output_file="final.mp4",
+                params=params,
+            )
+
+        # Only the voice stream reaches the mix; volume=0 means the
+        # source audio is muted at the composite stage. With one
+        # stream there is nothing to composite, so CompositeAudioClip
+        # must not be invoked at all.
+        composite.assert_not_called()
+
+    def test_source_without_audio_track_falls_back_to_voice_only(self):
+        """Some source clips carry no audio — the code must not crash and
+        must produce a voice-only output."""
+        source_video = _FakeMoviePyClip()
+        source_video.audio = None
+        params = self._params(keep_original_audio=True)
+
+        with (
+            patch.object(vd, "_open_video_clip_quietly", return_value=source_video),
+            patch.object(vd, "AudioFileClip", return_value=_FakeMoviePyClip()),
+            patch.object(vd, "CompositeAudioClip", return_value=_FakeMoviePyClip()) as composite,
+            patch.object(vd, "_write_videofile_with_codec_fallback"),
+            patch.object(vd, "_get_configured_video_codec", return_value="libx264"),
+        ):
+            vd.generate_video(
+                video_path="combined.mp4",
+                audio_path="voice.mp3",
+                subtitle_path="",
+                output_file="final.mp4",
+                params=params,
+            )
+
+        # Source had no audio, so only the voice stream reaches the mix.
+        # CompositeAudioClip is therefore unnecessary and must not be
+        # called.
+        composite.assert_not_called()
+
+
+class TestVideoParamsAudioFields(unittest.TestCase):
+    """Schema-level checks for the new audio option fields."""
+
+    def test_keep_original_audio_defaults_to_false(self):
+        params = vd.VideoParams(video_subject="x")
+        self.assertFalse(params.keep_original_audio)
+
+    def test_original_audio_volume_defaults_to_one(self):
+        params = vd.VideoParams(video_subject="x")
+        self.assertEqual(params.original_audio_volume, 1.0)
+
+    def test_original_audio_volume_rejects_negative(self):
+        with self.assertRaises(Exception):
+            vd.VideoParams(video_subject="x", original_audio_volume=-0.1)
+
+    def test_keep_original_audio_round_trips_through_dict(self):
+        params = vd.VideoParams(
+            video_subject="x", keep_original_audio=True, original_audio_volume=0.5
+        )
+        rebuilt = vd.VideoParams(**params.model_dump())
+        self.assertTrue(rebuilt.keep_original_audio)
+        self.assertEqual(rebuilt.original_audio_volume, 0.5)
+
+
 if __name__ == "__main__":
     unittest.main()
