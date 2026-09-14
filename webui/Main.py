@@ -64,19 +64,25 @@ from app.services import state as sm
 from app.services import task as tm
 from app.services import upload_post as upload_post_service
 from app.services import version_checker
+from webui import background_music
+from webui import generation_panel
+from webui import omnivoice_panel
+from webui import self_hosted_tts_panel
+from webui import settings_panels
+from webui import title_panel
 from app.utils.logging_utils import configure_terminal_logger
 from app.utils import utils
 
-# Only probe or launch VoiceStudio when it is the selected TTS provider.
+# Only probe or launch OmniVoice when it is the selected TTS provider.
 if (
     config.ui.get("voice_mode", "tts") == "tts"
-    and config.ui.get("tts_server") == "voicestudio"
+    and config.ui.get("tts_server") == "omnivoice"
 ):
-    st.session_state["voicestudio_reachable"] = (
-        voice.ensure_voicestudio_server_running()
+    st.session_state["omnivoice_reachable"] = (
+        voice.ensure_omnivoice_server_running()
     )
 else:
-    st.session_state.setdefault("voicestudio_reachable", False)
+    st.session_state.setdefault("omnivoice_reachable", False)
 
 st.set_page_config(
     page_title="MoneyPrinterTurbo",
@@ -115,7 +121,7 @@ DEFAULT_KOKORO_BASE_URL = "http://127.0.0.1:8880/v1"
 DEFAULT_KOKORO_MODEL = "kokoro"
 # empty = ask the server for its voice list (GET {base_url}/audio/voices)
 DEFAULT_KOKORO_VOICES: list[str] = []
-DEFAULT_VOICESTUDIO_BASE_URL = "http://127.0.0.1:8780"
+DEFAULT_OMNIVOICE_BASE_URL = "http://127.0.0.1:8780"
 ONBOARDING_TOUR_KEY = "mpt-onboarding-v1"
 CUSTOM_LLM_ENDPOINT_ID = "custom"
 VOICE_MODE_TTS = "tts"
@@ -151,7 +157,7 @@ DEFAULT_VIDEO_CODEC_OPTION = "__default__"
 # The reference price is used to help select models; the final cost is settled based on the actual model call. Alias ​​coverage at the same time
 # The current display name and common model ID. New models that are not included will naturally return an empty price, which does not affect the selection or quotation.
 LOOMLOOM_VIDEO_MODEL_PRICES = (
-    (("veo31fast", "googleveo31fastpreview"), "￥0.700/秒", "￥0.700/秒"),
+    (("veo31fast", "googleveo31fastpreview"), "CNY 0.700/sec", "CNY 0.700/sec"),
     (
         (
             "通义万相22图生视频fastlora",
@@ -161,27 +167,27 @@ LOOMLOOM_VIDEO_MODEL_PRICES = (
             "wanx22i2vfastlora",
             "wanx22t2vfastlora",
         ),
-        "￥0.350–0.770/条",
-        "￥0.350/条（480P）；￥0.770/条（720P）",
+        "CNY 0.350–0.770/video",
+        "CNY 0.350/video (480P); CNY 0.770/video (720P)",
     ),
-    (("即梦30文生视频720p", "jimeng30t2v720p"), "￥0.230/秒", "￥0.230/秒"),
-    (("即梦30pro视频", "jimeng30pro视频", "jimeng30provideo"), "￥1.000/秒", "￥1.000/秒"),
-    (("veo3", "googleveo3"), "￥1.400/秒", "￥1.400/秒"),
-    (("veo31", "googleveo31"), "￥1.400/秒", "￥1.400/秒"),
+    (("即梦30文生视频720p", "jimeng30t2v720p"), "CNY 0.230/sec", "CNY 0.230/sec"),
+    (("即梦30pro视频", "jimeng30pro视频", "jimeng30provideo"), "CNY 1.000/sec", "CNY 1.000/sec"),
+    (("veo3", "googleveo3"), "CNY 1.400/sec", "CNY 1.400/sec"),
+    (("veo31", "googleveo31"), "CNY 1.400/sec", "CNY 1.400/sec"),
     (
         ("klingv2", "可灵v2"),
-        "￥10.00–20.00/条",
-        "￥10.00/条（5秒）；￥20.00/条（10秒）",
+        "CNY 10.00–20.00/video",
+        "CNY 10.00/video (5 sec); CNY 20.00/video (10 sec)",
     ),
     (
         ("klingv21master", "可灵v21master"),
-        "￥10.00–20.00/条",
-        "￥10.00/条（5秒）；￥20.00/条（10秒）",
+        "CNY 10.00–20.00/video",
+        "CNY 10.00/video (5 sec); CNY 20.00/video (10 sec)",
     ),
     (
         ("viduq3pro",),
-        "￥0.440–1.000/秒",
-        "￥0.440/秒（540P）；￥0.940/秒（720P）；￥1.000/秒（1080P）",
+        "CNY 0.440–1.000/sec",
+        "CNY 0.440/sec (540P); CNY 0.940/sec (720P); CNY 1.000/sec (1080P)",
     ),
 )
 DEFAULT_SUBTITLE_SETTINGS = {
@@ -240,14 +246,13 @@ _WINDOWS_RESERVED_FILENAMES = frozenset(
 )
 _RUNTIME_CONFIG_SECTIONS = {
     "app": config.app,
-    "azure": config.azure,
     "chatterbox": config.chatterbox,
     "kokoro": config.kokoro,
     "elevenlabs": config.elevenlabs,
     "minimax_tts": config.minimax_tts,
     "siliconflow": config.siliconflow,
     "fish_audio": config.fish_audio,
-    "voicestudio": config.voicestudio,
+    "omnivoice": config.omnivoice,
     "ui": config.ui,
 }
 # Setup presets and key backups use separate file identifiers. When importing, first verify the schema and version.
@@ -275,12 +280,9 @@ CREDENTIAL_KEY_SUFFIXES = (
     "api_token",
     "access_key",
     "secret_key",
-    "speech_key",
 )
 # When you restore only the key without restoring the accompanying configuration items, the credentials are still unavailable. These companion items are backed up along with the key.
 CREDENTIAL_COMPANION_KEYS = {
-    # Azure Speech must also be region aware.
-    "azure": ("speech_region",),
     # Provider's additional fields are declared by the Registry, such as Cloudflare AI Gateway's
     # Account ID and Gateway ID. When only restoring the API Key and losing these fields, switch to another
     # The Provider still cannot be called after the machine is installed. Reading from the Registry allows future additions
@@ -570,44 +572,44 @@ def _get_kokoro_voice_options(saved_voice_name: str) -> list[str]:
     return options or [f"kokoro:{voice.KOKORO_DEFAULT_VOICE}"]
 
 
-def _sync_voicestudio_config_from_session_state():
+def _sync_omnivoice_config_from_session_state():
     # The sound catalog is rendered before setting the input box, and the browser status is synchronized first to ensure that it is used in this rerun.
     # New endpoint, no need to operate the control again.
     _set_runtime_config(
-        "voicestudio",
+        "omnivoice",
         "base_url",
         (
             st.session_state.get(
-                "voicestudio_base_url_input",
-                config.voicestudio.get("base_url")
-                or DEFAULT_VOICESTUDIO_BASE_URL,
+                "omnivoice_base_url_input",
+                config.omnivoice.get("base_url")
+                or DEFAULT_OMNIVOICE_BASE_URL,
             )
             or ""
         ).strip(),
     )
 
 
-def _get_voicestudio_voice_options(saved_voice_name: str) -> list[str]:
+def _get_omnivoice_voice_options(saved_voice_name: str) -> list[str]:
     """The remote directory is cached within the session, and the last selection is retained when disconnected, and the failure is not regarded as the user changing the tone."""
-    signature = (config.voicestudio.get("base_url") or "").strip().rstrip("/")
-    catalog = st.session_state.get("voicestudio_voice_catalog", {})
+    signature = (config.omnivoice.get("base_url") or "").strip().rstrip("/")
+    catalog = st.session_state.get("omnivoice_voice_catalog", {})
     if catalog.get("signature") != signature:
         catalog = {"signature": signature, "voices": [], "checked_at": None}
     now = time.monotonic()
     if catalog["checked_at"] is None or now - catalog["checked_at"] >= 30:
-        fetched = voice.get_voicestudio_voices()
+        fetched = voice.get_omnivoice_voices()
         catalog.update(checked_at=now, available=bool(fetched))
         if fetched:
             catalog["voices"] = fetched
-        st.session_state["voicestudio_voice_catalog"] = catalog
+        st.session_state["omnivoice_voice_catalog"] = catalog
 
     options = list(catalog["voices"])
     if not catalog["available"]:
-        st.warning(tr("VoiceStudio Voices Unavailable"))
+        st.warning(tr("OmniVoice Voices Unavailable"))
         # May not be cached when first opened, still retaining the real selection in the configuration; after restoring the connection
         # Only the successfully returned new directory can determine that an old sound has indeed been deleted by the server.
         if (
-            voice.is_voicestudio_voice(saved_voice_name)
+            voice.is_omnivoice_voice(saved_voice_name)
             and saved_voice_name not in options
         ):
             options.insert(0, saved_voice_name)
@@ -1560,11 +1562,9 @@ def _infer_tts_server_from_voice(voice_name):
         return "kokoro"
     if voice.is_fish_audio_voice(voice_name):
         return "fish_audio"
-    if voice.is_voicestudio_voice(voice_name):
-        return "voicestudio"
-    if voice.is_azure_v2_voice(voice_name):
-        return "azure-tts-v2"
-    return "azure-tts-v1"
+    if voice.is_omnivoice_voice(voice_name):
+        return "omnivoice"
+    return "edge-tts"
 
 
 def _set_stable_widget_value(key, value):
@@ -2076,19 +2076,11 @@ def render_onboarding_tour():
 
 
 def _render_generation_logs(task_id):
-    """Render a snapshot of the background task log without touching Streamlit session state from the worker thread."""
-    if config.ui.get("hide_log", False):
-        return
-
-    log_records = webui_task.get_task_logs(task_id)
-    if not log_records:
-        return
-
-    st.code("\n".join(log_records), height=320)
+    generation_panel.render_logs(task_id)
 
 
 def _render_generation_task_snapshot(task_id, task):
-    """Render task status, failure reason, or final film from the state store."""
+    """Render task status, failure reason, or final video from the state store."""
     if not task:
         st.info(tr("Generating Video"))
         _render_generation_logs(task_id)
@@ -2099,7 +2091,6 @@ def _render_generation_task_snapshot(task_id, task):
         st.info(tr("Generating Video"))
         _render_generation_logs(task_id)
         return
-
     if state == const.TASK_STATE_FAILED:
         error = str(task.get("error") or "").strip()
         message = tr("Video Generation Failed")
@@ -2116,54 +2107,30 @@ def _render_generation_task_snapshot(task_id, task):
     st.success(tr("Video Generation Completed"))
     for warning in task.get("warnings") or []:
         if isinstance(warning, Mapping) and warning.get("code") == "sonilo_bgm_failed":
-            st.warning(
-                tr("Sonilo BGM Fallback Warning").format(
-                    index=warning.get("video_index", "")
-                )
-            )
-        elif (
-            isinstance(warning, Mapping) and warning.get("code") == "series_part_failed"
-        ):
+            st.warning(tr("Sonilo BGM Fallback Warning").format(index=warning.get("video_index", "")))
+        elif isinstance(warning, Mapping) and warning.get("code") == "series_part_failed":
             st.warning(
                 tr("Series Part Failed Warning").format(
-                    part=warning.get("part", ""),
-                    subject=warning.get("subject", ""),
+                    part=warning.get("part", ""), subject=warning.get("subject", "")
                 )
             )
-        elif (
-            isinstance(warning, Mapping)
-            and warning.get("code") == "elevenlabs_bgm_failed"
-        ):
-            st.warning(
-                tr("ElevenLabs BGM Fallback Warning").format(
-                    index=warning.get("video_index", "")
-                )
-            )
+        elif isinstance(warning, Mapping) and warning.get("code") == "elevenlabs_bgm_failed":
+            st.warning(tr("ElevenLabs BGM Fallback Warning").format(index=warning.get("video_index", "")))
         else:
             st.warning(str(warning))
 
     try:
-        # A series returns dozens of videos. Wrapping at a fixed number per
-        # row keeps the original centred proportions for a single video and
-        # stops the columns from shrinking into unplayable slivers.
-        videos_per_row = 3
-        # The word-level subtitle JSON sidecar lives next to subtitle.srt in
-        # the task dir. When it exists, expose a "karaoke" link that opens
-        # the real-time subtitle player (resource/public/subtitle-player.html)
-        # so the user can preview the video with karaoke highlighting and
-        # tweak captions without re-encoding.
         karaoke_words_url = (
             f"/tasks/{task_id}/subtitle.words.json"
-            if os.path.isfile(
-                os.path.join(utils.task_dir(task_id), "subtitle.words.json")
-            )
+            if os.path.isfile(os.path.join(utils.task_dir(task_id), "subtitle.words.json"))
             else None
         )
+        videos_per_row = 3
         for row_start in range(0, len(video_files), videos_per_row):
             row_videos = video_files[row_start : row_start + videos_per_row]
             player_cols = st.columns(len(row_videos) * 2 + 1)
             for offset, url in enumerate(row_videos):
-                i = row_start + offset
+                index = row_start + offset
                 with player_cols[offset * 2 + 1]:
                     st.video(url)
                     if karaoke_words_url:
@@ -2175,8 +2142,7 @@ def _render_generation_task_snapshot(task_id, task):
                         )
                         st.markdown(
                             f"[🎤 karaoke preview]({player_href})",
-                            help="Open the real-time subtitle player "
-                            "to preview captions with word-level highlighting.",
+                            help="Preview captions with word-level highlighting.",
                         )
                     if not os.path.isfile(url):
                         logger.warning(
@@ -2184,22 +2150,18 @@ def _render_generation_task_snapshot(task_id, task):
                             f"task_id={task_id}, video_file={url}"
                         )
                         continue
-
                     download_label = tr("Download Video")
                     if len(video_files) > 1:
-                        download_label = f"{download_label} {i + 1}"
-                    download_name = _build_video_download_name(
-                        task.get("video_subject"),
-                        i + 1,
-                        len(video_files),
-                    )
+                        download_label = f"{download_label} {index + 1}"
                     with open(url, "rb") as video_file:
                         st.download_button(
                             download_label,
                             data=video_file,
-                            file_name=download_name,
+                            file_name=_build_video_download_name(
+                                task.get("video_subject"), index + 1, len(video_files)
+                            ),
                             mime=mimetypes.guess_type(url)[0] or "video/mp4",
-                            key=f"download_generated_video_{task_id}_{i}",
+                            key=f"download_generated_video_{task_id}_{index}",
                             icon=":material/download:",
                             on_click="ignore",
                             use_container_width=True,
@@ -2212,8 +2174,6 @@ def _render_generation_task_snapshot(task_id, task):
 
     _render_generation_logs(task_id)
     if st.session_state.get("handled_generation_task_id") != task_id:
-        # Fragments may render the same completion task repeatedly. Regardless of whether automatic directory opening is enabled or not,
-        # Each task only handles the completion event once to avoid repeatedly popping up the resource manager or repeatedly writing to the log.
         st.session_state["handled_generation_task_id"] = task_id
         if config.ui.get("open_task_folder_on_completion", True):
             open_task_folder(task_id)
@@ -2222,83 +2182,28 @@ def _render_generation_task_snapshot(task_id, task):
 
 @st.fragment(run_every=webui_task.TASK_LOG_REFRESH_INTERVAL_SECONDS)
 def _render_running_generation_task(task_id):
-    """Only poll while the task is running; switch back to static results after the task is completed to stop unnecessary scheduled refreshes."""
-    try:
-        task = sm.state.get_task(task_id)
-    except Exception as exc:
-        logger.exception(
-            f"failed to query WebUI generation task: task_id={task_id}, error={exc}"
-        )
-        st.error(tr("Video Generation Failed"))
-        return
-
-    state = _normalize_task_state((task or {}).get("state"))
-    if state in {const.TASK_STATE_COMPLETE, const.TASK_STATE_FAILED}:
-        _remove_active_generation_task(task_id)
-        # Full page scripts now have no time-consuming generation logic and can be safely rerun and change the results to static
-        # render. In this way, the browser will not permanently retain a two-second polling Fragment after the task is completed.
-        st.rerun(scope="app")
-
-    _render_generation_task_snapshot(task_id, task)
+    generation_panel.render_running_task(
+        task_id,
+        tr=tr,
+        normalize_state=_normalize_task_state,
+        remove_active_task=_remove_active_generation_task,
+        render_snapshot=_render_generation_task_snapshot,
+    )
 
 
 def _recover_generation_task_id():
-    """
-    Restore the running task after the browser session was replaced.
-
-    The long final render keeps the server thread busy, so Streamlit's
-    WebSocket can drop and reconnect with a brand new session. session_state is
-    empty then, which used to make the whole task panel -- progress, logs and
-    the finished video -- vanish while the task was still running.
-    """
-    task_id = webui_task.get_last_submitted_task_id()
-    if not task_id:
-        return ""
-
-    try:
-        task = sm.state.get_task(task_id)
-    except Exception as exc:
-        logger.exception(
-            f"failed to recover WebUI generation task: task_id={task_id}, error={exc}"
-        )
-        return ""
-    if not task:
-        return ""
-
-    st.session_state["current_generation_task_id"] = task_id
-    if _normalize_task_state(task.get("state")) != const.TASK_STATE_PROCESSING:
-        # The task already finished before this session existed: show the
-        # result, but do not replay the completion side effects (opening the
-        # task folder, the completion log line).
-        st.session_state["handled_generation_task_id"] = task_id
-    return task_id
+    return generation_panel.recover_task_id(normalize_state=_normalize_task_state)
 
 
 def _render_current_generation_task():
-    """Restore the queryable UI of the most recently submitted tasks for the current page below the generate button."""
-    task_id = (
-        st.session_state.get("current_generation_task_id", "")
-        or _recover_generation_task_id()
+    generation_panel.render_current_task(
+        tr=tr,
+        normalize_state=_normalize_task_state,
+        remove_active_task=_remove_active_generation_task,
+        render_snapshot=_render_generation_task_snapshot,
+        render_running=_render_running_generation_task,
+        recover_task=lambda: _recover_generation_task_id(),
     )
-    if not task_id:
-        return
-
-    try:
-        task = sm.state.get_task(task_id)
-    except Exception as exc:
-        logger.exception(
-            f"failed to query current WebUI task: task_id={task_id}, error={exc}"
-        )
-        st.error(tr("Video Generation Failed"))
-        return
-
-    state = _normalize_task_state((task or {}).get("state"))
-    if state in {const.TASK_STATE_COMPLETE, const.TASK_STATE_FAILED}:
-        _remove_active_generation_task(task_id)
-        _render_generation_task_snapshot(task_id, task)
-        return
-
-    _render_running_generation_task(task_id)
 
 
 def get_llm_provider_tips(provider_id, **kwargs):
@@ -3338,97 +3243,13 @@ def _render_settings_dialog():
             on_change="rerun",
         )
 
-        with publish_config_panel:
-            st.write(tr("Automatically publish generated videos to social media using upload-post.com"))
-            st.info(
-                tr("Upload-Post Setup Guide").format(
-                    api_keys_url=UPLOAD_POST_API_KEYS_URL,
-                    manage_users_url=UPLOAD_POST_MANAGE_USERS_URL,
-                )
-            )
-
-            is_enabled = config.app.get("upload_post_enabled", False)
-            is_auto = config.app.get("upload_post_auto_upload", False)
-
-            # The two keys are independent: enabled allows external processes to call Upload-Post,
-            # auto_upload determines whether to automatically publish after rendering is completed. Combined into one checkbox will be in
-            # In a configuration where the two keys are inconsistent, just open the settings dialog box and rewrite enabled to False.
-            upload_post_enabled = st.checkbox(
-                tr("Enable Upload-Post Integration"),
-                value=is_enabled,
-                key="upload_post_enabled_checkbox"
-            )
-            if upload_post_enabled != is_enabled:
-                _set_runtime_config("app", "upload_post_enabled", upload_post_enabled)
-
-            upload_post_auto_upload = st.checkbox(
-                tr("Enable Auto-Publish"),
-                value=is_auto,
-                key="upload_post_auto_upload_checkbox"
-            )
-            if upload_post_auto_upload != is_auto:
-                _set_runtime_config("app", "upload_post_auto_upload", upload_post_auto_upload)
-
-            upload_post_api_key = st.text_input(
-                tr("Upload-Post API Key"),
-                value=config.app.get("upload_post_api_key", ""),
-                type="password",
-                help=tr("Upload-Post API Key Help").format(
-                    api_keys_url=UPLOAD_POST_API_KEYS_URL
-                ),
-                key="upload_post_api_key_input"
-            )
-            if upload_post_api_key != config.app.get("upload_post_api_key", ""):
-                _set_runtime_config("app", "upload_post_api_key", upload_post_api_key)
-
-            upload_post_username = st.text_input(
-                tr("Upload-Post Profile Username"),
-                value=config.app.get("upload_post_username", ""),
-                help=tr("Upload-Post Profile Username Help").format(
-                    manage_users_url=UPLOAD_POST_MANAGE_USERS_URL
-                ),
-                key="upload_post_username_input"
-            )
-            if upload_post_username != config.app.get("upload_post_username", ""):
-                _set_runtime_config("app", "upload_post_username", upload_post_username)
-
-            upload_post_platforms = st.multiselect(
-                tr("Platforms"),
-                options=["tiktok", "instagram", "youtube"],
-                default=config.app.get("upload_post_platforms", ["tiktok", "instagram"]),
-                help="Select platforms to publish to",
-                key="upload_post_platforms_multiselect"
-            )
-            if upload_post_platforms != config.app.get("upload_post_platforms", ["tiktok", "instagram"]):
-                _set_runtime_config("app", "upload_post_platforms", upload_post_platforms)
-
-            if "youtube" in upload_post_platforms:
-                yt_status_options = ["public", "private", "unlisted"]
-                yt_saved = config.app.get("upload_post_youtube_privacy_status", "public")
-                if yt_saved not in yt_status_options:
-                    yt_saved = "public"
-                upload_post_youtube_privacy_status = st.selectbox(
-                    tr("YouTube Privacy Status"),
-                    options=yt_status_options,
-                    index=yt_status_options.index(yt_saved),
-                    key="upload_post_youtube_privacy_status_selectbox"
-                )
-                if upload_post_youtube_privacy_status != config.app.get("upload_post_youtube_privacy_status", "public"):
-                    _set_runtime_config("app", "upload_post_youtube_privacy_status", upload_post_youtube_privacy_status)
-
-            if st.button(
-                tr("Test Connection"),
-                key="upload_post_test_connection_button",
-                use_container_width=True,
-                help=tr("Test Connection Help"),
-            ):
-                test_result = upload_post_service.upload_post_service.test_connection()
-                if not test_result.get("configured"):
-                    st.warning(tr("Test Connection Not Configured"))
-                elif test_result.get("valid"):
-                    st.success(tr("Test Connection Success"))
-                else:
-                    st.error(tr("Test Connection Failed"))
+        settings_panels.render_publish_settings(
+            publish_config_panel,
+            tr=tr,
+            set_runtime_config=_set_runtime_config,
+            api_keys_url=UPLOAD_POST_API_KEYS_URL,
+            manage_users_url=UPLOAD_POST_MANAGE_USERS_URL,
+        )
 
         # Left panel - Log settings
         with left_config_panel:
@@ -3445,671 +3266,21 @@ def _render_settings_dialog():
 
         # Middle Panel - LLM Setup
 
-        with middle_config_panel:
-            # Drop-down order, default label and stable provider id all come from Registry; locale
-            # Only the display copy is covered, and Main.py no longer maintains a second Provider list.
-            llm_provider_ids = [
-                provider.provider_id for provider in LLM_PROVIDER_REGISTRY
-            ]
-            llm_provider_labels = {
-                provider.provider_id: get_llm_provider_label(provider)
-                for provider in LLM_PROVIDER_REGISTRY
-            }
-            saved_llm_provider = config.app.get(
-                "llm_provider", DEFAULT_LLM_PROVIDER_ID
-            ).lower()
-            if saved_llm_provider not in llm_provider_ids:
-                saved_llm_provider = DEFAULT_LLM_PROVIDER_ID
-
-            llm_provider = stable_selectbox(
-                tr("LLM Provider"),
-                options=llm_provider_ids,
-                default_value=saved_llm_provider,
-                key="llm_provider_select",
-                format_func=lambda provider_id: llm_provider_labels[provider_id],
-            )
-            # Display the configuration form and Provider description side by side, reducing line breaks in long descriptions in narrow columns.
-            # At the same time, make full use of the horizontal space of the basic settings panel.
-            llm_form_panel, llm_help_panel = st.columns(
-                [0.9, 1.1],
-                gap="large",
-                vertical_alignment="top",
-            )
-            llm_helper = llm_help_panel.container()
-            _set_runtime_config("app", "llm_provider", llm_provider)
-            llm_provider_spec = get_llm_provider(llm_provider)
-            if llm_provider_spec is None:
-                # Under normal circumstances, all drop-down options come from the Registry and will not enter this branch; reserved
-                # Explicit errors are used to diagnose corrupted session state or missed subsequent access.
-                raise RuntimeError(f"unsupported llm provider: {llm_provider}")
-
-            llm_api_key = config.app.get(llm_provider_spec.config_key("api_key"), "")
-            configured_llm_base_url = config.app.get(
-                llm_provider_spec.config_key("base_url"), ""
-            )
-            llm_default_base_url = llm_provider_spec.effective_default_base_url
-            llm_base_url = configured_llm_base_url or llm_default_base_url
-            llm_model_name = llm_provider_spec.resolve_model_name(
-                config.app.get(llm_provider_spec.config_key("model_name"), "")
-            )
-
-            provider_tip_context = {}
-            selected_service_endpoint = None
-            if llm_provider_spec.service_endpoints:
-                # Providers such as Kimi use different account systems for their Chinese and international sites. Only allow users
-                # Select the service area, and then use the Registry synchronization API to apply for the entrance and Base URL.
-                # Avoid manual assembly errors. If there is an empty Base URL configuration, the Chinese site will continue to be used. Only
-                # For new configurations that have not yet filled in the Key, the corresponding entry will be recommended based on the interface language.
-                selected_service_endpoint = (
-                    llm_provider_spec.select_service_endpoint(
-                        configured_llm_base_url,
-                        has_api_key=bool(str(llm_api_key).strip()),
-                        prefer_international=(
-                            st.session_state.get("ui_language", "en") != "zh"
-                        ),
-                    )
-                )
-                endpoint_options = [
-                    endpoint.endpoint_id
-                    for endpoint in llm_provider_spec.service_endpoints
-                ] + [CUSTOM_LLM_ENDPOINT_ID]
-                default_endpoint_id = (
-                    selected_service_endpoint.endpoint_id
-                    if selected_service_endpoint
-                    else CUSTOM_LLM_ENDPOINT_ID
-                )
-                endpoint_labels = {
-                    endpoint.endpoint_id: (
-                        tr_optional(
-                            llm_provider_spec.endpoint_label_key(endpoint.endpoint_id),
-                            fallback_language="en",
-                        )
-                        or endpoint.default_label
-                    )
-                    for endpoint in llm_provider_spec.service_endpoints
-                }
-                endpoint_labels[CUSTOM_LLM_ENDPOINT_ID] = (
-                    tr_optional("Custom API Endpoint", fallback_language="en")
-                    or "Custom API Endpoint"
-                )
-                with llm_form_panel:
-                    selected_endpoint_id = stable_selectbox(
-                        tr_optional(
-                            llm_provider_spec.endpoint_selector_label_key,
-                            fallback_language="en",
-                        )
-                        or tr("API Platform"),
-                        options=endpoint_options,
-                        default_value=default_endpoint_id,
-                        key=f"{llm_provider}_service_endpoint_select",
-                        format_func=lambda endpoint_id: endpoint_labels[endpoint_id],
-                        help=(
-                            tr_optional(
-                                llm_provider_spec.endpoint_selector_help_key,
-                                fallback_language="en",
-                            )
-                            or None
-                        ),
-                    )
-                selected_service_endpoint = next(
-                    (
-                        endpoint
-                        for endpoint in llm_provider_spec.service_endpoints
-                        if endpoint.endpoint_id == selected_endpoint_id
-                    ),
-                    None,
-                )
-                if selected_service_endpoint:
-                    llm_base_url = selected_service_endpoint.base_url
-                    provider_tip_context.update(
-                        {
-                            "api_key_url": selected_service_endpoint.api_key_url,
-                            "default_base_url": selected_service_endpoint.base_url,
-                            "model_docs_url": selected_service_endpoint.model_docs_url,
-                        }
-                    )
-                else:
-                    # Custom mode only retains addresses explicitly saved by the user and does not disguise a standard area
-                    # into a custom value. When the input is empty, the configuration will not be persisted and will return to the compatible default next time.
-                    llm_base_url = str(configured_llm_base_url or "").strip()
-
-            if llm_provider == "ollama":
-                llm_default_base_url = config.get_default_ollama_base_url()
-                if not llm_base_url:
-                    llm_base_url = llm_default_base_url
-                docker_hint = ""
-                if config.is_running_in_container():
-                    docker_hint = tr_optional(
-                        "llm_provider_tips.ollama.docker_hint",
-                        fallback_language="en",
-                    )
-                provider_tip_context["docker_hint"] = docker_hint
-
-            tips = get_llm_provider_tips(llm_provider, **provider_tip_context)
-            if tips:
-                with llm_helper:
-                    st.info(tips)
-
-            st_llm_api_key = llm_api_key
-            if llm_provider_spec.show_api_key:
-                st_llm_api_key = llm_form_panel.text_input(
-                    tr("API Key"),
-                    value=llm_api_key,
-                    type="password",
-                    key=f"{llm_provider}_api_key_input",
-                )
-
-            st_llm_base_url = llm_base_url
-            if llm_provider_spec.show_base_url:
-                st_llm_base_url = llm_form_panel.text_input(
-                    tr("Base Url"),
-                    value=llm_base_url,
-                    key=(
-                        f"{llm_provider}_base_url_"
-                        f"{selected_service_endpoint.endpoint_id}_input"
-                        if selected_service_endpoint
-                        else f"{llm_provider}_base_url_custom_input"
-                    ),
-                    disabled=selected_service_endpoint is not None,
-                )
-            st_llm_model_name = ""
-            if llm_provider == "groq":
-                effective_api_key = st_llm_api_key or llm_api_key
-                effective_base_url = st_llm_base_url or llm_base_url
-                groq_models = get_groq_model_ids(
-                    api_key=effective_api_key,
-                    base_url=effective_base_url,
-                )
-
-                if groq_models:
-                    selected_index = 0
-                    if llm_model_name in groq_models:
-                        selected_index = groq_models.index(llm_model_name)
-
-                    st_llm_model_name = llm_form_panel.selectbox(
-                        tr("Model Name"),
-                        options=groq_models,
-                        index=selected_index,
-                        key="groq_model_name_select",
-                    )
-                else:
-                    st_llm_model_name = llm_form_panel.text_input(
-                        tr("Model Name"),
-                        value=llm_model_name,
-                        key="groq_model_name_input",
-                    )
-                    if effective_api_key:
-                        llm_form_panel.caption(tr("Groq Model List Load Failed"))
-                    else:
-                        llm_form_panel.caption(
-                            tr("Groq API Key Required for Model List")
-                        )
-            else:
-                st_llm_model_name = llm_form_panel.text_input(
-                    tr("Model Name"),
-                    value=llm_model_name,
-                    key=f"{llm_provider}_model_name_input",
-                )
-            # The input box displays the Registry default value, but the configuration only saves the actual user override value.
-            # In this way, after the default model and Base URL are updated, uncustomized users can automatically follow them.
-            _set_runtime_config(
-                "app",
-                llm_provider_spec.config_key("api_key"),
-                st_llm_api_key,
-            )
-            _set_runtime_config(
-                "app",
-                llm_provider_spec.config_key("base_url"),
-                normalize_provider_override(
-                    st_llm_base_url,
-                    llm_default_base_url,
-                ),
-            )
-            _set_runtime_config(
-                "app",
-                llm_provider_spec.config_key("model_name"),
-                normalize_provider_override(
-                    st_llm_model_name,
-                    llm_provider_spec.default_model,
-                ),
-            )
-
-            # Provider-specific fields are also declared by the Registry. For example Cloudflare AI Gateway
-            # Account ID is required; there is no need to add judgment in Main.py when adding similar fields in the future.
-            for field in llm_provider_spec.extra_fields:
-                field_config_key = llm_provider_spec.config_key(field.config_suffix)
-                field_value = llm_form_panel.text_input(
-                    tr(field.label_key),
-                    value=(config.app.get(field_config_key, "") or field.default_value),
-                    type="password" if field.secret else "default",
-                    key=f"{llm_provider}_{field.config_suffix}_input",
-                )
-                _set_runtime_config(
-                    "app",
-                    field_config_key,
-                    normalize_provider_override(
-                        field_value,
-                        field.default_value,
-                    ),
-                )
-
-            if llm_form_panel.button(
-                tr("Test LLM Connection"),
-                key="test_llm_connection_button",
-                use_container_width=True,
-                type="secondary",
-                icon=":material/network_check:",
-            ):
-                with config.try_runtime_config_lock() as lock_acquired:
-                    if not lock_acquired:
-                        llm_form_panel.warning(tr("Runtime Configuration Busy"))
-                    else:
-                        with llm_form_panel.spinner(tr("Testing LLM Connection")):
-                            connection_ok, connection_error, connection_elapsed = (
-                                llm.test_connection()
-                            )
-
-                if not lock_acquired:
-                    connection_ok = None
-                elif connection_ok:
-                    llm_form_panel.success(
-                        tr("LLM Connection Test Succeeded").format(
-                            provider=llm_provider_labels[llm_provider],
-                            model=st_llm_model_name or "-",
-                            elapsed=f"{connection_elapsed:.2f}",
-                        )
-                    )
-                else:
-                    connection_error = format_llm_connection_error(
-                        llm_provider,
-                        st_llm_base_url,
-                        connection_error,
-                    )
-                    llm_form_panel.error(
-                        tr("LLM Connection Test Failed").format(error=connection_error)
-                    )
-
+        settings_panels.render_llm_settings(
+            middle_config_panel,
+            tr=tr,
+            set_runtime_config=_set_runtime_config,
+            stable_selectbox=stable_selectbox,
+            localized_widget_key=localized_widget_key,
+        )
         # Right panel - API key settings
-        with right_config_panel:
-            # Material Provider Click "Search stock materials/AI generated videos/AI generated pictures"
-            # Grouping to avoid all fields being mixed in a long list as the number of Providers increases.
-            # Grouping only adjusts the display level and does not change existing configuration keys. After upgrading, old users
-            # The original config.toml value will continue to be read.
-            with st.container(border=True):
-                st.markdown(f"#### {tr('Stock Video APIs')}")
-                st.caption(tr("Stock Video APIs Help"))
-
-                pexels_api_key = _get_material_api_keys("pexels_api_keys")
-                pixabay_api_key = _get_material_api_keys("pixabay_api_keys")
-                coverr_api_key = _get_material_api_keys("coverr_api_keys")
-                pexels_api_key = st.text_input(
-                    tr("Pexels API Key"),
-                    value=pexels_api_key,
-                    type="password",
-                    key="pexels_api_keys_input",
-                )
-                _save_material_api_keys("pexels_api_keys", pexels_api_key)
-
-                pixabay_api_key = st.text_input(
-                    tr("Pixabay API Key"),
-                    value=pixabay_api_key,
-                    type="password",
-                    key="pixabay_api_keys_input",
-                )
-                _save_material_api_keys("pixabay_api_keys", pixabay_api_key)
-
-                coverr_api_key = st.text_input(
-                    tr("Coverr API Key"),
-                    value=coverr_api_key,
-                    type="password",
-                    key="coverr_api_keys_input",
-                )
-                _save_material_api_keys("coverr_api_keys", coverr_api_key)
-
-            with st.container(border=True):
-                st.markdown(f"#### {tr('AI Video Generation APIs')}")
-                st.caption(tr("AI Video Generation APIs Help"))
-
-                # Video generation provider displays first by sponsor, in order within the sponsor
-                # In line with business agreements: Secret Tower, Odds Cloud, and Volcano Engine.
-                st.markdown(f"**{tr('Metaso MiniMax H3')}**")
-                metaso_api_key = st.text_input(
-                    tr("Metaso MiniMax API Key"),
-                    value=str(
-                        config.app.get("metaso_minimax_api_key", "") or ""
-                    ).strip(),
-                    type="password",
-                    help=tr("Metaso MiniMax API Key Help"),
-                    key="metaso_minimax_api_key_input",
-                )
-                _set_runtime_config(
-                    "app", "metaso_minimax_api_key", metaso_api_key.strip()
-                )
-                configured_metaso_base_url = str(
-                    config.app.get(
-                        "metaso_minimax_base_url",
-                        metaso_minimax.DEFAULT_BASE_URL,
-                    )
-                    or metaso_minimax.DEFAULT_BASE_URL
-                ).strip()
-                metaso_base_url = st.text_input(
-                    tr("Metaso MiniMax Base URL"),
-                    value=(
-                        ""
-                        if configured_metaso_base_url == metaso_minimax.DEFAULT_BASE_URL
-                        else configured_metaso_base_url
-                    ),
-                    placeholder=metaso_minimax.DEFAULT_BASE_URL,
-                    key="metaso_minimax_base_url_input",
-                )
-                _set_runtime_config(
-                    "app",
-                    "metaso_minimax_base_url",
-                    metaso_base_url.strip() or metaso_minimax.DEFAULT_BASE_URL,
-                )
-                configured_metaso_resolution = (
-                    str(
-                        config.app.get(
-                            "metaso_minimax_resolution",
-                            metaso_minimax.DEFAULT_RESOLUTION,
-                        )
-                    )
-                    .strip()
-                    .upper()
-                )
-                metaso_resolution_options = sorted(
-                    metaso_minimax.SUPPORTED_RESOLUTIONS,
-                    key=lambda value: value != metaso_minimax.DEFAULT_RESOLUTION,
-                )
-                resolution_is_valid = (
-                    configured_metaso_resolution
-                    in metaso_minimax.SUPPORTED_RESOLUTIONS
-                )
-                if not resolution_is_valid:
-                    # Resolution directly affects billing. In case of manual configuration error, retain the original value and ask the user
-                    # It is an active choice and cannot be silently changed to the more expensive 2K when the settings pop-up window is opened.
-                    st.error(
-                        tr("Metaso MiniMax Invalid Resolution").format(
-                            value=configured_metaso_resolution,
-                            supported=", ".join(metaso_resolution_options),
-                        )
-                    )
-                metaso_resolution = st.selectbox(
-                    tr("Metaso MiniMax Resolution"),
-                    options=metaso_resolution_options,
-                    index=(
-                        metaso_resolution_options.index(configured_metaso_resolution)
-                        if resolution_is_valid
-                        else None
-                    ),
-                    key="metaso_minimax_resolution_input",
-                    help=tr("Metaso MiniMax Resolution Help"),
-                    placeholder=tr("Select Metaso MiniMax Resolution"),
-                )
-                if metaso_resolution is not None:
-                    _set_runtime_config(
-                        "app", "metaso_minimax_resolution", metaso_resolution
-                    )
-
-                st.divider()
-                st.markdown(f"**{tr('Shengsuan Cloud AI Video')}**")
-                app_config_snapshot = config.snapshot_config_with_pending(config.app)
-                if (
-                    str(app_config_snapshot.get("llm_provider", "") or "").lower()
-                    == "shengsuanyun"
-                ):
-                    # When the large model Provider has been selected to win the cloud, the video generation is directly reused.
-                    # For the same key, an independent input box that is prone to ambiguity is no longer displayed.
-                    st.caption(tr("Shengsuan Cloud API Key Reused"))
-                else:
-                    configured_loomloom_token = str(
-                        app_config_snapshot.get("loomloom_api_token", "") or ""
-                    ).strip()
-                    loomloom_api_token = st.text_input(
-                        tr("Shengsuan Cloud API Key"),
-                        value=configured_loomloom_token,
-                        type="password",
-                        key="loomloom_api_token_input",
-                        help=tr("Shengsuan Cloud API Key Help"),
-                        placeholder=tr("Shengsuan Cloud API Key Placeholder"),
-                    ).strip()
-                    _set_runtime_config(
-                        "app", "loomloom_api_token", loomloom_api_token
-                    )
-
-                st.divider()
-                seedance_api_key_value = str(
-                    config.app.get("volcengine_seedance_api_key", "") or ""
-                ).strip()
-                shared_ark_api_key = str(
-                    config.app.get("volcengine_api_key", "") or ""
-                ).strip()
-                environment_ark_api_key = os.getenv(
-                    "VOLCENGINE_ARK_API_KEY", ""
-                ).strip()
-                seedance_reuses_llm_key = bool(
-                    not seedance_api_key_value
-                    and not environment_ark_api_key
-                    and shared_ark_api_key
-                )
-                seedance_title = f"**{tr('Volcano Engine Seedance')}**"
-                if seedance_reuses_llm_key:
-                    # Only the reused large model key cannot be directly seen from the current input box, so keep this prompt.
-                    # This can prevent users from mistakenly thinking that they must fill in the information repeatedly; the general configuration status will not be described again.
-                    seedance_title += f" :blue[{tr('Reusing LLM API Key')}]"
-                st.markdown(seedance_title)
-                seedance_api_key = st.text_input(
-                    tr("Volcano Engine Ark API Key"),
-                    value=seedance_api_key_value,
-                    type="password",
-                    help=tr("Volcano Engine Ark API Key Help"),
-                    key="volcengine_seedance_api_key_input",
-                )
-                _set_runtime_config(
-                    "app", "volcengine_seedance_api_key", seedance_api_key.strip()
-                )
-                configured_seedance_model = str(
-                    config.app.get(
-                        "volcengine_seedance_model",
-                        volcengine_seedance.DEFAULT_MODEL_ID,
-                    )
-                    or volcengine_seedance.DEFAULT_MODEL_ID
-                ).strip()
-                seedance_model = st.text_input(
-                    tr("Volcano Engine Seedance Model"),
-                    # Built-in default values ​​are displayed through placeholders, user-defined
-                    # Model or access point IDs are still displayed and saved as real values.
-                    value=(
-                        ""
-                        if configured_seedance_model
-                        == volcengine_seedance.DEFAULT_MODEL_ID
-                        else configured_seedance_model
-                    ),
-                    placeholder=volcengine_seedance.DEFAULT_MODEL_ID,
-                    key="volcengine_seedance_model_input",
-                )
-                _set_runtime_config(
-                    "app",
-                    "volcengine_seedance_model",
-                    seedance_model.strip() or volcengine_seedance.DEFAULT_MODEL_ID,
-                )
-                configured_seedance_base_url = str(
-                    config.app.get(
-                        "volcengine_seedance_base_url",
-                        volcengine_seedance.DEFAULT_BASE_URL,
-                    )
-                    or volcengine_seedance.DEFAULT_BASE_URL
-                ).strip()
-                seedance_base_url = st.text_input(
-                    tr("Volcano Engine Ark Base URL"),
-                    value=(
-                        ""
-                        if configured_seedance_base_url
-                        == volcengine_seedance.DEFAULT_BASE_URL
-                        else configured_seedance_base_url
-                    ),
-                    placeholder=volcengine_seedance.DEFAULT_BASE_URL,
-                    key="volcengine_seedance_base_url_input",
-                )
-                _set_runtime_config(
-                    "app",
-                    "volcengine_seedance_base_url",
-                    seedance_base_url.strip() or volcengine_seedance.DEFAULT_BASE_URL,
-                )
-
-                st.divider()
-                wavespeed_api_key = _get_material_api_keys("wavespeed_api_keys")
-                st.markdown("**WaveSpeed**")
-                wavespeed_api_key = st.text_input(
-                    tr("WaveSpeed API Key"),
-                    value=wavespeed_api_key,
-                    type="password",
-                    key="wavespeed_api_keys_input",
-                )
-                _save_material_api_keys("wavespeed_api_keys", wavespeed_api_key)
-
-                st.divider()
-                st.markdown("**OFox**")
-                ofox_api_key = st.text_input(
-                    tr("OFox API Key"),
-                    value=str(config.app.get("ofox_api_key", "") or ""),
-                    type="password",
-                    key="ofox_api_key_input",
-                )
-                _set_runtime_config("app", "ofox_api_key", ofox_api_key.strip())
-                ofox_model = st.text_input(
-                    tr("OFox Text-to-Video Model"),
-                    value=str(
-                        config.app.get(
-                            "ofox_text_to_video_model",
-                            ofox.DEFAULT_MODEL_ID,
-                        )
-                        or ofox.DEFAULT_MODEL_ID
-                    ),
-                    key="ofox_text_to_video_model_input",
-                )
-                _set_runtime_config(
-                    "app", "ofox_text_to_video_model", ofox_model.strip()
-                )
-                configured_ofox_base_url = str(
-                    config.app.get("ofox_base_url", ofox.DEFAULT_BASE_URL)
-                    or ofox.DEFAULT_BASE_URL
-                ).strip()
-                ofox_base_url = st.text_input(
-                    tr("OFox Base URL"),
-                    value=(
-                        ""
-                        if configured_ofox_base_url == ofox.DEFAULT_BASE_URL
-                        else configured_ofox_base_url
-                    ),
-                    placeholder=ofox.DEFAULT_BASE_URL,
-                    key="ofox_base_url_input",
-                )
-                _set_runtime_config(
-                    "app",
-                    "ofox_base_url",
-                    ofox_base_url.strip() or ofox.DEFAULT_BASE_URL,
-                )
-                ofox_vendor_options = [
-                    (tr("OFox Vendor BytePlus"), "byteplus"),
-                    (tr("OFox Vendor Volcengine"), "volcengine"),
-                    (tr("OFox Vendor Auto"), ""),
-                ]
-                configured_ofox_vendor = str(
-                    config.app.get("ofox_provider", ofox.DEFAULT_PROVIDER_TYPE)
-                    or ""
-                ).strip()
-                if configured_ofox_vendor not in {
-                    value for _, value in ofox_vendor_options
-                }:
-                    # Keep this selection when the user manually pinned other vendor names in config.toml.
-                    # Avoid being overwritten back to the default value by the drop-down box when opening the settings page.
-                    ofox_vendor_options.append(
-                        (configured_ofox_vendor, configured_ofox_vendor)
-                    )
-                selected_ofox_vendor = stable_selectbox(
-                    tr("OFox Upstream Vendor"),
-                    options=[value for _, value in ofox_vendor_options],
-                    default_value=configured_ofox_vendor,
-                    key="ofox_provider_select",
-                    format_func=lambda value: dict(
-                        (v, label) for label, v in ofox_vendor_options
-                    )[value],
-                    help=tr("OFox Upstream Vendor Help"),
-                )
-                _set_runtime_config("app", "ofox_provider", selected_ofox_vendor)
-
-            with st.container(border=True):
-                st.markdown(f"#### {tr('AI Image Generation APIs')}")
-                st.caption(tr("AI Image Generation APIs Help"))
-                st.markdown(f"**{tr('OpenAI Compatible Text-to-Image')}**")
-
-                openai_image_base_url = st.text_input(
-                    tr("OpenAI Image Base URL"),
-                    value=str(config.app.get("openai_image_base_url", "") or ""),
-                    placeholder="https://api.openai.com/v1",
-                    key="openai_image_base_url_input",
-                )
-                _set_runtime_config(
-                    "app", "openai_image_base_url", openai_image_base_url.strip()
-                )
-
-                openai_image_api_key = _get_material_api_keys(
-                    "openai_image_api_keys"
-                )
-                openai_image_api_key = st.text_input(
-                    tr("OpenAI Image API Key"),
-                    value=openai_image_api_key,
-                    type="password",
-                    help=tr("OpenAI Image API Key Help"),
-                    key="openai_image_api_keys_input",
-                )
-                _save_material_api_keys(
-                    "openai_image_api_keys", openai_image_api_key
-                )
-
-                openai_image_model = st.text_input(
-                    tr("OpenAI Image Model"),
-                    value=str(config.app.get("openai_image_model", "") or ""),
-                    placeholder="gpt-image-2",
-                    key="openai_image_model_input",
-                )
-                _set_runtime_config(
-                    "app", "openai_image_model", openai_image_model.strip()
-                )
-                # Only reference values ​​are shown and OpenAI official endpoints are not written as the default configuration.
-                # There is no uniform value for the Base URL and model ID of compatible services; leaving blank will not
-                # If the user mistakenly connects to the official payment interface without knowing it, the old configuration will not be overwritten.
-                st.caption(tr("OpenAI Image Configuration Example"))
-
-                with st.expander(
-                    tr("OpenAI Image Advanced Settings"), expanded=False
-                ):
-                    openai_image_size = st.text_input(
-                        tr("OpenAI Image Size"),
-                        value=str(config.app.get("openai_image_size", "") or ""),
-                        placeholder="1024x1536",
-                        help=tr("OpenAI Image Size Help"),
-                        key="openai_image_size_input",
-                    )
-                    _set_runtime_config(
-                        "app", "openai_image_size", openai_image_size.strip()
-                    )
-
-                    openai_image_prompt_template = st.text_input(
-                        tr("OpenAI Image Prompt Template"),
-                        value=str(
-                            config.app.get("openai_image_prompt_template", "") or ""
-                        ),
-                        placeholder="cinematic photo of {term}, photorealistic",
-                        help=tr("OpenAI Image Prompt Template Help"),
-                        key="openai_image_prompt_template_input",
-                    )
-                    _set_runtime_config(
-                        "app",
-                        "openai_image_prompt_template",
-                        openai_image_prompt_template.strip(),
-                    )
+        settings_panels.render_material_settings(
+            right_config_panel,
+            tr=tr,
+            set_runtime_config=_set_runtime_config,
+            get_material_api_keys=_get_material_api_keys,
+            save_material_api_keys=_save_material_api_keys,
+        )
 
     _save_runtime_config()
 
@@ -4295,7 +3466,7 @@ def _matching_full_voice_preview_duration(script, voice_rate):
 
     current_tts_server = st.session_state.get(
         localized_widget_key("tts_server_select"),
-        config.ui.get("tts_server", "azure-tts-v1"),
+        config.ui.get("tts_server", "edge-tts"),
     )
     current_voice_name = st.session_state.get(
         localized_widget_key(f"speech_synthesis_select_{current_tts_server}"),
@@ -5877,11 +5048,6 @@ def _get_voice_preview_provider_signature(tts_server: str) -> dict:
     Whenever the service address, region or credentials change, the audition must be regenerated, otherwise the interface may continue to play.
     Audio under the old Provider configuration makes users mistakenly believe that the current settings have taken effect.
     """
-    if tts_server == "azure-tts-v2":
-        return {
-            "speech_region": config.azure.get("speech_region", ""),
-            "credential": _credential_signature(config.azure.get("speech_key", "")),
-        }
     if tts_server == "siliconflow":
         return {
             "credential": _credential_signature(config.siliconflow.get("api_key", ""))
@@ -5916,8 +5082,8 @@ def _get_voice_preview_provider_signature(tts_server: str) -> dict:
             "model_id": config.kokoro.get("model_id", ""),
             "credential": _credential_signature(config.kokoro.get("api_key", "")),
         }
-    if tts_server == "voicestudio":
-        return {"base_url": config.voicestudio.get("base_url", "")}
+    if tts_server == "omnivoice":
+        return {"base_url": config.omnivoice.get("base_url", "")}
     return {}
 
 
@@ -5935,8 +5101,8 @@ def _synthesize_voice_preview(
         _sync_chatterbox_config_from_session_state()
     if selected_tts_server == "kokoro":
         _sync_kokoro_config_from_session_state()
-    if selected_tts_server == "voicestudio":
-        _sync_voicestudio_config_from_session_state()
+    if selected_tts_server == "omnivoice":
+        _sync_omnivoice_config_from_session_state()
 
     temp_dir = utils.storage_dir("temp", create=True)
     audio_file = os.path.join(temp_dir, f"tmp-voice-{str(uuid4())}.mp3")
@@ -6133,15 +5299,15 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
                         st.rerun()
                 else:
                     if (
-                        selected_tts_server == "voicestudio"
-                        and not st.session_state.get("voicestudio_reachable", True)
+                        selected_tts_server == "omnivoice"
+                        and not st.session_state.get("omnivoice_reachable", True)
                     ):
                         st.error(
-                            "VoiceStudio is not reachable from the WebUI "
+                            "OmniVoice is not reachable from the WebUI "
                             "container. On macOS Apple Silicon run "
                             "`make mac-setup` on the host first, then restart "
                             "the stack with `make up`. On Linux/Windows run "
-                            "`docker compose up -d voicestudio`."
+                            "`docker compose up -d omnivoice`."
                         )
                     else:
                         st.error(tr("Voice Preview No Audio"))
@@ -6190,7 +5356,7 @@ def _get_reusable_full_voice_preview(params, voice_mode: str) -> dict | None:
         return None
 
     script_content = str(params.video_script or "").strip()
-    selected_tts_server = config.ui.get("tts_server", "azure-tts-v1")
+    selected_tts_server = config.ui.get("tts_server", "edge-tts")
     if (
         not script_content
         or not params.voice_name
@@ -6459,27 +5625,13 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
     )
     params.bgm_type = selected_bgm_type
     _set_runtime_config("ui", "bgm_type", params.bgm_type)
-    if params.bgm_type == "sonilo":
-        configured_key = str(config.app.get("sonilo_api_key", "") or "").strip()
-        effective_key = configured_key or os.getenv("SONILO_API_KEY", "").strip()
-        entered_key = st.text_input(
-            tr("Sonilo API Key"),
-            value=effective_key,
-            type="password",
-            key="sonilo_api_key_input",
-        ).strip()
-        # The user requires the configured Key to be directly backfilled into the password input box. Configuration values ​​take precedence over environment variables;
-        # Only write back when the user actually changes the input or uses the configuration to avoid changing the Key in the environment variable.
-        # Copy into config.toml without any operation.
-        if configured_key or entered_key != effective_key:
-            _set_runtime_config("app", "sonilo_api_key", entered_key)
-    elif params.bgm_type == "elevenlabs":
-        if elevenlabs_api_key_rendered:
-            # When the shared input box has been rendered in the TTS area, a second widget will no longer be created to avoid two independent widgets.
-            # session_state values ​​overwrite each other. Description text helps users locate the shared configuration above.
-            st.caption(tr("ElevenLabs API Key Help"))
-        else:
-            _render_elevenlabs_api_key_input("ElevenLabs Music API Key")
+    background_music.render_api_key_control(
+        params.bgm_type,
+        tr=tr,
+        set_runtime_config=_set_runtime_config,
+        render_elevenlabs_api_key_input=_render_elevenlabs_api_key_input,
+        elevenlabs_api_key_rendered=elevenlabs_api_key_rendered,
+    )
 
     bgm_volume_options = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     params.bgm_volume = stable_selectbox(
@@ -6663,76 +5815,14 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
             else:
                 params.bgm_file = ""
 
-    if params.bgm_type == "sonilo":
-        if previous_bgm_type != "sonilo":
-            st.session_state["sonilo_bgm_prompt_input"] = _saved_ui_text(
-                "sonilo_bgm_prompt",
-                max_length=sonilo_service.MAX_PROMPT_LENGTH,
-            )
-        params.video_music_prompt = st.text_input(
-            tr("Sonilo Music Prompt"),
-            key="sonilo_bgm_prompt_input",
-            max_chars=sonilo_service.MAX_PROMPT_LENGTH,
-            help=tr("Sonilo Music Prompt Help"),
-        ).strip()
-        _set_runtime_config(
-            "ui", "sonilo_bgm_prompt", params.video_music_prompt
-        )
-        if params.video_count > 1:
-            st.warning(tr("Sonilo Multiple Videos Warning"))
-        if st.button(
-            tr("Test Sonilo Connection"),
-            key="test_sonilo_connection_button",
-            use_container_width=True,
-        ):
-            try:
-                sonilo_service.test_connection()
-            except sonilo_service.SoniloError as exc:
-                logger.warning(f"Sonilo connection test failed: {exc}")
-                st.error(tr("Sonilo Connection Test Failed").format(error=str(exc)))
-            else:
-                st.success(tr("Sonilo Connection Test Succeeded"))
-    elif params.bgm_type == "elevenlabs":
-        if previous_bgm_type != "elevenlabs":
-            st.session_state["elevenlabs_music_prompt_input"] = _saved_ui_text(
-                "elevenlabs_music_prompt",
-                max_length=elevenlabs_music_service.MAX_PROMPT_LENGTH,
-            )
-        params.video_music_prompt = st.text_input(
-            tr("ElevenLabs Music Prompt"),
-            key="elevenlabs_music_prompt_input",
-            max_chars=elevenlabs_music_service.MAX_PROMPT_LENGTH,
-            help=tr("ElevenLabs Music Prompt Help"),
-        ).strip()
-        _set_runtime_config(
-            "ui", "elevenlabs_music_prompt", params.video_music_prompt
-        )
-        if params.video_count > 1:
-            st.warning(tr("ElevenLabs Multiple Videos Warning"))
-        if st.button(
-            tr("Test ElevenLabs Connection"),
-            key="test_elevenlabs_music_connection_button",
-            use_container_width=True,
-        ):
-            try:
-                elevenlabs_music_service.test_connection()
-            except elevenlabs_music_service.ElevenLabsPaidPlanRequiredError:
-                st.error(tr("ElevenLabs Paid Plan Required"))
-            except elevenlabs_music_service.ElevenLabsMusicError as exc:
-                logger.warning(f"ElevenLabs connection test failed: {exc}")
-                st.error(tr("ElevenLabs Connection Test Failed").format(error=str(exc)))
-            else:
-                st.success(tr("ElevenLabs Connection Test Succeeded"))
-    if params.bgm_type == "sonilo" and bgm_enabled and not sonilo_service.is_enabled():
-        # The task layer does not generate or mix the Sonilo soundtrack at volume 0, so no Key prompt is needed;
-        # This judgment shares service layer rules with the task entry to avoid bifurcation between interface prompts and actual execution conditions.
-        st.warning(tr("Sonilo API Key Required"))
-    elif (
-        params.bgm_type == "elevenlabs"
-        and bgm_enabled
-        and not elevenlabs_music_service.is_enabled()
-    ):
-        st.warning(tr("ElevenLabs API Key Required"))
+    background_music.render_music_prompt(
+        params,
+        previous_bgm_type,
+        bgm_enabled,
+        tr=tr,
+        saved_ui_text=_saved_ui_text,
+        set_runtime_config=_set_runtime_config,
+    )
     st.session_state["last_rendered_bgm_type"] = params.bgm_type
     return uploaded_bgm_file
 
@@ -6745,7 +5835,7 @@ def _render_audio_settings(panel, params):
 
             # Dubbing mode is the first-level status of audio settings, responsible for clearly distinguishing automatic dubbing, user uploading and no dubbing.
             # When the old configuration does not have voice_mode, the voice-free sentinel according to the original tts_server remains compatible.
-            saved_tts_server = config.ui.get("tts_server", "azure-tts-v1")
+            saved_tts_server = config.ui.get("tts_server", "edge-tts")
             saved_voice_mode = config.ui.get("voice_mode")
             if saved_voice_mode not in {
                 VOICE_MODE_TTS,
@@ -6777,8 +5867,7 @@ def _render_audio_settings(panel, params):
             # The Provider drop-down is only responsible for selecting the automatic dubbing service; no dubbing is already controlled by the upper mode.
             # It is no longer mixed into the list as a TTS Provider to prevent two entries from expressing the same state.
             tts_servers = [
-                ("azure-tts-v1", "Azure TTS V1 (Edge TTS)"),
-                ("azure-tts-v2", "Azure TTS V2"),
+                ("edge-tts", "Edge TTS"),
                 ("siliconflow", "SiliconFlow TTS"),
                 ("gemini-tts", "Google Gemini TTS"),
                 ("mimo-tts", "Xiaomi MiMo TTS"),
@@ -6787,12 +5876,12 @@ def _render_audio_settings(panel, params):
                 ("chatterbox", "Chatterbox TTS"),
                 ("kokoro", "Kokoro TTS"),
                 ("fish_audio", "Fish Audio TTS"),
-                ("voicestudio", "VoiceStudio TTS"),
+                ("omnivoice", "OmniVoice TTS"),
             ]
 
             tts_server_values = [server_value for server_value, _ in tts_servers]
             if saved_tts_server not in tts_server_values:
-                saved_tts_server = "azure-tts-v1"
+                saved_tts_server = "edge-tts"
 
             if tts_mode_enabled:
                 selected_tts_server = stable_selectbox(
@@ -6827,7 +5916,7 @@ def _render_audio_settings(panel, params):
             # Get the sound list based on the selected TTS server
             filtered_voices = []
             # Honour the operator-configured default voice when the WebUI
-            # hasn't pinned one. This lets a fresh install clone a VoiceStudio
+            # hasn't pinned one. This lets a fresh install clone an OmniVoice
             # profile and adopt it via config.toml without touching code.
             saved_voice_name = config.ui.get("voice_name", "") or config.default_voice_name
             elevenlabs_api_key_rendered = False
@@ -6866,24 +5955,12 @@ def _render_audio_settings(panel, params):
                 filtered_voices = _get_kokoro_voice_options(saved_voice_name)
             elif selected_tts_server == "fish_audio":
                 filtered_voices = voice.get_fish_audio_voices()
-            elif selected_tts_server == "voicestudio":
-                # Local clone catalog for self-hosted VoiceStudio service
-                _sync_voicestudio_config_from_session_state()
-                filtered_voices = _get_voicestudio_voice_options(saved_voice_name)
-            else:
-                # Get Azure's sound list
-                all_voices = voice.get_all_azure_voices(filter_locals=None)
-
-                # Filter sounds based on selected TTS server
-                for v in all_voices:
-                    if selected_tts_server == "azure-tts-v2":
-                        # V2 versions of sounds contain "v2" in their names
-                        if "V2" in v:
-                            filtered_voices.append(v)
-                    else:
-                        # The V1 version of the sound does not contain "v2" in its name
-                        if "V2" not in v:
-                            filtered_voices.append(v)
+            elif selected_tts_server == "omnivoice":
+                # Local clone catalog for the self-hosted OmniVoice service.
+                _sync_omnivoice_config_from_session_state()
+                filtered_voices = _get_omnivoice_voice_options(saved_voice_name)
+            elif selected_tts_server == "edge-tts":
+                filtered_voices = voice.get_all_edge_voices(filter_locals=None)
 
             def _friendly(v):
                 if voice.is_no_voice(v):
@@ -6926,7 +6003,7 @@ def _render_audio_settings(panel, params):
                         display_name.replace("Female", tr("Female"))
                         .replace("Male", tr("Male"))
                     )
-                if voice.is_voicestudio_voice(v):
+                if voice.is_omnivoice_voice(v):
                     return v.split(":", 1)[1] if ":" in v else v
                 return (
                     v.replace("Female", tr("Female"))
@@ -7017,27 +6094,6 @@ def _render_audio_settings(panel, params):
                 # The non-automatic dubbing mode does not display the timbre controls, and only reuses the saved values ​​to maintain a stable parameter structure.
                 voice_name = saved_voice_name or voice.NO_VOICE_NAME
                 params.voice_name = voice_name
-
-            # When the V2 version is selected or the sound is V2 sound, the service area and API key input box are displayed.
-            if tts_mode_enabled and (
-                selected_tts_server == "azure-tts-v2"
-                or (voice_name and voice.is_azure_v2_voice(voice_name))
-            ):
-                saved_azure_speech_region = config.azure.get("speech_region", "")
-                saved_azure_speech_key = config.azure.get("speech_key", "")
-                azure_speech_region = st.text_input(
-                    tr("Speech Region"),
-                    value=saved_azure_speech_region,
-                    key="azure_speech_region_input",
-                )
-                azure_speech_key = st.text_input(
-                    tr("Speech Key"),
-                    value=saved_azure_speech_key,
-                    type="password",
-                    key="azure_speech_key_input",
-                )
-                _set_runtime_config("azure", "speech_region", azure_speech_region)
-                _set_runtime_config("azure", "speech_key", azure_speech_key)
 
             if tts_mode_enabled and selected_tts_server == "gemini-tts":
                 # Gemini TTS and Gemini LLM share the same key; provide direct access in the audio panel,
@@ -7188,190 +6244,29 @@ def _render_audio_settings(panel, params):
                 )
                 _set_runtime_config("fish_audio", "model", fish_model)
 
-            # Chatterbox API settings section (self-hosted, OpenAI-compatible)
-            if tts_mode_enabled and (
-                selected_tts_server == "chatterbox"
-                or (voice_name and voice.is_chatterbox_voice(voice_name))
-            ):
-                chatterbox_base_url = st.text_input(
-                    tr("Chatterbox Base URL"),
-                    value=config.chatterbox.get("base_url")
-                    or DEFAULT_CHATTERBOX_BASE_URL,
-                    key="chatterbox_base_url_input",
-                    placeholder=tr("Chatterbox Base URL Placeholder"),
-                )
-                _set_runtime_config(
-                    "chatterbox", "base_url", (chatterbox_base_url or "").strip()
-                )
+            self_hosted_tts_panel.render_settings(
+                tts_mode_enabled=tts_mode_enabled,
+                selected_tts_server=selected_tts_server,
+                voice_name=voice_name,
+                tr=tr,
+                parse_voices=_parse_chatterbox_voices,
+                set_runtime_config=_set_runtime_config,
+                chatterbox_base_url=DEFAULT_CHATTERBOX_BASE_URL,
+                chatterbox_model=DEFAULT_CHATTERBOX_MODEL,
+                chatterbox_voices=DEFAULT_CHATTERBOX_VOICES,
+                kokoro_base_url=DEFAULT_KOKORO_BASE_URL,
+                kokoro_model=DEFAULT_KOKORO_MODEL,
+                kokoro_voices=DEFAULT_KOKORO_VOICES,
+            )
 
-                chatterbox_api_key = st.text_input(
-                    tr("Chatterbox API Key"),
-                    value=config.chatterbox.get("api_key", ""),
-                    type="password",
-                    key="chatterbox_api_key_input",
-                )
-                _set_runtime_config("chatterbox", "api_key", chatterbox_api_key)
-
-                chatterbox_model = st.text_input(
-                    tr("Chatterbox Model"),
-                    value=config.chatterbox.get("model_id") or DEFAULT_CHATTERBOX_MODEL,
-                    key="chatterbox_model_input",
-                )
-                _set_runtime_config(
-                    "chatterbox",
-                    "model_id",
-                    (chatterbox_model or DEFAULT_CHATTERBOX_MODEL).strip(),
-                )
-
-                _saved_chatterbox_voices = (
-                    _parse_chatterbox_voices(config.chatterbox.get("voices"))
-                    or DEFAULT_CHATTERBOX_VOICES
-                )
-                if isinstance(_saved_chatterbox_voices, list):
-                    _saved_chatterbox_voices = ", ".join(_saved_chatterbox_voices)
-                chatterbox_voices = st.text_input(
-                    tr("Chatterbox Voices"),
-                    value=str(_saved_chatterbox_voices or ""),
-                    key="chatterbox_voices_input",
-                    placeholder=tr("Chatterbox Voices Placeholder"),
-                )
-                _set_runtime_config(
-                    "chatterbox",
-                    "voices",
-                    _parse_chatterbox_voices(chatterbox_voices),
-                )
-
-            # Kokoro API settings section (self-hosted, OpenAI-compatible; voices listed from the server when left empty)
-            if tts_mode_enabled and (
-                selected_tts_server == "kokoro"
-                or (voice_name and voice.is_kokoro_voice(voice_name))
-            ):
-                kokoro_base_url = st.text_input(
-                    tr("Kokoro Base URL"),
-                    value=config.kokoro.get("base_url")
-                    or DEFAULT_KOKORO_BASE_URL,
-                    key="kokoro_base_url_input",
-                    placeholder=tr("Kokoro Base URL Placeholder"),
-                )
-                _set_runtime_config(
-                    "kokoro", "base_url", (kokoro_base_url or "").strip()
-                )
-
-                kokoro_api_key = st.text_input(
-                    tr("Kokoro API Key"),
-                    value=config.kokoro.get("api_key", ""),
-                    type="password",
-                    key="kokoro_api_key_input",
-                )
-                _set_runtime_config("kokoro", "api_key", kokoro_api_key)
-
-                kokoro_model = st.text_input(
-                    tr("Kokoro Model"),
-                    value=config.kokoro.get("model_id") or DEFAULT_KOKORO_MODEL,
-                    key="kokoro_model_input",
-                )
-                _set_runtime_config(
-                    "kokoro",
-                    "model_id",
-                    (kokoro_model or DEFAULT_KOKORO_MODEL).strip(),
-                )
-
-                _saved_kokoro_voices = (
-                    _parse_chatterbox_voices(config.kokoro.get("voices"))
-                    or DEFAULT_KOKORO_VOICES
-                )
-                if isinstance(_saved_kokoro_voices, list):
-                    _saved_kokoro_voices = ", ".join(_saved_kokoro_voices)
-                kokoro_voices = st.text_input(
-                    tr("Kokoro Voices"),
-                    value=str(_saved_kokoro_voices or ""),
-                    key="kokoro_voices_input",
-                    placeholder=tr("Kokoro Voices Placeholder"),
-                )
-                _set_runtime_config(
-                    "kokoro",
-                    "voices",
-                    _parse_chatterbox_voices(kokoro_voices),
-                )
-
-            # VoiceStudio API settings section (self-hosted OmniVoice cloning server)
-            if tts_mode_enabled and (
-                selected_tts_server == "voicestudio"
-                or (voice_name and voice.is_voicestudio_voice(voice_name))
-            ):
-                voicestudio_base_url = st.text_input(
-                    tr("VoiceStudio Base URL"),
-                    value=config.voicestudio.get("base_url")
-                    or DEFAULT_VOICESTUDIO_BASE_URL,
-                    key="voicestudio_base_url_input",
-                    placeholder=tr("VoiceStudio Base URL Placeholder"),
-                )
-                _set_runtime_config(
-                    "voicestudio",
-                    "base_url",
-                    (voicestudio_base_url or "").strip(),
-                )
-
-                profile_sample = st.file_uploader(
-                    tr("VoiceStudio Voice Sample"),
-                    type=["wav", "mp3", "flac", "ogg", "m4a"],
-                    key="voicestudio_profile_sample_upload",
-                )
-                profile_name_input = st.text_input(
-                    tr("VoiceStudio Profile Name"),
-                    value="",
-                    key="voicestudio_profile_name_input",
-                )
-                if st.button(
-                    tr("Create VoiceStudio Profile"),
-                    key="voicestudio_create_profile_button",
-                ):
-                    sample_bytes = profile_sample.getvalue() if profile_sample else b""
-                    ok, message = voice.create_voicestudio_profile(
-                        profile_name=profile_name_input or "",
-                        audio_bytes=sample_bytes,
-                        original_filename=(
-                            profile_sample.name if profile_sample else ""
-                        ),
-                    )
-                    if ok:
-                        st.success(
-                            f"{tr('VoiceStudio Profile Created')}: "
-                            f"{(profile_name_input or '').strip()}"
-                        )
-                        # Refresh the voice catalog on the next rerun so the
-                        # newly created profile shows up in the TTS drop-down.
-                        st.session_state.pop("voicestudio_voice_catalog", None)
-                    else:
-                        st.error(f"{tr('VoiceStudio Profile Create Failed')}: {message}")
-
-                cloned_profiles = voice.get_voicestudio_profiles()
-                if cloned_profiles:
-                    profile_to_remove = st.selectbox(
-                        tr("VoiceStudio Profile to Remove"),
-                        options=cloned_profiles,
-                        key="voicestudio_profile_remove_select",
-                    )
-                    if st.button(
-                        tr("Remove VoiceStudio Profile"),
-                        key="voicestudio_remove_profile_button",
-                    ):
-                        ok, message = voice.delete_voicestudio_profile(
-                            profile_to_remove
-                        )
-                        if ok:
-                            st.success(
-                                f"{tr('VoiceStudio Profile Removed')}: "
-                                f"{profile_to_remove}"
-                            )
-                            # Refresh the catalog so the deleted voice leaves
-                            # the TTS drop-down on the next rerun.
-                            st.session_state.pop("voicestudio_voice_catalog", None)
-                        else:
-                            st.error(
-                                f"{tr('VoiceStudio Profile Remove Failed')}: "
-                                f"{message}"
-                            )
+            omnivoice_panel.render_omnivoice_settings(
+                tts_mode_enabled=tts_mode_enabled,
+                selected_tts_server=selected_tts_server,
+                voice_name=voice_name,
+                tr=tr,
+                set_runtime_config=_set_runtime_config,
+                default_base_url=DEFAULT_OMNIVOICE_BASE_URL,
+            )
 
             # Render only the controls each mode actually needs. Auto dubbing
             # exposes volume and rate; uploaded audio needs just the file and
@@ -7906,143 +6801,15 @@ def _render_subtitle_settings(panel, params):
 
 def _render_title_settings(panel, params):
     """Render video title / hook banner overlay settings and update parameters."""
-    with panel:
-        with st.container(border=True):
-            st.write(tr("Video Title Settings"))
-            st.session_state.setdefault(
-                "title_enabled_checkbox",
-                _saved_ui_bool(
-                    "title_enabled",
-                    DEFAULT_SUBTITLE_SETTINGS["title_enabled"],
-                ),
-            )
-            params.title_enabled = st.checkbox(
-                tr("Enable Title / Hook Banner"),
-                key="title_enabled_checkbox",
-            )
-            _set_runtime_config("ui", "title_enabled", params.title_enabled)
-            title_disabled = not params.title_enabled
-
-            saved_title_text = config.ui.get(
-                "title_text", DEFAULT_SUBTITLE_SETTINGS["title_text"]
-            )
-            st.session_state.setdefault("title_text_input", str(saved_title_text))
-            params.title_text = st.text_input(
-                tr("Title Text"),
-                placeholder=tr("Title Text Help"),
-                key="title_text_input",
-                disabled=title_disabled,
-            )
-            _set_runtime_config("ui", "title_text", params.title_text)
-
-            title_styles = [
-                (tr("TikTok Yellow Badge"), "tiktok_yellow"),
-                (tr("Breaking Red Banner"), "red_banner"),
-                (tr("CapCut Dark Pill"), "capcut_black"),
-                (tr("Neon Cyber Glow"), "neon_cyan"),
-                (tr("Minimalist Bold White"), "minimalist_white"),
-                (tr("Golden Luxury Card"), "golden_luxury"),
-                (tr("Comic Bang Punch"), "comic_punch"),
-            ]
-            saved_title_style = config.ui.get(
-                "title_style", DEFAULT_SUBTITLE_SETTINGS["title_style"]
-            )
-            saved_title_style_idx = 0
-            for i, (_, val) in enumerate(title_styles):
-                if val == saved_title_style:
-                    saved_title_style_idx = i
-                    break
-            params.title_style = stable_selectbox(
-                tr("Title Style"),
-                options=[val for _, val in title_styles],
-                default_value=title_styles[saved_title_style_idx][1],
-                key="title_style_select",
-                format_func=lambda val: dict(
-                    (v, label) for label, v in title_styles
-                ).get(val, val),
-                disabled=title_disabled,
-            )
-            _set_runtime_config("ui", "title_style", params.title_style)
-
-            title_row = st.columns([0.5, 0.5])
-            with title_row[0]:
-                title_positions = [
-                    (tr("Top"), "top"),
-                    (tr("Center"), "center"),
-                    (tr("Bottom"), "bottom"),
-                ]
-                saved_tpos = config.ui.get(
-                    "title_position", DEFAULT_SUBTITLE_SETTINGS["title_position"]
-                )
-                saved_tpos_idx = 0
-                for i, (_, val) in enumerate(title_positions):
-                    if val == saved_tpos:
-                        saved_tpos_idx = i
-                        break
-                params.title_position = stable_selectbox(
-                    tr("Title Position"),
-                    options=[val for _, val in title_positions],
-                    default_value=title_positions[saved_tpos_idx][1],
-                    key="title_position_select",
-                    format_func=lambda val: dict(
-                        (v, label) for label, v in title_positions
-                    ).get(val, val),
-                    disabled=title_disabled,
-                )
-                _set_runtime_config("ui", "title_position", params.title_position)
-
-            with title_row[1]:
-                title_durations = [
-                    (tr("Intro (First 4 Seconds)"), "intro"),
-                    (tr("Full Video"), "full"),
-                ]
-                saved_tdur = config.ui.get(
-                    "title_duration", DEFAULT_SUBTITLE_SETTINGS["title_duration"]
-                )
-                saved_tdur_idx = 0
-                for i, (_, val) in enumerate(title_durations):
-                    if val == saved_tdur:
-                        saved_tdur_idx = i
-                        break
-                params.title_duration = stable_selectbox(
-                    tr("Title Duration"),
-                    options=[val for _, val in title_durations],
-                    default_value=title_durations[saved_tdur_idx][1],
-                    key="title_duration_select",
-                    format_func=lambda val: dict(
-                        (v, label) for label, v in title_durations
-                    ).get(val, val),
-                    disabled=title_disabled,
-                )
-                _set_runtime_config("ui", "title_duration", params.title_duration)
-
-            title_animations = [
-                (tr("Pop Up (Spring)"), "pop_spring"),
-                (tr("Scale Up (Punch)"), "scale_up"),
-                (tr("Smooth Fade"), "fade"),
-                (tr("Slide Up"), "slide_up"),
-                (tr("Shake (Impact)"), "shake"),
-                (tr("None"), "none"),
-            ]
-            saved_tanim = config.ui.get(
-                "title_animation", DEFAULT_SUBTITLE_SETTINGS["title_animation"]
-            )
-            saved_tanim_idx = 0
-            for i, (_, val) in enumerate(title_animations):
-                if val == saved_tanim:
-                    saved_tanim_idx = i
-                    break
-            params.title_animation = stable_selectbox(
-                tr("Title Animation"),
-                options=[val for _, val in title_animations],
-                default_value=title_animations[saved_tanim_idx][1],
-                key="title_animation_select",
-                format_func=lambda val: dict(
-                    (v, label) for label, v in title_animations
-                ).get(val, val),
-                disabled=title_disabled,
-            )
-            _set_runtime_config("ui", "title_animation", params.title_animation)
+    title_panel.render_title_settings(
+        panel,
+        params,
+        tr=tr,
+        saved_ui_bool=_saved_ui_bool,
+        stable_selectbox=stable_selectbox,
+        set_runtime_config=_set_runtime_config,
+        defaults=DEFAULT_SUBTITLE_SETTINGS,
+    )
 
 
 def _render_generation_controls(
