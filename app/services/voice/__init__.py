@@ -155,8 +155,11 @@ from app.services.voice._shared import (  # noqa: F401  - re-exported
 # are exact -- we're the ones building the chunk list -- so every join gets
 # faded regardless of how short the adjoining silence is. The fade only
 # scales existing samples in place (no samples are dropped or inserted), so
-# total duration is unchanged and subtitle timing stays in sync.
-_CHUNK_BOUNDARY_FADE_MS = 15
+# total duration is unchanged and subtitle timing stays in sync. 50 ms is
+# the shortest fade that reliably hides a hard splice between arbitrary
+# waveform shapes; 15 ms (the previous value) still produces an audible
+# click when the join is voiced-to-voiced.
+_CHUNK_BOUNDARY_FADE_MS = 50
 
 
 def _concat_audio_files(audio_files: list[str], output_file: str) -> bool:
@@ -326,7 +329,15 @@ def _soften_voice_file(voice_file: str) -> None:
     natural sentence gap in that (default) path never gets its click fixed,
     no matter how good ``soften_audio_transitions`` itself is.
 
-    Best-effort and silent: softening is cosmetic, so any decode/encode
+    In addition to the click fix, the cleanup pass strips leading and
+    trailing silence from the model output and runs a spectral-gate
+    denoiser (``afftdn``) to remove the broadband hiss left by diffusion
+    samplers like OmniVoice. Without these two steps every TTS chunk
+    ships with ~100 ms of dead air at both ends (which compounds into long
+    gaps once chunks are concatenated) and audible white noise during
+    voiced segments.
+
+    Best-effort and silent: cleanup is cosmetic, so any decode/encode
     failure here must never turn a successful TTS call into a failed one.
     """
     if not voice_file or not os.path.isfile(voice_file) or os.path.getsize(voice_file) == 0:
@@ -345,11 +356,41 @@ def _soften_voice_file(voice_file: str) -> None:
             if res.returncode != 0 or not os.path.exists(pcm_wav):
                 return
 
-            if not soften_audio_transitions(pcm_wav):
-                return  # no silences worth softening; leave voice_file as-is
+            # One FFmpeg pass does the silence trim + denoise. silenceremove
+            # drops anything below -50 dBFS that's longer than 50 ms at the
+            # start/end of the file (start_periods=1, stop_periods=-1) so the
+            # output starts and ends on a voiced sample. afftdn removes the
+            # broadband hiss that diffusion samplers carry in the voiced
+            # signal. nf=-25 is a moderate setting that cleans the noise
+            # floor without dulling sibilants.
+            cleaned_wav = os.path.join(tmp_dir, "cleaned.wav")
+            clean_cmd = [
+                ffmpeg_binary, "-y", "-i", pcm_wav,
+                "-vn", "-ac", "1", "-ar", "24000",
+                "-af",
+                "silenceremove=start_periods=1:start_silence=0.05:"
+                "start_threshold=-50dB:stop_periods=-1:stop_silence=0.05:"
+                "stop_threshold=-50dB,afftdn=nf=-25",
+                "-codec:a", "pcm_s16le",
+                cleaned_wav,
+            ]
+            res = subprocess.run(clean_cmd, capture_output=True, text=True, check=False)
+            if res.returncode != 0 or not os.path.exists(cleaned_wav):
+                logger.warning(
+                    "voice clean pass failed, keeping unsoftened audio: "
+                    f"{(res.stderr or '').strip()[-200:]}"
+                )
+                return
+
+            # soften_audio_transitions still handles the internal silence
+            # boundaries that silenceremove leaves intact (sentence gaps
+            # inside the file). Best-effort: a file with no internal
+            # silences returns False and that's fine — the cleaned file is
+            # still kept.
+            soften_audio_transitions(cleaned_wav)
 
             re_encode_cmd = [
-                ffmpeg_binary, "-y", "-i", pcm_wav,
+                ffmpeg_binary, "-y", "-i", cleaned_wav,
                 "-vn", "-ac", "1", "-ar", "24000",
             ]
             if output_ext == ".mp3":
