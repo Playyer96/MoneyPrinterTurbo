@@ -66,6 +66,7 @@ from app.services import upload_post as upload_post_service
 from app.services import version_checker
 from webui import background_music
 from webui import generation_panel
+from webui import intro_outro_panel
 from webui import omnivoice_panel
 from webui import self_hosted_tts_panel
 from webui import settings_panels
@@ -192,6 +193,13 @@ LOOMLOOM_VIDEO_MODEL_PRICES = (
 )
 DEFAULT_SUBTITLE_SETTINGS = {
     "subtitle_enabled": True,
+    "subtitle_format": "both",
+    "subtitle_ass_style_override": "",
+    "subtitle_ass_event_overrides": "",
+    "subtitle_ass_shadow": 0.0,
+    "subtitle_ass_blur": 0.0,
+    "subtitle_ass_rotation": 0.0,
+    "subtitle_ass_background_color": "#000000",
     "font_name": "MicrosoftYaHeiBold.ttc",
     "subtitle_position": "bottom",
     "subtitle_display_mode": "sentence",
@@ -212,6 +220,21 @@ DEFAULT_SUBTITLE_SETTINGS = {
     "title_position": "top",
     "title_duration": "intro",
     "title_animation": "pop_spring",
+    "intro_enabled": False,
+    "intro_text": "",
+    "intro_duration": 3.0,
+    "intro_blur_strength": 35,
+    "intro_text_color": "#FFFFFF",
+    "intro_animation": "fade",
+    "intro_tts_enabled": False,
+    "outro_enabled": False,
+    "outro_text": "",
+    "outro_duration": 4.0,
+    "outro_blur_strength": 35,
+    "outro_text_color": "#FFFFFF",
+    "outro_animation": "fade",
+    "outro_tts_enabled": False,
+    "delivery_cues_enabled": False,
 }
 LOCAL_MATERIAL_EXTENSIONS = {
     ".mp4",
@@ -6107,6 +6130,24 @@ def _render_audio_settings(panel, params):
                     # The placeholder sentinel is only used for disabled display in non-automatic mode and does not overwrite the user's last
                     # The actual selected tone can be restored to its original setting after switching back to automatic dubbing.
                     _set_runtime_config("ui", "voice_name", voice_name)
+
+                # Per-call emotion / delivery override. Forwarded to TTS
+                # providers that accept it (today: OmniVoice's `style`
+                # field). Other providers silently ignore it so the same
+                # prompt can drive multiple backends.
+                saved_voice_style = config.ui.get("voice_style", "")
+                st.session_state.setdefault(
+                    "voice_style_input", saved_voice_style
+                )
+                params.voice_style = st.text_area(
+                    tr("Voice Emotion / Delivery Override"),
+                    key="voice_style_input",
+                    placeholder=tr("e.g. enthusiastic, energetic, mid-pitch"),
+                    help=tr("Voice Style Help"),
+                )
+                _set_runtime_config(
+                    "ui", "voice_style", params.voice_style
+                )
             elif tts_mode_enabled:
                 # If there is no sound available, a prompt message is displayed.
                 st.warning(
@@ -6810,6 +6851,149 @@ def _render_subtitle_settings(panel, params):
                     selected_rounded_subtitle_background,
                 )
 
+            # Advanced ASS customisation. Off by default; collapsing the
+            # expander keeps the main panel uncluttered for users who
+            # don't need raw style block edits.
+            with st.expander(
+                tr("Advanced ASS Subtitles"),
+                expanded=False,
+            ):
+                subtitle_format_options = [
+                    (tr("SRT only (legacy)"), "srt"),
+                    (tr("ASS only"), "ass"),
+                    (tr("Both SRT and ASS"), "both"),
+                ]
+                saved_format = config.ui.get(
+                    "subtitle_format",
+                    DEFAULT_SUBTITLE_SETTINGS.get("subtitle_format", "both"),
+                )
+                saved_format_idx = 2
+                for i, (_, val) in enumerate(subtitle_format_options):
+                    if val == saved_format:
+                        saved_format_idx = i
+                        break
+                selected_format = stable_selectbox(
+                    tr("Subtitle Output Format"),
+                    options=[val for _, val in subtitle_format_options],
+                    default_value=subtitle_format_options[saved_format_idx][1],
+                    key="subtitle_format_select",
+                    format_func=lambda v: dict(
+                        (val, label) for label, val in subtitle_format_options
+                    ).get(v, v),
+                    help=tr("Subtitle Format Help"),
+                    disabled=subtitle_settings_disabled,
+                )
+                params.subtitle_format = selected_format
+                _set_runtime_config(
+                    "ui", "subtitle_format", params.subtitle_format
+                )
+
+                saved_ass_style = config.ui.get(
+                    "subtitle_ass_style_override",
+                    "",
+                )
+                st.session_state.setdefault(
+                    "subtitle_ass_style_override_text", saved_ass_style
+                )
+                params.subtitle_ass_style_override = st.text_area(
+                    tr("Raw [V4+ Styles] Override"),
+                    key="subtitle_ass_style_override_text",
+                    help=tr("ASS Style Override Help"),
+                    disabled=subtitle_settings_disabled,
+                )
+                _set_runtime_config(
+                    "ui",
+                    "subtitle_ass_style_override",
+                    params.subtitle_ass_style_override,
+                )
+
+                saved_ass_events = config.ui.get(
+                    "subtitle_ass_event_overrides", ""
+                )
+                st.session_state.setdefault(
+                    "subtitle_ass_event_overrides_text", saved_ass_events
+                )
+                params.subtitle_ass_event_overrides = st.text_area(
+                    tr("Per-Event ASS Overrides"),
+                    key="subtitle_ass_event_overrides_text",
+                    help=tr("ASS Event Overrides Help"),
+                    disabled=subtitle_settings_disabled,
+                )
+                _set_runtime_config(
+                    "ui",
+                    "subtitle_ass_event_overrides",
+                    params.subtitle_ass_event_overrides,
+                )
+
+                transform_cols = st.columns(3)
+                st.session_state.setdefault(
+                    "subtitle_ass_shadow_slider",
+                    float(
+                        config.ui.get("subtitle_ass_shadow", 0) or 0
+                    ),
+                )
+                with transform_cols[0]:
+                    params.subtitle_ass_shadow = st.slider(
+                        tr("Shadow"),
+                        0.0,
+                        8.0,
+                        key="subtitle_ass_shadow_slider",
+                        disabled=subtitle_settings_disabled,
+                    )
+                    _set_runtime_config(
+                        "ui", "subtitle_ass_shadow", params.subtitle_ass_shadow
+                    )
+
+                st.session_state.setdefault(
+                    "subtitle_ass_blur_slider",
+                    float(config.ui.get("subtitle_ass_blur", 0) or 0),
+                )
+                with transform_cols[1]:
+                    params.subtitle_ass_blur = st.slider(
+                        tr("Blur"),
+                        0.0,
+                        8.0,
+                        key="subtitle_ass_blur_slider",
+                        disabled=subtitle_settings_disabled,
+                    )
+                    _set_runtime_config(
+                        "ui", "subtitle_ass_blur", params.subtitle_ass_blur
+                    )
+
+                st.session_state.setdefault(
+                    "subtitle_ass_rotation_slider",
+                    float(config.ui.get("subtitle_ass_rotation", 0) or 0),
+                )
+                with transform_cols[2]:
+                    params.subtitle_ass_rotation = st.slider(
+                        tr("Rotation"),
+                        -180.0,
+                        180.0,
+                        key="subtitle_ass_rotation_slider",
+                        disabled=subtitle_settings_disabled,
+                    )
+                    _set_runtime_config(
+                        "ui",
+                        "subtitle_ass_rotation",
+                        params.subtitle_ass_rotation,
+                    )
+
+                st.session_state.setdefault(
+                    "subtitle_ass_background_color_picker",
+                    config.ui.get("subtitle_ass_background_color", "#000000"),
+                )
+                params.subtitle_ass_background_color = st.color_picker(
+                    tr("ASS Background Plate Color"),
+                    key="subtitle_ass_background_color_picker",
+                    help=tr("ASS Background Plate Help"),
+                    disabled=subtitle_settings_disabled,
+                )
+                _set_runtime_config(
+                    "ui",
+                    "subtitle_ass_background_color",
+                    params.subtitle_ass_background_color,
+                )
+
             if video.subtitle_colors_are_indistinguishable(params):
                 # Matching text and background color is valid user choice; warn nearby without blocking generation.
                 st.warning(tr("Subtitle Colors Are Indistinguishable"))
@@ -6838,6 +7022,19 @@ def _render_subtitle_settings(panel, params):
 def _render_title_settings(panel, params):
     """Render video title / hook banner overlay settings and update parameters."""
     title_panel.render_title_settings(
+        panel,
+        params,
+        tr=tr,
+        saved_ui_bool=_saved_ui_bool,
+        stable_selectbox=stable_selectbox,
+        set_runtime_config=_set_runtime_config,
+        defaults=DEFAULT_SUBTITLE_SETTINGS,
+    )
+
+
+def _render_intro_outro_settings(panel, params):
+    """Render intro / outro blurred overlay and per-paragraph delivery cue controls."""
+    intro_outro_panel.render_intro_outro_settings(
         panel,
         params,
         tr=tr,
@@ -7260,6 +7457,7 @@ def _render_application():
 
     _render_subtitle_settings(right_panel, params)
     _render_title_settings(right_panel, params)
+    _render_intro_outro_settings(right_panel, params)
 
     generation_submitted = _render_generation_controls(
         params,

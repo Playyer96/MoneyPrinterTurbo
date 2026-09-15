@@ -162,6 +162,9 @@ class VideoParams(BaseModel):
     voice_name: Optional[str] = ""
     voice_volume: Optional[float] = 1.0
     voice_rate: Optional[float] = 1.0
+    # Free-text emotion / delivery instruction forwarded to TTS providers
+    # that accept one (today: OmniVoice). Other providers silently ignore it.
+    voice_style: Optional[str] = ""
     bgm_type: Optional[str] = "random"
     bgm_file: Optional[str] = ""
     bgm_volume: Optional[float] = 0.2
@@ -182,6 +185,10 @@ class VideoParams(BaseModel):
     sonilo_bgm_prompt: str = Field(default="", max_length=2000)
 
     subtitle_enabled: Optional[bool] = True
+    # "srt" keeps the legacy subtitle format; "ass" writes an Advanced
+    # SubStation Alpha file alongside the SRT so the user can edit the
+    # on-disk captions directly; "both" writes both files (default).
+    subtitle_format: Optional[str] = "both"
     subtitle_position: Optional[str] = config.ui.get(
         "subtitle_position", "bottom"
     )  # top, bottom, center, custom, two_thirds_bottom
@@ -204,10 +211,28 @@ class VideoParams(BaseModel):
     font_size: int = 60
     stroke_color: Optional[str] = "#000000"
     stroke_width: float = 1.5
+
+    # Raw ASS overrides. Accept full ``[V4+ Styles]`` blocks, per-event
+    # override tag strings (``\\an2\\pos(x,y)\\fscx105\\t(...)``), or named
+    # transform primitives (shadow / blur / rotation). Falsy values leave
+    # the rendered cue on the base style. Sized to a few hundred KB so a
+    # user can paste any reasonable ASS snippet without truncation.
+    subtitle_ass_style_override: Optional[str] = ""
+    subtitle_ass_event_overrides: Optional[str] = ""
+    subtitle_ass_shadow: Optional[float] = 0
+    subtitle_ass_blur: Optional[float] = 0
+    subtitle_ass_rotation: Optional[float] = 0
+    subtitle_ass_background_color: Optional[str] = ""
     n_threads: Optional[int] = 2
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
     custom_system_prompt: str = Field(default="", max_length=8000)
+
+    # Per-paragraph delivery cues. ``None`` means "no cues were generated", an
+    # empty list means "cues were requested but the model produced none", and a
+    # populated list has one entry per paragraph of ``video_script``.
+    paragraph_cues: Optional[List[str]] = None
+    delivery_cues_enabled: bool = False
 
     # Video title / hook banner overlay settings
     title_enabled: bool = False
@@ -218,6 +243,26 @@ class VideoParams(BaseModel):
     title_animation: Optional[str] = "pop_spring"
     title_font_name: Optional[str] = None
     title_font_size: Optional[int] = None
+
+    # Intro / outro blurred overlay. Renders a heavily blurred full-screen
+    # background with multi-line centered text, prepended or appended to the
+    # final video. Both are optional and disabled by default to preserve the
+    # legacy behaviour. ``intro_text`` / ``outro_text`` accept multi-line text
+    # via ``\n``; each non-empty line becomes its own line on the overlay.
+    intro_enabled: bool = False
+    intro_text: Optional[str] = ""
+    intro_duration: float = Field(default=3.0, ge=0.5, le=15.0)
+    intro_blur_strength: int = Field(default=35, ge=5, le=120)
+    intro_text_color: Optional[str] = "#FFFFFF"
+    intro_animation: Optional[str] = "fade"
+    intro_tts_enabled: bool = False
+    outro_enabled: bool = False
+    outro_text: Optional[str] = ""
+    outro_duration: float = Field(default=4.0, ge=0.5, le=15.0)
+    outro_blur_strength: int = Field(default=35, ge=5, le=120)
+    outro_text_color: Optional[str] = "#FFFFFF"
+    outro_animation: Optional[str] = "fade"
+    outro_tts_enabled: bool = False
 
     # Series mode: turn one subject into an ordered set of chapter videos.
     # ``series_parts`` is the single count input: 0 lets the model decide how
@@ -238,6 +283,7 @@ class SubtitleRequest(BaseModel):
     voice_name: Optional[str] = "zh-CN-XiaoxiaoNeural-Female"
     voice_volume: Optional[float] = 1.0
     voice_rate: Optional[float] = 1.2
+    voice_style: Optional[str] = ""
     bgm_type: Optional[str] = "random"
     bgm_file: Optional[str] = ""
     bgm_volume: Optional[float] = 0.2
@@ -257,6 +303,13 @@ class SubtitleRequest(BaseModel):
     font_size: int = 60
     stroke_color: Optional[str] = "#000000"
     stroke_width: float = 1.5
+    subtitle_format: Optional[str] = "both"
+    subtitle_ass_style_override: Optional[str] = ""
+    subtitle_ass_event_overrides: Optional[str] = ""
+    subtitle_ass_shadow: Optional[float] = 0
+    subtitle_ass_blur: Optional[float] = 0
+    subtitle_ass_rotation: Optional[float] = 0
+    subtitle_ass_background_color: Optional[str] = ""
     video_source: Optional[str] = "local"
     subtitle_enabled: Optional[str] = "true"
 
@@ -280,7 +333,8 @@ class VideoScriptParams:
       "video_language": "",
       "paragraph_number": 1,
       "video_script_prompt": "",
-      "custom_system_prompt": ""
+      "custom_system_prompt": "",
+      "delivery_cues_enabled": false
     }
     """
 
@@ -289,6 +343,11 @@ class VideoScriptParams:
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
     custom_system_prompt: str = Field(default="", max_length=8000)
+    # When True, the LLM emits a `[Cue: <delivery>]` line before each paragraph
+    # and the response payload includes `paragraph_cues`. The audio stage can
+    # then forward each cue as a per-paragraph voice_style to TTS providers that
+    # accept one (today: OmniVoice).
+    delivery_cues_enabled: bool = False
 
 
 class VideoTermsParams:
@@ -389,6 +448,10 @@ class TaskListData(BaseModel):
 
 class VideoScriptData(BaseModel):
     video_script: str
+    # Per-paragraph delivery cues returned by the script generator. Empty
+    # strings fall back to the configured `voice_style`. Length matches the
+    # paragraph count in `video_script` when delivery cues are enabled.
+    paragraph_cues: Optional[List[str]] = None
 
 
 class VideoTermsData(BaseModel):

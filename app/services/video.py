@@ -26,10 +26,11 @@ from moviepy import (
     TextClip,
     VideoFileClip,
     afx,
+    concatenate_videoclips,
 )
 from moviepy.video.io import ffmpeg_writer as moviepy_ffmpeg_writer
 from moviepy.video.tools.subtitles import SubtitlesClip
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from app.config import config
 from app.models import const
@@ -2149,6 +2150,38 @@ def _build_ass_subtitles(
     stroke_width = max(0, int(round(float(getattr(params, "stroke_width", 0) or 0))))
     margin_x = max(10, int(video_width * 0.05))
 
+    background_color = (
+        getattr(params, "subtitle_ass_background_color", "") or ""
+    ) or (
+        "#000000"
+        if bool(getattr(params, "subtitle_background_enabled", False))
+        or bool(getattr(params, "rounded_subtitle_background", False))
+        else ""
+    )
+    back_color = (
+        _ass_color(background_color, "#000000") if background_color else "&H00000000"
+    )
+
+    custom_style_block = (
+        (getattr(params, "subtitle_ass_style_override", "") or "").strip()
+    )
+    if custom_style_block:
+        style_block = custom_style_block
+        if style_block.lower().startswith("[v4+ styles]"):
+            style_block = style_block[len("[v4+ Styles]"):].lstrip("\r\n")
+        styles_section = f"[V4+ Styles]\n{style_block}"
+    else:
+        styles_section = (
+            "[V4+ Styles]\n"
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+            "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+            "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+            "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+            f"Style: Default,{font_name},{ass_font_size},{normal_color},"
+            f"{normal_color},{stroke_color},{back_color},-1,0,0,0,100,100,"
+            f"0,0,1,{stroke_width},0,5,{margin_x},{margin_x},0,1"
+        )
+
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {video_width}
@@ -2156,9 +2189,7 @@ PlayResY: {video_height}
 WrapStyle: 0
 ScaledBorderAndShadow: yes
 
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{font_name},{ass_font_size},{normal_color},{normal_color},{stroke_color},&H00000000,-1,0,0,0,100,100,0,0,1,{stroke_width},0,5,{margin_x},{margin_x},0,1
+{styles_section}
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -2191,6 +2222,25 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         timed_cues,
         getattr(params, "subtitle_display_mode", "sentence"),
     )
+    raw_event_overrides = (
+        getattr(params, "subtitle_ass_event_overrides", "") or ""
+    ).strip()
+
+    shadow_tag = ""
+    if float(getattr(params, "subtitle_ass_shadow", 0) or 0) > 0:
+        shadow_tag = f"\\shad{int(float(getattr(params, 'subtitle_ass_shadow')))}"
+    blur_tag = ""
+    if float(getattr(params, "subtitle_ass_blur", 0) or 0) > 0:
+        blur_tag = f"\\blur{int(float(getattr(params, 'subtitle_ass_blur')))}"
+    rotation_tag = ""
+    if float(getattr(params, "subtitle_ass_rotation", 0) or 0) % 360 != 0:
+        rotation_tag = (
+            f"\\frz{int(float(getattr(params, 'subtitle_ass_rotation')) % 360)}"
+        )
+    static_event_overrides = "".join(
+        tag for tag in (shadow_tag, blur_tag, rotation_tag) if tag
+    )
+
     events: list[str] = []
     for timing, raw_phrase in display_cues:
         start, end = timing
@@ -2209,9 +2259,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         else:
             position_tag = f"\\an{alignment}\\pos({x:.0f},{y:.0f})"
         text = _ass_dialogue_text(phrase, normal_color, highlight_color)
+        body_overrides = "".join(
+            tag
+            for tag in (animation_tag, static_event_overrides, raw_event_overrides)
+            if tag
+        )
         events.append(
             f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,,"
-            f"{{{position_tag}{animation_tag}}}{text}"
+            f"{{{position_tag}{body_overrides}}}{text}"
         )
     return header + "\n".join(events) + "\n" if events else ""
 
@@ -2251,7 +2306,7 @@ def _render_subtitle_pngs(
     Pillow renders the text ONCE per cue (vs. once per frame in
     MoviePy), and the ffmpeg overlay+encode runs in a single pass.
     """
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
     if not os.path.exists(font_path):
         return []
@@ -2431,6 +2486,52 @@ def _run_ffmpeg_subtitle_filter(
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     stderr = " | ".join((result.stderr or "").strip().splitlines()[-5:])
     return result.returncode == 0, stderr
+
+
+def _burn_prebuilt_ass(
+    *,
+    video_path: str,
+    audio_path: str,
+    ass_path: str,
+    font_path: str,
+    output_file: str,
+    voice_volume: float,
+    threads: int,
+    max_duration: float | None = None,
+) -> bool:
+    """Render an on-disk ``.ass`` file through ffmpeg's native ``ass=`` filter.
+
+    Skips the SRT-to-ASS regeneration so user edits to the on-disk ASS
+    file (full custom ``[V4+ Styles]`` blocks, per-event overrides, raw
+    transform tags, ...) reach the output verbatim. Falls through to the
+    legacy path on failure so the pipeline never hard-stops on a malformed
+    ASS file.
+    """
+    ffmpeg_binary = utils.get_ffmpeg_binary()
+    ass_filter = (
+        f"ass=filename='{_escape_ffmpeg_filter_path(os.path.abspath(ass_path))}'"
+        f":fontsdir='{_escape_ffmpeg_filter_path(os.path.abspath(os.path.dirname(font_path)))}'"
+    )
+    if not _ffmpeg_filter_exists(ffmpeg_binary, "ass"):
+        # Same fallback path the SRT-based ASS renderer takes: ship the
+        # overlay MOV from a container ffmpeg and overlay it locally.
+        return False
+
+    succeeded, stderr = _run_ffmpeg_subtitle_filter(
+        video_path=video_path,
+        audio_path=audio_path,
+        output_file=output_file,
+        video_filter=ass_filter,
+        voice_volume=voice_volume,
+        threads=threads,
+        max_duration=max_duration,
+    )
+    if not succeeded:
+        logger.warning(
+            "prebuilt ASS render failed; falling back to SRT path. "
+            f"last stderr: {stderr}"
+        )
+    return succeeded
 
 
 def _burn_subtitles_with_ffmpeg_ass(
@@ -2792,6 +2893,351 @@ def _burn_subtitles_with_png_overlay(
     return True
 
 
+def _create_blurred_text_clip(
+    *,
+    params: VideoParams,
+    text: str,
+    duration: float,
+    video_width: int,
+    video_height: int,
+    text_color: str,
+    blur_strength: int,
+    font_name: Optional[str] = None,
+):
+    """
+    Render a fully-blurred full-screen overlay with centered multi-line text.
+
+    The background is a procedurally generated blurred gradient — no source
+    clip or external image is required, so the overlay stays self-contained
+    and never reveals the underlying video. ``text`` may contain ``\\n``
+    separators, one per line; empty lines collapse to a small vertical
+    spacer so the overlay breathes.
+    """
+    text = (text or "").strip()
+    if not text or duration <= 0:
+        return None
+
+    # Cap blur so very large strengths do not blow up MoviePy's per-frame
+    # Gaussian. Beyond ~80 px the eye stops telling the difference anyway.
+    blur_strength = max(5, min(int(blur_strength), 80))
+    width = max(64, int(video_width))
+    height = max(64, int(video_height))
+
+    background = _build_blurred_background(width, height, blur_strength)
+
+    text_clips = _build_overlay_text_clips(
+        text=text,
+        width=width,
+        height=height,
+        text_color=text_color,
+        font_name=font_name or getattr(params, "font_name", None),
+    )
+    if not text_clips:
+        return None
+
+    layers = [ImageClip(background).with_duration(duration)]
+    layers.extend(text_clips)
+    composite = CompositeVideoClip(layers, size=(width, height))
+    composite = composite.with_duration(duration)
+    return composite
+
+
+def _build_blurred_background(width: int, height: int, blur_strength: int):
+    """
+    Procedurally build a dark, blurred gradient PNG the size of one frame.
+
+    Generated once per overlay (cheap; the same background is reused for every
+    frame), then MoviePy caches the underlying image. No source media needed,
+    so the result never accidentally leaks real footage.
+    """
+    radius = max(8, blur_strength * 2)
+    diag = int(math.hypot(width, height))
+    image = Image.new("RGB", (diag, diag), (8, 10, 18))
+    draw = ImageDraw.Draw(image)
+    # Two-stop diagonal gradient: deep slate to a subtle violet-blue. The
+    # Gaussian blur turns these stops into a soft cinematic backdrop.
+    for y in range(diag):
+        t = y / float(diag)
+        r = int(8 + (40 - 8) * t)
+        g = int(10 + (30 - 10) * t)
+        b = int(18 + (60 - 18) * t)
+        draw.line([(0, y), (diag, y)], fill=(r, g, b))
+    draw.ellipse(
+        [(diag * 0.05, diag * 0.1), (diag * 0.95, diag * 0.9)],
+        fill=(28, 35, 70),
+    )
+    image = image.filter(ImageFilter.GaussianBlur(radius=radius))
+    # Crop the square diagonal into the video aspect.
+    left = (diag - width) // 2
+    top = (diag - height) // 2
+    return np.asarray(
+        image.crop((left, top, left + width, top + height)), dtype=np.uint8
+    )
+
+
+def _build_overlay_text_clips(
+    *,
+    text: str,
+    width: int,
+    height: int,
+    text_color: str,
+    font_name: Optional[str],
+):
+    """Build centered, multi-line TextClips for the overlay. Pure helper."""
+    available_fonts = [
+        f for f in os.listdir(utils.font_dir()) if f.endswith((".ttf", ".ttc"))
+    ]
+    chosen_font = None
+    if font_name and font_name in available_fonts:
+        chosen_font = font_name
+    elif available_fonts:
+        chosen_font = (
+            "STHeitiMedium.ttc"
+            if "STHeitiMedium.ttc" in available_fonts
+            else available_fonts[0]
+        )
+    font_path = os.path.join(utils.font_dir(), chosen_font) if chosen_font else ""
+    if font_path and os.name == "nt":
+        font_path = font_path.replace("\\", "/")
+
+    font_size = max(28, int(height * 0.075))
+    line_max_width = int(width * 0.85)
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    if not lines:
+        return []
+
+    clips = []
+    n_lines = len(lines)
+    line_height = int(font_size * 1.3)
+    total_height = n_lines * line_height
+    y_start = (height - total_height) // 2
+
+    for index, line in enumerate(lines):
+        wrapped, _ = wrap_text(
+            line,
+            max_width=line_max_width,
+            font=font_path or "Arial",
+            fontsize=font_size,
+        )
+        if font_path:
+            text_clip = TextClip(
+                text=wrapped,
+                font=font_path,
+                font_size=font_size,
+                color=text_color,
+                stroke_color="#000000",
+                stroke_width=2,
+                method="caption",
+                size=(line_max_width, None),
+                text_align="center",
+            )
+        else:
+            text_clip = TextClip(
+                text=wrapped,
+                font="Arial",
+                font_size=font_size,
+                color=text_color,
+                method="caption",
+                size=(line_max_width, None),
+                text_align="center",
+            )
+        clip_y = y_start + index * line_height + (line_height - text_clip.h) // 2
+        clips.append(text_clip.with_position(("center", clip_y)))
+    return clips
+
+
+def _apply_overlay_fade(clip, duration: float, animation: str = "fade"):
+    """
+    Add a fade-in / fade-out envelope to an intro or outro overlay clip.
+
+    Animations:
+    * ``fade`` (default): fade in over the first 25% of duration, fade out
+      over the last 25%.
+    * ``fade_in``: fade in over the first 30%, hold, no fade-out.
+    * ``fade_out``: full opacity, fade out over the last 30%.
+    * ``none`` or empty: passthrough.
+    """
+    if clip is None or animation in (None, "", "none"):
+        return clip
+    duration = float(duration or 0.0)
+    if duration <= 0:
+        return clip
+    fade_in_dur = min(0.6, duration * 0.25)
+    fade_out_dur = min(0.6, duration * 0.25)
+
+    def fade_transform(get_frame, t):
+        frame = get_frame(t)
+        if frame.ndim == 2:
+            return (frame * alpha_at(t)).astype(frame.dtype, copy=False)
+        if frame.shape[2] == 4:
+            fc = frame.copy()
+            fc[:, :, 3] = np.clip(fc[:, :, 3] * alpha_at(t), 0, 255).astype(frame.dtype)
+            return fc
+        return (frame * alpha_at(t)).astype(frame.dtype, copy=False)
+
+    def alpha_at(t: float) -> float:
+        if animation == "fade_in":
+            if t < fade_in_dur:
+                return max(0.0, min(t / fade_in_dur, 1.0))
+            return 1.0
+        if animation == "fade_out":
+            if t > duration - fade_out_dur:
+                return max(0.0, min((duration - t) / fade_out_dur, 1.0))
+            return 1.0
+        # default: symmetric fade
+        if t < fade_in_dur:
+            return max(0.0, min(t / fade_in_dur, 1.0))
+        if t > duration - fade_out_dur:
+            return max(0.0, min((duration - t) / fade_out_dur, 1.0))
+        return 1.0
+
+    return clip.transform(fade_transform, apply_to=["mask"])
+
+
+def _build_intro_outro_clips(
+    params: VideoParams,
+    video_width: int,
+    video_height: int,
+    video_duration: float,
+):
+    """
+    Build (intro_clip, outro_clip, intro_audio_clip, outro_audio_clip) for
+    prepending/appending to the final video.
+
+    Returns ``(None, None, None, None)`` when both overlays are disabled, or
+    ``None`` for whichever side is disabled. Audio clips are only produced
+    when the matching ``intro_tts_enabled`` / ``outro_tts_enabled`` flag is
+    True; callers must handle the None cases by treating that side as silent.
+
+    ponytail: TTS is invoked directly here; if a provider call fails, the
+    overlay falls back to a silent intro/outro rather than failing the whole
+    render. Upgrade to surface the error when callers start surfacing it.
+    """
+    intro_clip = None
+    intro_audio_clip = None
+    if getattr(params, "intro_enabled", False):
+        intro_text = getattr(params, "intro_text", "") or params.video_subject or ""
+        intro_clip = _create_blurred_text_clip(
+            params=params,
+            text=(
+                "Lo que viene en este video\n\n"
+                + (intro_text or "").strip()
+                if (intro_text or "").strip()
+                else "Lo que viene en este video"
+            ),
+            duration=float(getattr(params, "intro_duration", 3.0) or 3.0),
+            video_width=video_width,
+            video_height=video_height,
+            text_color=getattr(params, "intro_text_color", "#FFFFFF") or "#FFFFFF",
+            blur_strength=int(getattr(params, "intro_blur_strength", 35) or 35),
+        )
+        if intro_clip is not None and getattr(params, "intro_tts_enabled", False):
+            intro_audio_clip = _render_overlay_tts(
+                params=params,
+                text=(
+                    "Lo que viene en este video. "
+                    + (intro_text or "").strip().replace("\n", ". ")
+                    if (intro_text or "").strip()
+                    else "Lo que viene en este video"
+                ),
+                duration=intro_clip.duration,
+            )
+
+    outro_clip = None
+    outro_audio_clip = None
+    if getattr(params, "outro_enabled", False):
+        outro_text = getattr(params, "outro_text", "") or ""
+        if not outro_text.strip():
+            outro_text = (
+                "Gracias por ver. "
+                "Lo que vamos a llenar a continuación. "
+                "Continúa en la siguiente parte."
+            )
+        else:
+            outro_text = outro_text.replace("\n", ". ")
+        outro_clip = _create_blurred_text_clip(
+            params=params,
+            text=outro_text,
+            duration=float(getattr(params, "outro_duration", 4.0) or 4.0),
+            video_width=video_width,
+            video_height=video_height,
+            text_color=getattr(params, "outro_text_color", "#FFFFFF") or "#FFFFFF",
+            blur_strength=int(getattr(params, "outro_blur_strength", 35) or 35),
+        )
+        if outro_clip is not None and getattr(params, "outro_tts_enabled", False):
+            outro_audio_clip = _render_overlay_tts(
+                params=params,
+                text=outro_text,
+                duration=outro_clip.duration,
+            )
+
+    # Clamp overlays so a misconfigured duration cannot blow past the main
+    # video into a 10x longer clip.
+    if intro_clip is not None:
+        intro_clip = intro_clip.with_duration(
+            min(intro_clip.duration, max(0.5, video_duration))
+        )
+        intro_clip = _apply_overlay_fade(
+            intro_clip,
+            intro_clip.duration,
+            getattr(params, "intro_animation", "fade") or "fade",
+        )
+    if outro_clip is not None:
+        outro_clip = outro_clip.with_duration(
+            min(outro_clip.duration, max(0.5, video_duration))
+        )
+        outro_clip = _apply_overlay_fade(
+            outro_clip,
+            outro_clip.duration,
+            getattr(params, "outro_animation", "fade") or "fade",
+        )
+    if intro_audio_clip is not None and intro_clip is not None:
+        intro_audio_clip = intro_audio_clip.with_duration(intro_clip.duration)
+    if outro_audio_clip is not None and outro_clip is not None:
+        outro_audio_clip = outro_audio_clip.with_duration(outro_clip.duration)
+    return intro_clip, outro_clip, intro_audio_clip, outro_audio_clip
+
+
+def _render_overlay_tts(params: VideoParams, text: str, duration: float):
+    """
+    Render intro / outro narration audio using the project's TTS provider.
+
+    Returns ``None`` when the provider fails or the project is in a no-voice
+    state, so callers fall back to a silent overlay. Reuses the project's
+    voice_name and voice_rate so the intro/outro voice matches the narration.
+    """
+    voice_name = getattr(params, "voice_name", "") or ""
+    if not voice_name or text is None or not text.strip():
+        return None
+    try:
+        from app.services import voice as voice_service
+
+        parsed_voice = voice_service.parse_voice_name(voice_name)
+        audio_path = os.path.join(
+            tempfile.gettempdir(),
+            f"overlay_tts_{abs(hash(text)) % 10_000_000}.mp3",
+        )
+        sub_maker = voice_service.tts(
+            text=text,
+            voice_name=parsed_voice,
+            voice_rate=float(getattr(params, "voice_rate", 1.0) or 1.0),
+            voice_file=audio_path,
+            voice_volume=float(getattr(params, "voice_volume", 1.0) or 1.0),
+            voice_style="",
+        )
+        if sub_maker is None or not os.path.exists(audio_path):
+            return None
+        audio_clip = AudioFileClip(audio_path)
+        # Cap narration at the overlay duration so a verbose intro does not
+        # bleed past the visual fade.
+        if duration and audio_clip.duration > duration:
+            audio_clip = audio_clip.subclipped(0, duration)
+        return audio_clip
+    except Exception as exc:
+        logger.warning(f"overlay TTS failed, falling back to silence: {exc}")
+        return None
+
+
 def _create_title_clip(
     params: VideoParams,
     video_width: int,
@@ -3006,6 +3452,8 @@ def _try_fast_subtitle_render(
         and subtitle_path
         and os.path.exists(subtitle_path)
         and not params.title_enabled
+        and not getattr(params, "intro_enabled", False)
+        and not getattr(params, "outro_enabled", False)
         and not bgm_file_override
         and not _resolve_subtitle_background_color_locally(
             getattr(params, "text_background_color", False)
@@ -3030,6 +3478,40 @@ def _try_fast_subtitle_render(
         "threads": int(getattr(params, "n_threads", 2) or 2),
         "fps": int(fps),
     }
+
+    # Fastest path: when a hand-authored or pipeline-generated ``.ass`` file
+    # sits next to the SRT, render it directly. This respects any edits the
+    # user made on disk (full ASS power: ``\an``, ``\fad``, ``\t``, ``\org``,
+    # ``\clip``, multi-line ``\N``, etc.) and skips the per-task regeneration
+    # that would otherwise overwrite the file's style choices.
+    prebuilt_ass = (
+        os.path.splitext(subtitle_path)[0] + ".ass"
+        if subtitle_path.lower().endswith(".srt")
+        else ""
+    )
+    if prebuilt_ass and os.path.isfile(prebuilt_ass):
+        try:
+            started = perf_counter()
+            if _burn_prebuilt_ass(
+                video_path=video_path,
+                audio_path=audio_path,
+                ass_path=prebuilt_ass,
+                font_path=font_path,
+                output_file=output_file,
+                voice_volume=common["voice_volume"],
+                threads=common["threads"],
+                max_duration=None,
+            ):
+                logger.info(
+                    "prebuilt ASS subtitle burn-in succeeded in "
+                    f"{perf_counter() - started:.2f}s"
+                )
+                return True
+        except Exception as exc:
+            logger.warning(
+                f"prebuilt ASS fast path raised: {exc}; falling back"
+            )
+
     try:
         started = perf_counter()
         if _burn_subtitles_with_ffmpeg_ass(
@@ -3520,6 +4002,40 @@ def generate_video(
 
         final_video_clip = video_clip.with_audio(audio_clip)
         clip_stack.callback(final_video_clip.close)
+
+        # Optional intro / outro blurred-text overlays. The audio track is
+        # untouched; intro/outro are silent lead-in / lead-out sections.
+        intro_clip, outro_clip, intro_audio_clip, outro_audio_clip = (
+            _build_intro_outro_clips(
+                params=params,
+                video_width=video_width,
+                video_height=video_height,
+                video_duration=final_video_clip.duration,
+            )
+        )
+        if intro_audio_clip is not None or outro_audio_clip is not None:
+            # Build a silent AudioClip sized to the intro / outro durations
+            # so the narration has a slot at the right offset even if the
+            # TTS returned a slightly shorter clip.
+            narration_streams = []
+            if intro_audio_clip is not None:
+                narration_streams.append(intro_audio_clip)
+            if outro_audio_clip is not None:
+                narration_streams.append(outro_audio_clip)
+            audio_streams = narration_streams + audio_streams
+        if intro_clip is not None or outro_clip is not None:
+            # Intro / outro share the main clip's fps and resolution so
+            # concatenate_videoclips does not re-encode.
+            target_fps = int(getattr(final_video_clip, "fps", 0) or fps or 30)
+            seq = []
+            if intro_clip is not None:
+                seq.append(intro_clip.with_fps(target_fps))
+            seq.append(final_video_clip)
+            if outro_clip is not None:
+                seq.append(outro_clip.with_fps(target_fps))
+            final_video_clip = concatenate_videoclips(seq, method="compose")
+            clip_stack.callback(final_video_clip.close)
+
         # reuse the input audio's sample rate explicitly, falling back to
         # MoviePy's 44100 Hz default when it cannot be read. that avoids another
         # resample and the quality swings it causes across environments,

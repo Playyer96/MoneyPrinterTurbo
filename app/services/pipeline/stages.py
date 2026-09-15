@@ -141,14 +141,27 @@ _mark_task_failed = mark_task_failed
 def generate_script(task_id, params):
     logger.info("\n\n## generating video script")
     video_script = params.video_script.strip()
+    cues_enabled = bool(getattr(params, "delivery_cues_enabled", False))
     if not video_script:
-        video_script = llm.generate_script(
-            video_subject=params.video_subject,
-            language=params.video_language,
-            paragraph_number=params.paragraph_number,
-            video_script_prompt=params.video_script_prompt,
-            custom_system_prompt=params.custom_system_prompt,
-        )
+        if cues_enabled:
+            video_script, paragraph_cues = llm.generate_script_with_cues(
+                video_subject=params.video_subject,
+                language=params.video_language,
+                paragraph_number=params.paragraph_number,
+                video_script_prompt=params.video_script_prompt,
+                custom_system_prompt=params.custom_system_prompt,
+            )
+            # Persist cues so the audio stage and any re-run can pick them up.
+            params.paragraph_cues = paragraph_cues
+        else:
+            video_script = llm.generate_script(
+                video_subject=params.video_subject,
+                language=params.video_language,
+                paragraph_number=params.paragraph_number,
+                video_script_prompt=params.video_script_prompt,
+                custom_system_prompt=params.custom_system_prompt,
+            )
+            params.paragraph_cues = None
     else:
         logger.debug(f"video script: \n{video_script}")
 
@@ -380,12 +393,26 @@ def generate_audio(
 
         logger.info("no custom audio file provided, using TTS to generate audio.")
         audio_file = path.join(utils.task_dir(task_id), "audio.mp3")
-        sub_maker = voice.tts(
-            text=video_script,
-            voice_name=voice.parse_voice_name(params.voice_name),
-            voice_rate=params.voice_rate,
-            voice_file=audio_file,
-        )
+        paragraph_cues = getattr(params, "paragraph_cues", None)
+        global_voice_style = str(getattr(params, "voice_style", "") or "")
+        if paragraph_cues and any(c.strip() for c in paragraph_cues):
+            sub_maker = voice.tts_with_styles(
+                text=video_script,
+                voice_name=voice.parse_voice_name(params.voice_name),
+                voice_rate=params.voice_rate,
+                voice_file=audio_file,
+                voice_volume=params.voice_volume,
+                voice_styles=list(paragraph_cues),
+                default_voice_style=global_voice_style,
+            )
+        else:
+            sub_maker = voice.tts(
+                text=video_script,
+                voice_name=voice.parse_voice_name(params.voice_name),
+                voice_rate=params.voice_rate,
+                voice_file=audio_file,
+                voice_style=global_voice_style,
+            )
         if sub_maker is None:
             # The real failure reason (e.g. quota, auth, bad voice) is already
             # logged by the voice provider. Surface a hint pointing the user
@@ -401,10 +428,10 @@ def generate_audio(
             return None, None, None
         # Measure audio length. Non-real-word providers (Gemini, SiliconFlow,
         # MiniMax, ...) populate sub_maker.duration from the actual rendered
-        # audio length, so the file probe is pure overhead. Edge TTS and
-        # Azure v2 return word boundaries instead, leaving a fixed audio tail
+        # audio length, so the file probe is pure overhead. Edge TTS returns
+        # word boundaries, leaving a fixed audio tail
         # (~0.88s for Edge) past the last boundary that only the file probe
-        # exposes. The probe still runs for those two providers because the
+        # exposes. The probe still runs for Edge because the
         # under-count sizes paid generate_bgm() calls, is reported as
         # audio_duration to the API/WebUI, and under-sources
         # download_videos() material, scaled by video_count.
@@ -455,7 +482,7 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
 
     if sub_maker is None and subtitle_provider != "whisper":
         # Custom audio does not go through TTS, so there is no sub_maker
-        # timeline from Edge/Azure TTS. Only Whisper can transcribe subtitles
+        # timeline from Edge TTS. Only Whisper can transcribe subtitles
         # directly from audio files; other subtitle providers keep their
         # original behavior to avoid generating incorrect empty timelines.
         logger.warning(
@@ -480,6 +507,11 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
 
     display_mode = getattr(params, "subtitle_display_mode", "sentence")
     is_word_level = display_mode != "sentence"
+    subtitle_format = (
+        str(getattr(params, "subtitle_format", "both") or "both").strip().lower()
+    )
+    if subtitle_format not in {"srt", "ass", "both"}:
+        subtitle_format = "both"
 
     if subtitle_provider == "edge":
         voice.create_subtitle(
@@ -515,6 +547,13 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     if not subtitle_lines:
         logger.warning(f"subtitle file is invalid: {subtitle_path}")
         return ""
+
+    if subtitle_format in {"ass", "both"}:
+        ass_path = os.path.splitext(subtitle_path)[0] + ".ass"
+        if subtitle.create_ass_subtitle(
+            subtitle_path, ass_path, params
+        ):
+            logger.info(f"ASS subtitle written: {ass_path}")
 
     return subtitle_path
 
