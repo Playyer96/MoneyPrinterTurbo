@@ -142,7 +142,9 @@ class TestVideoService(unittest.TestCase):
         self.assertNotIn(vd.subtitle_styles.HIGHLIGHT_OPEN, document)
         self.assertIn(r"\c&H000BB9F0&", document)
         self.assertIn(r"\fscx65\fscy65\t(0,180,0.5,\fscx100\fscy100)", document)
-        self.assertIn(r"\an8\pos(540,576)", document)
+        # two_thirds_bottom centres the block on 68 % of the height, inside
+        # the 9:16 safe zone.
+        self.assertIn(r"\an5\pos(540,1306)", document)
 
     def test_scale_subtitle_frame_rejects_unsupported_shapes(self):
         """Unsupported channels or dimensions must fail clearly, so damaged frames are not passed on to the video encoder."""
@@ -499,6 +501,33 @@ class TestVideoService(unittest.TestCase):
         materials = vd.preprocess_video([m], clip_duration=4)
 
         self.assertEqual(materials, [])
+
+    def test_preprocess_video_resolves_material_by_basename_fallback(self):
+        """
+        Material URLs are persisted with the absolute path of whichever root
+        recorded them (e.g. the container's /MoneyPrinterTurbo). When the
+        pipeline later runs under a different root, the same file is still in
+        local_videos under the same name, so the basename fallback must rescue
+        the task instead of skipping the material.
+        """
+        local_videos_dir = utils.storage_dir("local_videos", create=True)
+        safe_img_path = os.path.join(local_videos_dir, "test-cross-root-1.png")
+        shutil.copy2(self.test_img_path, safe_img_path)
+
+        # absolute path recorded under a root that does not exist here
+        m = MaterialInfo(provider="local", url="/MoneyPrinterTurbo/storage/local_videos/test-cross-root-1.png")
+
+        try:
+            materials = vd.preprocess_video([m], clip_duration=4)
+
+            self.assertEqual(len(materials), 1)
+            self.assertTrue(materials[0].url.endswith(".mp4"))
+
+            if os.path.exists(materials[0].url):
+                os.remove(materials[0].url)
+        finally:
+            if os.path.exists(safe_img_path):
+                os.remove(safe_img_path)
 
     def test_get_bgm_file_accepts_song_directory_filename(self):
         """
