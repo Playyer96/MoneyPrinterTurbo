@@ -1089,7 +1089,7 @@ class TestElevenLabsVoice(unittest.TestCase):
         fake_sub2.subs = ["Segment 2"]
         fake_sub2.offset = [(2000000, 18000000)]
 
-        def fake_single_tts(text, voice_name, voice_rate, voice_file, voice_volume=1.0):
+        def fake_single_tts(text, voice_name, voice_rate, voice_file, voice_volume=1.0, **kwargs):
             if "Segment 1" in text:
                 _write_test_wav(voice_file, 1.5)
                 return fake_sub1
@@ -1182,7 +1182,7 @@ class TestElevenLabsVoice(unittest.TestCase):
         fake_sub.subs = ["Hello"]
         fake_sub.offset = [(1000000, 12000000)]
 
-        def fake_single_tts(text, voice_name, voice_rate, voice_file, voice_volume=1.0):
+        def fake_single_tts(text, voice_name, voice_rate, voice_file, voice_volume=1.0, **kwargs):
             _write_test_wav(voice_file, 1.2)
             return fake_sub
 
@@ -1420,7 +1420,7 @@ class TestElevenLabsVoice(unittest.TestCase):
             return sub
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            def real_single_tts_wav(text, voice_name, voice_rate, voice_file, voice_volume=1.0):
+            def real_single_tts_wav(text, voice_name, voice_rate, voice_file, voice_volume=1.0, **kwargs):
                 # 写入真实的 1 秒 WAV 音频数据
                 with wave.open(voice_file, "wb") as wf:
                     wf.setnchannels(1)
@@ -1488,7 +1488,7 @@ class TestElevenLabsVoice(unittest.TestCase):
             Subtitle(1, timedelta(seconds=0.0), timedelta(seconds=1.0), "Hello"),
         ]
 
-        def fake_single_tts_empty(text, voice_name, voice_rate, voice_file, voice_volume=1.0):
+        def fake_single_tts_empty(text, voice_name, voice_rate, voice_file, voice_volume=1.0, **kwargs):
             Path(voice_file).touch()  # 0-byte empty file
             return fake_sub
 
@@ -1512,7 +1512,7 @@ class TestElevenLabsVoice(unittest.TestCase):
             Subtitle(1, timedelta(seconds=0.0), timedelta(seconds=1.0), "Hello"),
         ]
 
-        def fake_single_tts_corrupted(text, voice_name, voice_rate, voice_file, voice_volume=1.0):
+        def fake_single_tts_corrupted(text, voice_name, voice_rate, voice_file, voice_volume=1.0, **kwargs):
             with open(voice_file, "wb") as f:
                 f.write(b"NOT_A_VALID_AUDIO_FILE_DATA_CORRUPTED_1234567890")
             return fake_sub

@@ -261,6 +261,30 @@ def clamp_clip_duration(value, default: int = 5) -> int:
     return seconds
 
 
+def auto_clip_duration(audio_duration_seconds: float, *, default: int = 5) -> int:
+    """Pick a sensible max-clip-duration when the user picked "Auto".
+
+    Aim for roughly ten cuts across the audio so a 60s narration gets
+    ~6s cuts and a 3min narration still gets ~10 distinct scenes. Clamped
+    to the same 2..10s window the WebUI exposes so an extreme script does
+    not get a 30s cut. The audio length is unknown before TTS, so the
+    pipeline passes the realised narration length here at combine time.
+    """
+    max_clip_seconds = 10
+    try:
+        duration = float(audio_duration_seconds or 0.0)
+    except (TypeError, ValueError):
+        return default
+    if duration <= 0:
+        return default
+    # Aim for ~10 cuts so a short video does not feel chopped and a long
+    # one still shows enough scene variety. The max-cap mirrors the WebUI
+    # dropdown so a 5-minute audio still picks 10s cuts instead of 30s.
+    target = round(duration / 10.0)
+    target = max(MIN_CLIP_SECONDS, min(max_clip_seconds, target))
+    return clamp_clip_duration(target, default=default)
+
+
 def clamp_clip_speed(value, default: float = 1.0) -> float:
     """Playback speed, bounded by the shared WebUI/API range."""
     return utils.normalize_clip_speed(value, default)

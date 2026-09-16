@@ -85,6 +85,9 @@ lightpanda_url = ""
 web_research_results = 6
 web_research_pages = 3
 
+# Timeout in seconds for a single Edge TTS streaming request; raise it for slow
+# networks, 0 disables the timeout.
+
 # Verify TLS certificates for external APIs and material downloads. Keep enabled
 # by default; disable temporarily only for a trusted proxy or self-signed
 # certificate environment.
@@ -661,8 +664,8 @@ open_task_folder_on_completion = true
 # video_clip_duration = 3
 # video_clip_speed = 1.0
 # video_count = 1
-# tts_server = "omnivoice"
-# voice_name = "omnivoice:boy_voice"
+# tts_server = "edge-tts"
+# voice_name = ""
 # voice_volume = 1.0
 # voice_rate = 1.0
 # bgm_type = "random"

@@ -2,7 +2,17 @@
 moviepy==2.2.1
 streamlit==1.59.1
 streamlit-tour==1.1.0
+# ``edge-tts`` stays because other providers use its ``SubMaker`` data class for
+# subtitle timing; the Edge TTS *synthesis* provider was removed.
 edge_tts==7.2.7
+# Coqui XTTS is *deliberately* NOT in this file. Adding ``TTS>=0.22.0`` here
+# bloats every docker build by ~1.5 GB and ~30 minutes: it drags in torch,
+# ``gruut[de,es,fr]``, and language packs that have nothing to do with the
+# default omnivoice pipeline. Coqui is opt-in: install it on demand with
+# ``uv pip install TTS`` (or ``docker exec moneyprinterturbo-api pip
+# install TTS``) the first time a ``coqui:`` voice is used. The provider
+# detects the missing package and raises a clear ``RuntimeError`` until
+# installed.
 fastapi==0.136.3
 uvicorn==0.32.1
 openai==2.24.0
@@ -23,7 +33,6 @@ mlx-whisper==0.4.3; sys_platform == "darwin" and platform_machine == "arm64"
 loguru==0.7.3
 google-genai==2.11.0
 dashscope==1.20.14
-azure-cognitiveservices-speech==1.41.1
 redis==5.2.0
 python-multipart==0.0.27
 pyyaml==6.0.3

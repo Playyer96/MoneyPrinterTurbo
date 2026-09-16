@@ -1,22 +1,27 @@
-"""Clone a WAV sample into a VoiceStudio voice profile.
+"""Clone a WAV sample into an OmniVoice voice profile.
 
-The OmniVoice bridge under ``vendor/voice_studio`` exposes ``POST /profiles``
+The OmniVoice service under ``vendor/omnivoice`` exposes ``POST /profiles``
 which encodes a reference sample as a reusable ``VoiceClonePrompt`` and
 persists it under ``voice_profiles/``. This script is a thin wrapper so
 operators can clone a new voice with one command without writing Python:
 
-    .venv/bin/python scripts/clone_voicestudio_profile.py /path/to/sample.wav boy_voice
+    .venv/bin/python scripts/clone_omnivoice_profile.py /path/to/sample.wav boy_voice
 
 The profile name is normalised to ``[a-z0-9_-]+`` by the server; a name with
 illegal characters is rejected with HTTP 400. After cloning, the voice shows
-up as ``voicestudio:<name>`` in the WebUI TTS drop-down and the
-``VideoParams.voice_name`` default is now ``voicestudio:boy_voice``.
+up as ``omnivoice:<name>`` in the WebUI TTS drop-down and the
+``VideoParams.voice_name`` default is now ``omnivoice:boy_voice``.
 
 Quality guidance:
     A short reference sample (under ~10 seconds) produces a recognisable
     but flat clone. Aim for 20-60 seconds of clean, single-speaker audio
     for the strongest voice match. Background music, reverb, or multiple
     speakers all degrade the cloned prompt.
+
+    Pass --instruct "energetic, mid-pitch, expressive" (or similar) to bake
+    a per-profile emotion/delivery descriptor into the clone so every
+    later generation that picks this voice inherits the same energy
+    register. This is the main lever for expressive, non-monotone clones.
 """
 from __future__ import annotations
 
@@ -58,7 +63,7 @@ def _probe_duration_seconds(path: str) -> float | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Clone a WAV sample into a VoiceStudio voice profile.",
+        description="Clone a WAV sample into an OmniVoice voice profile.",
     )
     parser.add_argument(
         "sample_path",
@@ -71,7 +76,20 @@ def main() -> int:
     parser.add_argument(
         "--base-url",
         default=None,
-        help="Override the OmniVoice base URL (default: $VOICESTUDIO_BASE_URL or [voicestudio] base_url).",
+        help="Override the OmniVoice base URL (default: $OMNIVOICE_BASE_URL or [omnivoice] base_url).",
+    )
+    parser.add_argument(
+        "--instruct",
+        default="",
+        help=(
+            "Per-profile emotion/delivery descriptor (e.g. 'energetic, mid-pitch, expressive'). "
+            "Stored in the profile metadata and applied to every generation that uses this clone."
+        ),
+    )
+    parser.add_argument(
+        "--ref-text",
+        default="",
+        help="Optional transcript of the reference sample. Improves clone fidelity when supplied.",
     )
     parser.add_argument(
         "--force",
@@ -90,26 +108,29 @@ def main() -> int:
         return 2
 
     duration = _probe_duration_seconds(args.sample_path)
-    if duration is not None and duration < 10.0 and not args.force:
+    if duration is not None and duration < 20.0 and not args.force:
         print(
             f"warning: sample is only {duration:.1f}s long. "
             "OmniVoice produces noticeably flat clones from short references; "
-            "20-60 seconds of clean single-speaker audio is recommended for "
-            "the strongest voice match. Re-run with --force to upload anyway.",
+            "30-60 seconds of clean single-speaker audio is recommended for "
+            "the strongest voice match. Pair short samples with --instruct to "
+            "compensate for the limited conditioning. Re-run with --force to "
+            "upload anyway.",
             file=sys.stderr,
         )
-        return 3
 
     if args.base_url:
-        os.environ["VOICESTUDIO_BASE_URL"] = args.base_url
+        os.environ["OMNIVOICE_BASE_URL"] = args.base_url
 
-    ok, message = voice.create_voicestudio_profile(
+    ok, message = voice.create_omnivoice_profile(
         profile_name=args.profile_name,
         audio_bytes=audio_bytes,
         original_filename=os.path.basename(args.sample_path),
+        ref_text=args.ref_text,
+        instruct_override=args.instruct,
     )
     if ok:
-        print(f"profile created: voicestudio:{message}")
+        print(f"profile created: omnivoice:{message}")
         return 0
     print(f"profile creation failed: {message}", file=sys.stderr)
     return 1

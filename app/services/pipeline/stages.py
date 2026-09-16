@@ -18,10 +18,11 @@ from loguru import logger
 
 from app.config import config
 from app.models import const
-from app.models.schema import VideoConcatMode, VideoParams
+from app.models.schema import VideoAspect, VideoConcatMode, VideoParams
 from app.services import (
     bgm as bgm_service,
     elevenlabs_music,
+    guardrails,
     llm,
     loomloom,
     material,
@@ -36,6 +37,7 @@ from app.services import (
     voice,
 )
 from app.services import state as sm
+from app.services.render import subtitle_cues
 from app.utils import file_security, utils
 
 # Video music providers only need to implement ``is_enabled`` and
@@ -494,16 +496,23 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     # The regular path favors precise Whisper alignment for estimated TTS
     # timelines. Docker's fast-pipeline mode already has the complete script and
     # uses the TTS estimate directly, avoiding a redundant transcription pass.
-    if (
-        subtitle_provider == "edge"
-        and not voice.has_real_word_timestamps(sub_maker)
-        and os.environ.get("MPT_SKIP_PIPELINE_PREFLIGHT") != "1"
-    ):
-        logger.warning(
-            "TTS provider did not return real word-level timestamps; "
-            "falling back to whisper for accurate subtitle alignment"
-        )
-        subtitle_provider = "whisper"
+    if subtitle_provider == "edge" and not voice.has_real_word_timestamps(sub_maker):
+        # Estimated timing drifts by whole sentences on long scripts. Whenever
+        # a GPU whisper backend is reachable (local MLX, the host accelerator
+        # from inside Docker, or CUDA) align on the real audio instead. The
+        # estimate stays as the fallback so a host without any accelerator
+        # still gets subtitles.
+        if subtitle.has_accelerated_backend():
+            logger.warning(
+                "TTS provider did not return real word-level timestamps; "
+                "falling back to whisper for accurate subtitle alignment"
+            )
+            subtitle_provider = "whisper"
+        else:
+            logger.warning(
+                "TTS provider did not return word-level timestamps and no GPU "
+                "whisper backend is reachable; subtitle timing is estimated"
+            )
 
     display_mode = getattr(params, "subtitle_display_mode", "sentence")
     is_word_level = display_mode != "sentence"
@@ -534,14 +543,24 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
             return ""
 
     if subtitle_provider == "whisper":
+        # SRT granularity follows the display mode exactly as before --
+        # word-level SRT for word-by-word/karaoke modes (the legacy
+        # MoviePy renderer, still used whenever intro/outro overlays are
+        # enabled, reads this SRT directly and needs one row per word to
+        # group correctly). ``subtitle.create`` always writes the
+        # ``.words.json`` sidecar too, regardless of word_level, so the
+        # newer ASS fast path gets accurate word timing either way.
         subtitle.create(
             audio_file=audio_file,
             subtitle_file=subtitle_path,
             word_level=is_word_level,
         )
-        if not is_word_level:
+        if not is_word_level and os.path.exists(subtitle_path):
             logger.info("\n\n## correcting subtitle")
             subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
+        words_json = os.path.splitext(subtitle_path)[0] + ".words.json"
+        if subtitle_cues.write_aligned_words_json(words_json, video_script):
+            logger.info(f"word timing aligned to the script: {words_json}")
 
     subtitle_lines = subtitle.file_to_subtitles(subtitle_path)
     if not subtitle_lines:
@@ -550,8 +569,9 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
 
     if subtitle_format in {"ass", "both"}:
         ass_path = os.path.splitext(subtitle_path)[0] + ".ass"
+        ass_width, ass_height = VideoAspect(params.video_aspect).to_resolution()
         if subtitle.create_ass_subtitle(
-            subtitle_path, ass_path, params
+            subtitle_path, ass_path, params, width=ass_width, height=ass_height
         ):
             logger.info(f"ASS subtitle written: {ass_path}")
 
@@ -812,7 +832,11 @@ def generate_final_videos(
             video_fit_mode=params.video_fit_mode,
             video_concat_mode=video_concat_mode,
             video_transition_mode=video_transition_mode,
-            max_clip_duration=params.video_clip_duration,
+            max_clip_duration=(
+                guardrails.auto_clip_duration(audio_duration)
+                if getattr(params, "video_clip_duration_auto", False)
+                else params.video_clip_duration
+            ),
             threads=params.n_threads,
             clip_speed=params.video_clip_speed,
             exclude_clip_fingerprints=used_clip_fingerprints,

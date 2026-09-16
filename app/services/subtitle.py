@@ -16,7 +16,7 @@ except ImportError:
 # Apple Silicon, with some operators landing on the Neural Engine via
 # Core ML). On Mac hosts this is the fastest local path -- 3-5x faster
 # than faster-whisper's CPU-only CTranslate2 backend -- and the primary
-# choice when the VoiceStudio LaunchAgent is not reachable.
+# choice when the OmniVoice LaunchAgent is not reachable.
 try:
     import mlx_whisper
 except ImportError:
@@ -37,13 +37,13 @@ def _remote_transcribe(audio_file: str):
     """Transcribe on the host-side GPU server, or return None when unavailable.
 
     faster-whisper's CTranslate2 backend is cpu/cuda only, so inside a Linux
-    container on a Mac whisper can never leave the CPU. The VoiceStudio server
+    container on a Mac whisper can never leave the CPU. The OmniVoice service
     already runs natively on the host for the same reason (see `make mac-setup`);
     it exposes /transcribe backed by MLX, which does run on Metal.
     """
     from app.services import voice
 
-    base_url = voice.get_voicestudio_base_url()
+    base_url = voice.get_omnivoice_base_url()
     try:
         with open(audio_file, "rb") as fh:
             response = requests.post(
@@ -97,7 +97,7 @@ def _has_cuda_whisper() -> bool:
 
 def log_gpu_backend_status() -> None:
     """Log the accelerated Whisper backend available on this host."""
-    if os.environ.get("VOICESTUDIO_BASE_URL"):
+    if os.environ.get("OMNIVOICE_BASE_URL"):
         logger.info("Whisper backend: remote accelerator")
     elif sys.platform == "darwin" and mlx_whisper is not None:
         logger.info("Whisper backend: mlx-whisper (Apple Silicon Metal)")
@@ -107,6 +107,28 @@ def log_gpu_backend_status() -> None:
         logger.warning("no accelerated Whisper backend; CPU transcription is disabled")
 
 
+def has_accelerated_backend(timeout: float = 2.0) -> bool:
+    """Return whether any GPU whisper backend can serve a transcription now.
+
+    Order matches :func:`create`: local MLX on Apple Silicon, the host GPU
+    server reachable over HTTP, then CUDA faster-whisper. CPU transcription is
+    disabled everywhere, so this is the single yes/no the pipeline uses to
+    decide between whisper alignment and estimated timing.
+    """
+    if sys.platform == "darwin" and mlx_whisper is not None:
+        return True
+    try:
+        from app.services import voice
+
+        base_url = voice.get_omnivoice_base_url()
+        response = requests.get(f"{base_url}/health", timeout=timeout)
+        if response.status_code == 200:
+            return True
+    except Exception:
+        pass
+    return WhisperModel is not None and _has_cuda_whisper()
+
+
 def _mlx_transcribe(audio_file: str):
     """Transcribe on the local MLX runtime (Apple Silicon Metal + ANE).
 
@@ -114,7 +136,7 @@ def _mlx_transcribe(audio_file: str):
     Whisper through Apple's MLX framework, which targets Metal on Apple
     Silicon GPUs and routes a growing subset of operators to the Neural
     Engine via Core ML. That makes it 3-5x faster than faster-whisper
-    (CPU-only CTranslate2) and removes the dependency on the VoiceStudio
+    (CPU-only CTranslate2) and removes the dependency on the OmniVoice
     LaunchAgent being up.
 
     Returns a (segments, info) tuple in the same shape as the other
@@ -175,7 +197,7 @@ def create(audio_file, subtitle_file: str = "", word_level: bool = False):
 
     # Order on Mac hosts:
     #   1. local mlx-whisper (Metal + ANE, fast, no server required)
-    #   2. VoiceStudio remote (MLX, only if local MLX is unavailable)
+    #   2. OmniVoice remote (MLX, only if local MLX is unavailable)
     #   3. faster-whisper on CUDA
     # CPU inference is deliberately disabled on every platform.
     if sys.platform == "darwin" and mlx_whisper is not None:
@@ -393,6 +415,225 @@ def _write_subtitle(segments, info, audio_file, subtitle_file, word_level):
             # The JSON is a progressive enhancement; failing to write it must
             # not break the SRT path the rest of the pipeline depends on.
             logger.warning(f"failed to write word-level subtitle json: {exc}")
+
+
+# --- ASS standalone subtitle generation ------------------------------------
+
+
+_HIGHLIGHT_OPEN = "{{active}}"
+_HIGHLIGHT_CLOSE = "{{/active}}"
+_DEFAULT_ASS_PLAYRES = (1920, 1080)
+
+
+def _ass_color(hex_color: str, fallback: str) -> str:
+    """Convert ``#RRGGBB`` to ASS ``&H00BBGGRR``."""
+    value = (
+        hex_color
+        if isinstance(hex_color, str) and re.fullmatch(r"#[0-9A-Fa-f]{6}", hex_color)
+        else fallback
+    )
+    return f"&H00{value[5:7]}{value[3:5]}{value[1:3]}".upper()
+
+
+def _ass_time(seconds: float) -> str:
+    centi = max(0, int(round(float(seconds) * 100)))
+    hours, rem = divmod(centi, 360000)
+    minutes, rem = divmod(rem, 6000)
+    secs, fraction = divmod(rem, 100)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{fraction:02d}"
+
+
+def _escape_ass_text(text: str) -> str:
+    """Escape characters that ASS treats as override syntax."""
+    return (
+        str(text or "")
+        .replace("\\", "＼")
+        .replace("{", "｛")
+        .replace("}", "｝")
+        .replace("\r\n", "\n")
+        .replace("\n", r"\N")
+    )
+
+
+def _ass_dialogue_text(
+    phrase: str, normal_color: str, highlight_color: str
+) -> str:
+    start = phrase.find(_HIGHLIGHT_OPEN)
+    end = phrase.find(_HIGHLIGHT_CLOSE)
+    if start < 0 or end < start:
+        return _escape_ass_text(phrase)
+    before = _escape_ass_text(phrase[:start])
+    active = _escape_ass_text(phrase[start + len(_HIGHLIGHT_OPEN) : end])
+    after = _escape_ass_text(phrase[end + len(_HIGHLIGHT_CLOSE) :])
+    return (
+        f"{before}{{\\c{highlight_color}&}}{active}"
+        f"{{\\c{normal_color}&}}{after}"
+    )
+
+
+def _resolve_position(
+    position: str,
+    custom_position: float,
+    width: int,
+    height: int,
+) -> tuple[int, float, float]:
+    """Map a ``subtitle_position`` string to (alignment, x, y)."""
+    if position == "bottom":
+        return 2, width / 2, height * 0.92
+    if position == "top":
+        return 8, width / 2, height * 0.08
+    if position in ("two_thirds_bottom", "two_thirds", "2/3_bottom"):
+        return 8, width / 2, height * 0.68
+    if position == "custom":
+        percent = max(0.0, min(100.0, float(custom_position or 70.0)))
+        return 8, width / 2, height * percent / 100
+    return 5, width / 2, height / 2
+
+
+def _resolve_animation(animation: str) -> str:
+    """Translate ``subtitle_animation`` to an ASS ``\\t``-style override tag."""
+    if animation in ("scale_up", "zoom_in", "punch"):
+        return r"\fscx65\fscy65\t(0,180,0.5,\fscx100\fscy100)"
+    if animation in ("pop_spring", "spring", "pop"):
+        return (
+            r"\fscx5\fscy5\t(0,100,0.5,\fscx135\fscy135)"
+            r"\t(100,180,0.5,\fscx100\fscy100)"
+        )
+    if animation in ("fade", "fade_in"):
+        return r"\fad(180,0)"
+    return ""
+
+
+def _normalise_ass_style_override(raw: str) -> str:
+    """Strip a leading ``[V4+ Styles]`` header from a pasted style block.
+
+    Lets the user paste either a full style block or just the
+    ``Style:`` lines without the section header.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    header = "[V4+ Styles]"
+    if text.lower().startswith(header.lower()):
+        text = text[len(header):].lstrip("\r\n")
+    return text
+
+
+def create_ass_subtitle(
+    srt_path: str,
+    ass_path: str,
+    params,
+    *,
+    width: int = _DEFAULT_ASS_PLAYRES[0],
+    height: int = _DEFAULT_ASS_PLAYRES[1],
+) -> bool:
+    """Write a real, editable ``.ass`` subtitle file next to the SRT.
+
+    Reads cues from the SRT so the timeline is identical, applies the
+    same display-mode split as the burn-in path, and emits a clean ASS
+    header the user can open and tweak in any editor (VS Code, Aegisub,
+    Subtitle Edit). When ``params.subtitle_ass_style_override`` is set,
+    it replaces the generated ``[V4+ Styles]`` block so the user can
+    hand-author styles without going through the schema.
+
+    Returns True on success, False on failure.
+    """
+    if not srt_path or not os.path.isfile(srt_path):
+        logger.warning(f"create_ass_subtitle: missing SRT source: {srt_path}")
+        return False
+    timed_cues: list[tuple[tuple[float, float], str]] = []
+    last_timing: tuple[float, float] | None = None
+    last_text_parts: list[str] = []
+    timing_re = re.compile(
+        r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)"
+    )
+    # The shared ``file_to_subtitles`` parser collapses every cue into one
+    # when an SRT is missing the blank-line separator between blocks (a
+    # real-world hand-edit bug). The standalone ASS builder is the
+    # single place the user can edit the SRT and have the result reflected
+    # verbatim, so parse the file directly here to stay correct under any
+    # input. Whisper / Edge TTS paths keep using ``file_to_subtitles``
+    # unchanged.
+    try:
+        with open(srt_path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except OSError as exc:
+        logger.warning(f"create_ass_subtitle: cannot read SRT: {exc}")
+        return False
+    for raw_line in lines:
+        line = raw_line.strip()
+        timing_match = timing_re.search(line)
+        if timing_match:
+            if last_timing is not None and last_text_parts:
+                text_joined = "\n".join(last_text_parts).strip()
+                if text_joined:
+                    timed_cues.append((last_timing, text_joined))
+                last_text_parts = []
+            h1, m1, s1, ms1, h2, m2, s2, ms2 = (
+                int(value) for value in timing_match.groups()
+            )
+            last_timing = (
+                h1 * 3600 + m1 * 60 + s1 + ms1 / 1000.0,
+                h2 * 3600 + m2 * 60 + s2 + ms2 / 1000.0,
+            )
+        elif last_timing is not None and line:
+            # Skip the cue index line ("1", "2", ...) that precedes each
+            # timing line in standard SRT format.
+            if not line.isdigit():
+                last_text_parts.append(line)
+    if last_timing is not None and last_text_parts:
+        text_joined = "\n".join(last_text_parts).strip()
+        if text_joined:
+            timed_cues.append((last_timing, text_joined))
+    timed_cues = [
+        (timing, text)
+        for timing, text in timed_cues
+        if timing[1] > timing[0] and text
+    ]
+    if not timed_cues:
+        logger.warning("create_ass_subtitle: no usable cues found")
+        return False
+
+    from app.services.render import subtitles_ass  # local import keeps the
+    # subtitle module import-light for tests that don't need styles.
+
+    font_name = getattr(params, "font_name", "") or "STHeitiMedium.ttc"
+    font_path = os.path.join(utils.font_dir(), os.path.basename(font_name))
+    document = subtitles_ass.build_ass_document(
+        timed_cues=timed_cues,
+        params=params,
+        font_path=font_path,
+        width=width,
+        height=height,
+        words_json_path=os.path.splitext(srt_path)[0] + ".words.json",
+    )
+    if not document:
+        logger.warning("create_ass_subtitle: no renderable cues")
+        return False
+
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(ass_path)), exist_ok=True)
+        with open(ass_path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(document)
+        logger.info(f"ASS subtitle file created: {ass_path}")
+        return True
+    except Exception as exc:
+        logger.warning(f"failed to write ASS subtitle file {ass_path}: {exc}")
+        return False
+
+
+def _parse_subtitle_timing(line: str) -> tuple[float, float] | None:
+    match = re.search(
+        r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)",
+        line,
+    )
+    if not match:
+        return None
+    h1, m1, s1, ms1, h2, m2, s2, ms2 = (int(value) for value in match.groups())
+    return (
+        h1 * 3600 + m1 * 60 + s1 + ms1 / 1000.0,
+        h2 * 3600 + m2 * 60 + s2 + ms2 / 1000.0,
+    )
 
 
 def file_to_subtitles(filename):

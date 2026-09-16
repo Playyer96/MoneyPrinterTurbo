@@ -7,11 +7,11 @@
 # platform limit, not a configuration one. What *can* be containerised is the
 # service boundary: the real OmniVoice/MLX server runs natively on the host.
 # The Compose provider below provisions and starts it automatically, while a
-# tiny socat front door publishes it under the bridge alias `voicestudio`.
+# tiny socat front door publishes it under the bridge alias `omnivoice`.
 #
 # The payoff is that nothing above this line changes shape per platform. webui
-# and api keep talking to http://voicestudio:8780 exactly as they do on Linux,
-# `docker compose ps` lists a voicestudio container, and the healthcheck goes
+# and api keep talking to http://omnivoice:8780 exactly as they do on Linux,
+# `docker compose ps` lists an omnivoice container, and the healthcheck goes
 # red when the host server is down. Only the last hop differs: on Linux it
 # lands in a container, on a Mac it lands on Metal.
 #
@@ -20,15 +20,15 @@
 # The ffmpeg-proxy-host service below adds hardware video encoding on top:
 # without it, ffmpeg inside the container has no h264_videotoolbox. The env
 # override below turns on the wrapper script (scripts/ffmpeg_mac_wrapper.py)
-# for webui and api only -- voicestudio does not encode video.
+# for webui and api only -- OmniVoice does not encode video.
 #
 # service-env-mac duplicates the base compose's *service-env so the YAML
 # merge stays self-contained (cross-file anchors do not resolve).
 x-service-env-mac: &service-env-mac
   MPT_SKIP_PIPELINE_PREFLIGHT: "1"
-  VOICESTUDIO_BASE_URL: "${VOICESTUDIO_BASE_URL:-http://voicestudio:8780}"
+  OMNIVOICE_BASE_URL: "${OMNIVOICE_BASE_URL:-http://omnivoice:8780}"
   LIGHTPANDA_URL: "${LIGHTPANDA_URL:-ws://lightpanda:9222}"
-  WEB_SEARCH_PROVIDER: "${WEB_SEARCH_PROVIDER:-searxng}"
+  WEB_SEARCH_PROVIDER: "searxng"
   SEARXNG_URL: "${SEARXNG_URL:-http://searxng:8080}"
   FFMPEG_MAC_PROXY_URL: "http://ffmpeg-mac-proxy:8781"
 
@@ -46,27 +46,21 @@ services:
   # excludes it from both build and start. It stays reachable for a Linux or
   # NVIDIA host with:
   #
-  #   docker compose --profile container-tts build voicestudio
-  voicestudio:
+  #   docker compose --profile container-tts build omnivoice
+  omnivoice:
     profiles: ["container-tts"]
 
   # Front door for the host GPU server. socat is a ~5MB image doing one TCP
   # forward; all model work happens on the host, on Metal.
-  voicestudio-host:
+  omnivoice-host:
     image: alpine/socat
-    # Distinct from the base file's container_name, which stays reserved for
-    # the real (unused here) image; the network alias below is what callers use.
-    container_name: "moneyprinterturbo-voicestudio-host"
+    container_name: "moneyprinterturbo-omnivoice-host"
     command: "TCP-LISTEN:8780,fork,reuseaddr TCP:host.docker.internal:8780"
     networks:
       mpt-net:
-        # Claims the name the base compose file's env default already points
-        # at, so VOICESTUDIO_BASE_URL needs no per-platform override.
         aliases:
-          - voicestudio
+          - omnivoice
     healthcheck:
-      # Probes the host server, not socat, so a dead LaunchAgent shows up as an
-      # unhealthy container instead of a connection refused deep in a render.
       test: ["CMD", "nc", "-z", "-w2", "host.docker.internal", "8780"]
       interval: 30s
       timeout: 5s
@@ -77,7 +71,7 @@ services:
       - host-accelerators
 
   # Front door for the host ffmpeg proxy (scripts/ffmpeg_mac_proxy.py). Same
-  # pattern as voicestudio-host: a 5MB socat that forwards a container port
+  # pattern as omnivoice-host: a 5MB socat that forwards a container port
   # to a LaunchAgent on the host. Without this the app inside the container
   # sees ffmpeg from Ubuntu apt, which is built without h264_videotoolbox.
   ffmpeg-proxy-host:
@@ -86,8 +80,6 @@ services:
     command: "TCP-LISTEN:8781,fork,reuseaddr TCP:host.docker.internal:8781"
     networks:
       mpt-net:
-        # The app's get_ffmpeg_binary() reaches this alias on Linux+macOS
-        # via the FFMPEG_MAC_PROXY_URL env var set in x-service-env below.
         aliases:
           - ffmpeg-mac-proxy
     healthcheck:
@@ -107,14 +99,14 @@ services:
   webui:
     environment: *service-env-mac
     depends_on:
-      voicestudio-host:
+      omnivoice-host:
         condition: service_healthy
       ffmpeg-proxy-host:
         condition: service_healthy
   api:
     environment: *service-env-mac
     depends_on:
-      voicestudio-host:
+      omnivoice-host:
         condition: service_healthy
       ffmpeg-proxy-host:
         condition: service_healthy

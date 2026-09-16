@@ -6,6 +6,7 @@ import socket
 import tempfile
 import threading
 from contextlib import contextmanager
+from contextvars import ContextVar
 
 import toml
 from loguru import logger
@@ -24,16 +25,58 @@ _pending_config_flush_scheduled = False
 _MISSING = object()
 _DELETE = object()
 _UTF8_BOM = "\ufeff"
+_task_config_snapshot: ContextVar[dict[int, dict] | None] = ContextVar(
+    "task_config_snapshot", default=None
+)
 
 
 class _SynchronizedConfig(dict):
-    """保持 dict 使用方式不变，同时让运行期配置写操作服从同一把锁。"""
+    """Keep dict semantics while serializing runtime configuration writes."""
+
+    def _snapshot(self) -> dict | None:
+        snapshot = _task_config_snapshot.get()
+        return snapshot.get(id(self)) if snapshot else None
+
+    def __getitem__(self, key):
+        snapshot = self._snapshot()
+        return snapshot[key] if snapshot is not None else super().__getitem__(key)
+
+    def __contains__(self, key):
+        snapshot = self._snapshot()
+        return key in snapshot if snapshot is not None else super().__contains__(key)
+
+    def get(self, key, default=None):
+        snapshot = self._snapshot()
+        return snapshot.get(key, default) if snapshot is not None else super().get(key, default)
+
+    def __iter__(self):
+        snapshot = self._snapshot()
+        return iter(snapshot) if snapshot is not None else super().__iter__()
+
+    def __len__(self):
+        snapshot = self._snapshot()
+        return len(snapshot) if snapshot is not None else super().__len__()
+
+    def items(self):
+        snapshot = self._snapshot()
+        return snapshot.items() if snapshot is not None else super().items()
+
+    def keys(self):
+        snapshot = self._snapshot()
+        return snapshot.keys() if snapshot is not None else super().keys()
+
+    def values(self):
+        snapshot = self._snapshot()
+        return snapshot.values() if snapshot is not None else super().values()
 
     def __setitem__(self, key, value):
-        # Streamlit 每次整页 rerun 都会把当前控件值重新写回配置。视频任务持有
-        # runtime_config_lock 时，如果值没有变化，这次写入没有任何副作用，也
-        # 不应让刷新后的页面卡在表单中途。真正改变配置的写入仍进入下方锁，
-        # 因而不能在正在生成的视频中途切换 Provider、密钥或其它全局设置。
+        snapshot = self._snapshot()
+        if snapshot is not None:
+            snapshot[key] = value
+            return
+        # Each Streamlit rerun writes current widget values back to config.
+        # Unchanged values need no lock; real changes remain serialized with
+        # other configuration writes while submitted jobs use their own snapshot.
         current = super().get(key, _MISSING)
         if current is not _MISSING and current == value:
             return
@@ -41,18 +84,31 @@ class _SynchronizedConfig(dict):
             super().__setitem__(key, value)
 
     def __delitem__(self, key):
+        snapshot = self._snapshot()
+        if snapshot is not None:
+            del snapshot[key]
+            return
         with _config_save_lock:
             super().__delitem__(key)
 
     def clear(self):
+        snapshot = self._snapshot()
+        if snapshot is not None:
+            snapshot.clear()
+            return
         if not self:
             return
         with _config_save_lock:
             super().clear()
 
     def pop(self, key, default=_MISSING):
-        # ``pop(key, default)`` 在 key 不存在时同样不会改变配置。WebUI 使用
-        # 这种写法表达“采用默认策略”，刷新时必须允许它直接完成。
+        snapshot = self._snapshot()
+        if snapshot is not None:
+            if default is _MISSING:
+                return snapshot.pop(key)
+            return snapshot.pop(key, default)
+        # ``pop(key, default)`` does not mutate config when the key is absent. The
+        # WebUI uses it to select defaults, which must complete during refresh.
         if key not in self:
             if default is _MISSING:
                 raise KeyError(key)
@@ -63,8 +119,11 @@ class _SynchronizedConfig(dict):
             return super().pop(key, default)
 
     def setdefault(self, key, default=None):
-        # 与 __setitem__ 相同，已存在 key 的 setdefault 是只读操作。提前返回
-        # 可以让只读取默认配置的页面刷新不受长任务配置锁影响。
+        snapshot = self._snapshot()
+        if snapshot is not None:
+            return snapshot.setdefault(key, default)
+        # Like __setitem__, setdefault for an existing key is read-only. Returning
+        # early keeps pages reading defaults responsive during long-running tasks.
         current = super().get(key, _MISSING)
         if current is not _MISSING:
             return current
@@ -73,6 +132,10 @@ class _SynchronizedConfig(dict):
 
     def update(self, *args, **kwargs):
         changes = dict(*args, **kwargs)
+        snapshot = self._snapshot()
+        if snapshot is not None:
+            snapshot.update(changes)
+            return
         if all(
             (current := dict.get(self, key, _MISSING)) is not _MISSING
             and current == value
@@ -84,24 +147,22 @@ class _SynchronizedConfig(dict):
 
 
 def _pending_update_key(config_section, key):
-    """为进程内固定配置分区生成待更新键。"""
+    """Create a pending-update key for an in-process configuration section."""
     return id(config_section), key
 
 
 def update_config_nonblocking(config_section, key, value):
     """
-    非阻塞更新 WebUI 的运行期配置。
+    Update WebUI runtime configuration without blocking.
 
-    视频生成会持有 ``runtime_config_lock``，确保同一任务不会在执行中途切换
-    Provider、密钥或语音配置。Streamlit 控件发生变化时不能等待这把长任务锁，
-    否则浏览器会表现为页面冻结。锁空闲时立即更新；锁繁忙时只保留每个配置项
-    的最新值，并在当前任务释放锁时统一应用。
+    Submitted jobs capture their own settings, so widget changes can apply to
+    later jobs immediately. When another configuration write is in progress,
+    retain only the newest value for each setting until that write completes.
 
-    返回 True 表示值已经生效，False 表示已进入待更新队列。
+    Return True when applied, False when queued.
     """
-    # 所有更新都先进入同一队列，再尝试获取配置锁。这样多个页面同时修改同一
-    # 配置项时，写入队列的先后顺序就是最终顺序，不会出现较早线程在获取锁后
-    # 把较新线程已经排队的值误删掉。
+    # Queue every update before trying the config lock. Concurrent pages then
+    # retain write order and an earlier thread cannot erase a newer queued value.
     with _pending_config_lock:
         _pending_config_updates[_pending_update_key(config_section, key)] = (
             config_section,
@@ -111,9 +172,9 @@ def update_config_nonblocking(config_section, key, value):
 
     acquired = _config_save_lock.acquire(blocking=False)
     if not acquired:
-        # 调用方通常会在本次 Streamlit rerun 末尾请求保存，但不能依赖这一步
-        # 一定执行。例如页面中途异常或更新恰好发生在任务退出保存阶段时，仍需
-        # 有后台刷新线程保证排队值最终生效。
+        # Callers usually save at the end of a Streamlit rerun, but that can fail
+        # when a page errors or an update arrives as a task exits. A background
+        # flush guarantees queued values are eventually applied.
         _schedule_deferred_config_flush()
         return False
 
@@ -126,10 +187,11 @@ def update_config_nonblocking(config_section, key, value):
 
 def delete_config_nonblocking(config_section, key):
     """
-    非阻塞删除 WebUI 配置项。
+    Delete a WebUI configuration entry without blocking.
 
-    “使用默认值”需要真正移除配置项，而不是写入空字符串。视频任务占用配置
-    锁时，删除意图会覆盖同一配置项之前排队的更新，并在任务结束后执行。
+    “Use default” must remove a key rather than write an empty string. When a
+    video task owns the lock, deletion supersedes earlier queued updates for the
+    same key and runs when the task finishes.
     """
     with _pending_config_lock:
         _pending_config_updates[_pending_update_key(config_section, key)] = (
@@ -151,12 +213,12 @@ def delete_config_nonblocking(config_section, key):
 
 
 def _apply_pending_config_updates_locked():
-    """在持有配置写锁时应用 WebUI 暂存的最新配置值。"""
+    """Apply the latest pending WebUI values while holding the config write lock."""
     with _pending_config_lock:
         updates = list(_pending_config_updates.values())
         _pending_config_updates.clear()
-        # 应用配置时继续持有待更新锁。读取“当前值 + 待更新值”快照的线程由此
-        # 只能看到应用前或应用后的完整状态，不会读到只更新了一半的配置集合。
+        # Keep the pending lock while applying so readers of the current-plus-
+        # pending snapshot see a complete state before or after application.
         for config_section, key, value in updates:
             if value is _DELETE:
                 config_section.pop(key, None)
@@ -167,11 +229,10 @@ def _apply_pending_config_updates_locked():
 
 def snapshot_config_with_pending(config_section):
     """
-    返回配置分区的有效快照，并合并尚未应用的 WebUI 更新。
+    Return the effective configuration snapshot, including pending WebUI updates.
 
-    视频任务持锁期间不能改写全局配置，但用户仍可准备下一条内容。LLM 请求
-    使用这个快照后，界面中刚选择的 Provider、模型和密钥会参与新请求，同时
-    不会改变正在执行的视频任务。
+    This lets a newly submitted task include UI updates that are waiting behind
+    another configuration write without changing a task already in progress.
     """
     with _pending_config_lock:
         snapshot = dict(config_section)
@@ -187,7 +248,7 @@ def snapshot_config_with_pending(config_section):
 
 
 def _flush_pending_config_locked(*, suppress_save_errors):
-    """在持有配置写锁时应用并保存当前所有待处理配置。"""
+    """Apply and save all pending configuration while holding the write lock."""
     global _pending_config_save_requested
 
     updates_applied = _apply_pending_config_updates_locked()
@@ -202,8 +263,9 @@ def _flush_pending_config_locked(*, suppress_save_errors):
         save_config()
         return True
     except Exception as exc:
-        # 内存中的配置已经成功应用，保存失败时只保留待保存标记。视频任务不应
-        # 因配置文件暂时不可写而被改判失败；下一次页面交互会再次触发保存。
+        # The in-memory update succeeded. Keep only the save marker on failure:
+        # a temporarily unwritable config must not fail the video task, and the
+        # next interaction retries the save.
         with _pending_config_lock:
             _pending_config_save_requested = True
         if not suppress_save_errors:
@@ -213,7 +275,7 @@ def _flush_pending_config_locked(*, suppress_save_errors):
 
 
 def _run_deferred_config_flush():
-    """等待长任务释放配置锁，并可靠清空期间积累的配置更新。"""
+    """Wait for the current config writer, then reliably flush queued updates."""
     global _pending_config_flush_scheduled
 
     while True:
@@ -232,7 +294,7 @@ def _run_deferred_config_flush():
 
 
 def _schedule_deferred_config_flush():
-    """保证同一时间最多只有一个后台线程等待刷新配置。"""
+    """Ensure at most one background thread waits to flush configuration."""
     global _pending_config_flush_scheduled
 
     with _pending_config_lock:
@@ -249,10 +311,10 @@ def _schedule_deferred_config_flush():
 
 def try_save_config():
     """
-    非阻塞保存 WebUI 配置，锁繁忙时交由当前长任务结束后保存。
+    Save WebUI configuration without blocking; defer it while another save is busy.
 
-    普通 API、CLI 和维护脚本仍可调用 ``save_config`` 获得原来的阻塞写入语义；
-    只有 Streamlit rerun 使用本函数，避免页面为等待视频任务而长时间无响应。
+    APIs, the CLI, and maintenance scripts retain ``save_config``'s blocking
+    semantics. Only Streamlit reruns use this function to avoid page stalls.
     """
     global _pending_config_save_requested
 
@@ -273,14 +335,15 @@ def try_save_config():
 @contextmanager
 def runtime_config_lock():
     """
-    在一次依赖全局配置的完整操作期间阻止其它 WebUI 会话改写配置。
+    Group configuration reads and writes into one consistent operation.
 
-    当前项目默认绑定本地回环地址，配置仍然是单用户全局配置。这个轻量锁主要
-    保护生成、试听等长操作，避免另一个标签页在操作中途切换 Provider 或密钥。
+    The project defaults to a local loopback address and uses one global user
+    configuration. Submitted jobs use ``capture_runtime_config`` instead; this
+    lock remains for short operations that must read a consistent live config.
     """
     with _config_save_lock:
-        # 如果上一个短操作释放锁时后台刷新线程尚未获得调度，新任务必须在读取
-        # Provider、密钥等全局配置前先应用队列，不能继续使用旧配置执行整条流水线。
+        # Apply queued updates before and after the grouped operation so callers
+        # see a complete configuration state.
         _flush_pending_config_locked(suppress_save_errors=True)
         try:
             yield
@@ -291,11 +354,11 @@ def runtime_config_lock():
 @contextmanager
 def try_runtime_config_lock():
     """
-    尝试获取运行期配置锁，并立即返回是否成功。
+    Try to acquire the runtime configuration lock and return immediately.
 
-    WebUI 试听属于用户主动触发的短操作，不应在后台视频任务持锁时等待数分钟。
-    调用方可以在未获取锁时就近提示用户稍后重试；成功获取后仍能保证试听期间
-    Provider、密钥和模型配置不会被其它会话修改。
+    A WebUI preview is a short user-triggered action and must not wait minutes
+    for a background task. Callers can prompt a retry on failure; a successful
+    lock still prevents other sessions changing providers, keys, or models.
     """
     acquired = _config_save_lock.acquire(blocking=False)
     try:
@@ -314,16 +377,15 @@ def is_running_in_container(
     cgroup_path: str = "/proc/1/cgroup",
 ) -> bool:
     """
-    判断当前进程是否运行在容器内。
+    Return whether the current process runs inside a container.
 
-    这个判断主要用于 Ollama 默认地址选择：
-    - 普通本机运行时，`localhost` 指向用户机器本身；
-    - Docker 容器内，`localhost` 指向容器自己，访问宿主机 Ollama
-      通常需要使用 `host.docker.internal`。
+    This selects Ollama's default address:
+    - locally, `localhost` is the user's machine;
+    - inside Docker, it is the container and host Ollama usually needs
+      `host.docker.internal`.
 
-    不能只判断 `/proc/1/cgroup` 是否存在，因为普通 Linux 也会有这个文件。
-    这里只在检测到明确的容器标记时返回 True，避免误伤非 Docker Linux 用户。
-    参数保留为可注入路径，便于单元测试覆盖不同运行环境。
+    `/proc/1/cgroup` also exists on normal Linux, so return True only for a
+    clear container marker. Paths remain injectable for environment tests.
     """
     if os.path.isfile(dockerenv_path) or os.path.isfile(containerenv_path):
         return True
@@ -346,9 +408,9 @@ def _can_resolve_hostname(hostname: str) -> bool:
 
 
 def _decode_linux_route_gateway(hex_gateway: str) -> str:
-    # /proc/net/route 里的 Gateway 是 16 进制小端序，例如 010011AC 表示
-    # 172.17.0.1。这里单独解析，是为了在原生 Linux Docker 没有
-    # host.docker.internal DNS 记录时，还能尝试访问容器默认网关上的宿主机。
+    # The /proc/net/route gateway is little-endian hexadecimal: 010011AC means
+    # 172.17.0.1. Parse it so native Linux Docker can reach host services through
+    # the default gateway when host.docker.internal has no DNS record.
     if len(hex_gateway) != 8:
         raise ValueError("invalid gateway length")
 
@@ -360,12 +422,12 @@ def _decode_linux_route_gateway(hex_gateway: str) -> str:
 
 def get_container_default_gateway_ip(route_path: str = "/proc/net/route") -> str:
     """
-    读取 Linux 容器里的默认网关 IP。
+    Read the default gateway IP from a Linux container.
 
-    Docker Desktop 通常提供 `host.docker.internal`，但原生 Linux Docker
-    默认不一定提供这个 DNS 名称。默认网关通常可以作为访问宿主机服务的
-    兜底地址；如果用户的 Ollama 只监听 127.0.0.1，则仍需要用户让
-    Ollama 监听宿主机网卡或手动配置 `ollama_base_url`。
+    Docker Desktop usually provides `host.docker.internal`, but native Linux
+    Docker may not. The default gateway is a fallback for host services; if
+    Ollama listens only on 127.0.0.1, it must bind a host interface or use an
+    explicit `ollama_base_url`.
     """
     try:
         with open(route_path, mode="r", encoding="utf-8") as fp:
@@ -394,10 +456,10 @@ def get_container_default_gateway_ip(route_path: str = "/proc/net/route") -> str
 
 def get_default_ollama_base_url() -> str:
     """
-    返回 Ollama 的默认 OpenAI-compatible base_url。
+    Return Ollama's default OpenAI-compatible base URL.
 
-    用户显式配置 `ollama_base_url` 时不会走这里；这里只处理“未配置时的
-    最佳默认值”。容器内默认指向宿主机，普通本机运行默认指向 localhost。
+    An explicit `ollama_base_url` bypasses this. Without one, containers target
+    the host and ordinary local runs target localhost.
     """
     if not is_running_in_container():
         return "http://localhost:11434/v1"
@@ -422,12 +484,12 @@ def get_default_ollama_base_url() -> str:
 
 def _load_toml_config(config_path: str):
     """
-    加载 TOML，并兼容 Windows 编辑器可能写入的重复 UTF-8 BOM。
+    Load TOML while accepting repeated UTF-8 BOMs written by Windows editors.
 
-    ``utf-8-sig`` 只会移除文件开头的一个 BOM。部分 Windows 编辑器或
-    解压、保存流程可能再次写入 BOM，导致第二个不可见字符进入 TOML
-    解析器并在第一行报错。这里仅在标准解析失败后做一次只读归一化，
-    不回写原文件，避免意外覆盖用户已经填写的 API Key。
+    ``utf-8-sig`` removes only one leading BOM. Some Windows edit, archive, or
+    save flows add another, causing TOML to see an invisible first-line character.
+    Normalize only after a normal read fails and never rewrite the original file,
+    protecting user-entered API keys.
     """
     try:
         return toml.load(config_path)
@@ -457,6 +519,56 @@ def _load_toml_config(config_path: str):
         raise
 
 
+def _apply_environment_overlay(loaded_config):
+    """
+    Lift secret-style keys from ``.env`` (gitignored) on top of the TOML
+    config so an API key never lands inside ``config.toml``.
+
+    Order of precedence (highest wins): ``os.environ`` > ``.env`` file >
+    ``config.toml``. Only the keys explicitly mapped below are eligible --
+    everything else stays as written in TOML.
+
+    Kept as one tight function so the rest of the loader can stay
+    decoupled from any specific provider; add a new line when a new
+    service needs an API key.
+    """
+    env_path = os.path.join(root_dir, ".env")
+    if os.path.isfile(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    key, _, value = line.partition("=")
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+        except OSError as exc:
+            logger.debug(
+                f"could not read .env for env overlay: path={env_path}, "
+                f"error={type(exc).__name__}: {exc}"
+            )
+
+    mappings = (
+        ("app", "groq_api_key", "GROQ_API_KEY"),
+        ("app", "openai_api_key", "OPENAI_API_KEY"),
+        ("app", "anthropic_api_key", "ANTHROPIC_API_KEY"),
+        ("app", "elevenlabs_api_key", "ELEVENLABS_API_KEY"),
+        ("app", "gemini_api_key", "GEMINI_API_KEY"),
+    )
+    for section_name, key_name, env_var in mappings:
+        env_value = os.environ.get(env_var)
+        if not env_value:
+            continue
+        section = loaded_config.setdefault(section_name, {})
+        if isinstance(section, dict):
+            section[key_name] = env_value
+
+
 def load_config():
     # fix: IsADirectoryError: [Errno 21] Is a directory: '/MoneyPrinterTurbo/config.toml'
     if os.path.isdir(config_file):
@@ -470,41 +582,60 @@ def load_config():
 
     logger.info(f"load config from file: {config_file}")
 
-    return _load_toml_config(config_file)
+    loaded_config = _load_toml_config(config_file)
+    _apply_environment_overlay(loaded_config)
+
+    loaded_config = _load_toml_config(config_file)
+    _apply_environment_overlay(loaded_config)
+    loaded_config.pop("azure", None)
+    legacy_omnivoice_config = loaded_config.pop("voicestudio", None)
+    if isinstance(legacy_omnivoice_config, dict):
+        loaded_config.setdefault("omnivoice", legacy_omnivoice_config)
+    ui_config = loaded_config.get("ui")
+    if isinstance(ui_config, dict):
+        if ui_config.get("tts_server") == "voicestudio":
+            ui_config["tts_server"] = "omnivoice"
+        voice_name = ui_config.get("voice_name")
+        if isinstance(voice_name, str) and voice_name.startswith("voicestudio:"):
+            ui_config["voice_name"] = voice_name.replace("voicestudio:", "omnivoice:", 1)
+    app_config = loaded_config.get("app")
+    if isinstance(app_config, dict):
+        for key in tuple(app_config):
+            if key.startswith("azure_"):
+                app_config.pop(key)
+    return loaded_config
 
 
 def save_config():
     """
-    原子保存运行时配置。
+    Save runtime configuration atomically.
 
-    Streamlit 的不同会话可能在相近时间触发配置保存。直接覆盖 config.toml 时，
-    另一个线程可能读取到只写了一部分的 TOML 内容。这里使用进程内可重入锁串行化
-    保存，并先写入同目录临时文件，再通过 os.replace 原子替换目标文件。
+    Streamlit sessions can save at nearly the same time. A direct overwrite lets
+    another thread read partial TOML, so serialize writes with a process-local
+    reentrant lock, write a sibling temporary file, then atomically replace it.
 
-    Docker Desktop 单文件 bind mount 会把 config.toml 本身作为挂载点，
-    Linux 内核不允许通过 rename/replace 替换挂载点，因此会返回 EBUSY。
-    该场景下只能在锁内原地覆盖文件；其它异常仍然抛出，避免掩盖权限、磁盘
-    或路径错误。
+    A Docker Desktop single-file bind mount makes config.toml the mount point and
+    Linux rejects rename/replace with EBUSY. In that case overwrite in place under
+    the lock; re-raise other errors so permissions, disk, and path issues remain visible.
 
-    这仍然保留项目现有的单用户全局配置语义，不额外引入复杂的多用户配置系统；
-    主要用于避免多标签页或快速 rerun 时损坏配置文件。
+    This keeps the existing single-user global configuration semantics and avoids
+    corrupting config files during fast reruns or activity in multiple tabs.
     """
     with _config_save_lock:
         config_to_save = dict(_cfg)
         config_to_save["app"] = dict(app)
-        config_to_save["azure"] = dict(azure)
         config_to_save["siliconflow"] = dict(siliconflow)
         config_to_save["minimax_tts"] = dict(minimax_tts)
         config_to_save["elevenlabs"] = dict(elevenlabs)
         config_to_save["chatterbox"] = dict(chatterbox)
         config_to_save["kokoro"] = dict(kokoro)
         config_to_save["fish_audio"] = dict(fish_audio)
-        config_to_save["voicestudio"] = dict(voicestudio)
+        config_to_save["omnivoice"] = dict(omnivoice)
         config_to_save["ui"] = dict(ui)
         serialized_config = toml.dumps(config_to_save)
 
-        # WebUI 完整 rerun 结束时会调用保存。内容没有变化时直接返回，避免每次
-        # 点击普通控件都产生一次磁盘写入和 fsync。
+        # A complete WebUI rerun saves here. Return unchanged content directly to
+        # avoid a disk write and fsync for every ordinary control click.
         try:
             with open(config_file, mode="r", encoding="utf-8") as f:
                 if f.read() == serialized_config:
@@ -548,21 +679,20 @@ def save_config():
 
 _cfg = load_config()
 app = _SynchronizedConfig(_cfg.get("app", {}))
-whisper = _cfg.get("whisper", {})
-proxy = _cfg.get("proxy", {})
-azure = _SynchronizedConfig(_cfg.get("azure", {}))
+whisper = _SynchronizedConfig(_cfg.get("whisper", {}))
+proxy = _SynchronizedConfig(_cfg.get("proxy", {}))
 siliconflow = _SynchronizedConfig(_cfg.get("siliconflow", {}))
 minimax_tts = _SynchronizedConfig(_cfg.get("minimax_tts", {}))
 elevenlabs = _SynchronizedConfig(_cfg.get("elevenlabs", {}))
 chatterbox = _SynchronizedConfig(_cfg.get("chatterbox", {}))
 kokoro = _SynchronizedConfig(_cfg.get("kokoro", {}))
 fish_audio = _SynchronizedConfig(_cfg.get("fish_audio", {}))
-voicestudio = _SynchronizedConfig(_cfg.get("voicestudio", {}))
+omnivoice = _SynchronizedConfig(_cfg.get("omnivoice", {}))
 
 # Default voice used when the WebUI/API doesn't pass one. An empty string
-# keeps the previous behaviour: fall through to Azure TTS. Set this in
-# config.toml (or via the VOICE_NAME env var) to e.g. "voicestudio:boy_voice"
-# once a cloned profile exists on the local VoiceStudio bridge.
+# keeps the previous behavior: fall through to Edge TTS. Set this in
+# config.toml (or via the VOICE_NAME env var) to e.g. "omnivoice:boy_voice"
+# once a cloned profile exists on the local OmniVoice service.
 default_voice_name = str(_cfg.get("default_voice_name", "")).strip()
 ui = _SynchronizedConfig(
     _cfg.get(
@@ -572,6 +702,38 @@ ui = _SynchronizedConfig(
         },
     )
 )
+
+_TASK_CONFIG_SECTIONS = (
+    app,
+    whisper,
+    proxy,
+    siliconflow,
+    minimax_tts,
+    elevenlabs,
+    chatterbox,
+    kokoro,
+    fish_audio,
+    omnivoice,
+    ui,
+)
+
+
+def capture_runtime_config() -> dict[int, dict]:
+    """Capture the effective configuration used by one background task."""
+    return {
+        id(section): copy.deepcopy(snapshot_config_with_pending(section))
+        for section in _TASK_CONFIG_SECTIONS
+    }
+
+
+@contextmanager
+def use_runtime_config_snapshot(snapshot: dict[int, dict]):
+    """Make a captured configuration visible only to the current task thread."""
+    token = _task_config_snapshot.set(snapshot)
+    try:
+        yield
+    finally:
+        _task_config_snapshot.reset(token)
 
 hostname = socket.gethostname()
 

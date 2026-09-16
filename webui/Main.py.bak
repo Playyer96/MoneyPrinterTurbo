@@ -687,57 +687,6 @@ def _build_uploaded_file_path(uploaded_file, target_dir, allowed_extensions, pre
     return file_path
 
 
-_LOCAL_MATERIAL_COPY_CHUNK_BYTES = 1024 * 1024
-
-
-def _persist_local_material(uploaded_file, target_dir):
-    """Validate and store an uploaded local material, content-addressed.
-
-    The stored name is derived from the sha256 of the uploaded bytes, so
-    submitting (or re-uploading) the same footage reuses the stored copy
-    instead of writing a fresh duplicate on every generate. The previous
-    per-submit uuid copy re-wrote the whole file each time, which turned a
-    single 1.9 GB upload into >100 GB of identical copies on disk.
-    """
-    original_name = os.path.basename(str(uploaded_file.name or ""))
-    extension = os.path.splitext(original_name)[1].lower()
-    if extension not in LOCAL_MATERIAL_EXTENSIONS:
-        logger.warning(
-            f"reject unsupported uploaded file extension: {original_name or '<empty>'}"
-        )
-        raise ValueError("unsupported uploaded file type")
-
-    normalized_target_dir = os.path.realpath(target_dir)
-    os.makedirs(normalized_target_dir, exist_ok=True)
-    buffer = uploaded_file.getbuffer()
-    digest = hashlib.sha256()
-    for start in range(0, len(buffer), _LOCAL_MATERIAL_COPY_CHUNK_BYTES):
-        digest.update(buffer[start : start + _LOCAL_MATERIAL_COPY_CHUNK_BYTES])
-    file_path = os.path.realpath(
-        os.path.join(
-            normalized_target_dir,
-            f"material-{digest.hexdigest()[:32]}{extension}",
-        )
-    )
-    if os.path.commonpath([normalized_target_dir, file_path]) != normalized_target_dir:
-        logger.warning(f"invalid uploaded file path: {file_path}")
-        raise ValueError("invalid uploaded file path")
-    if not os.path.exists(file_path):
-        with open(file_path, "wb") as output:
-            output.write(buffer)
-        logger.info(
-            f"local material stored: original_name={original_name}, "
-            f"stored_name={os.path.basename(file_path)}, "
-            f"size={len(buffer)} bytes"
-        )
-    else:
-        logger.info(
-            f"local material reuses stored copy: original_name={original_name}, "
-            f"stored_name={os.path.basename(file_path)}"
-        )
-    return file_path
-
-
 def _initialize_session_state():
     """Centrally initialize page state that is preserved across reruns."""
     if not st.session_state.get("cross_post_recovery_checked"):
@@ -1638,7 +1587,7 @@ def _infer_tts_server_from_voice(voice_name):
         return "fish_audio"
     if voice.is_omnivoice_voice(voice_name):
         return "omnivoice"
-    return "omnivoice"
+    return "edge-tts"
 
 
 def _set_stable_widget_value(key, value):
@@ -3799,7 +3748,7 @@ def _matching_full_voice_preview_duration(script, voice_rate):
 
     current_tts_server = st.session_state.get(
         localized_widget_key("tts_server_select"),
-        config.ui.get("tts_server", "omnivoice"),
+        config.ui.get("tts_server", "edge-tts"),
     )
     current_voice_name = st.session_state.get(
         localized_widget_key(f"speech_synthesis_select_{current_tts_server}"),
@@ -5713,7 +5662,7 @@ def _get_reusable_full_voice_preview(params, voice_mode: str) -> dict | None:
         return None
 
     script_content = str(params.video_script or "").strip()
-    selected_tts_server = config.ui.get("tts_server", "omnivoice")
+    selected_tts_server = config.ui.get("tts_server", "edge-tts")
     if (
         not script_content
         or not params.voice_name
@@ -5948,7 +5897,7 @@ def _render_audio_settings(panel, params):
 
             # Dubbing mode is the first-level status of audio settings, responsible for clearly distinguishing automatic dubbing, user uploading and no dubbing.
             # When the old configuration does not have voice_mode, the voice-free sentinel according to the original tts_server remains compatible.
-            saved_tts_server = config.ui.get("tts_server", "omnivoice")
+            saved_tts_server = config.ui.get("tts_server", "edge-tts")
             saved_voice_mode = config.ui.get("voice_mode")
             if saved_voice_mode not in {
                 VOICE_MODE_TTS,
@@ -6072,37 +6021,8 @@ def _render_audio_settings(panel, params):
                 # Local clone catalog for the self-hosted OmniVoice service.
                 _sync_omnivoice_config_from_session_state()
                 filtered_voices = _get_omnivoice_voice_options(saved_voice_name)
-            elif selected_tts_server == "coqui":
-                # Coqui XTTS has no remote catalog; the user picks a bundled
-                # language speaker (``coqui:speaker:<lang>``) or supplies the
-                # absolute path to a clone sample (``coqui:clone:/path/to.wav``).
-                # The provider detects the missing ``TTS`` package at call
-                # time and surfaces a clear error before the request runs.
-                coqui_default_speaker = (
-                    f"coqui:speaker:{config.ui.get('video_language', 'es')[:2].lower()}"
-                    if config.ui.get("video_language", "")
-                    else "coqui:speaker:es"
-                )
-                coqui_candidates = [
-                    "coqui:speaker:es",
-                    "coqui:speaker:en",
-                    "coqui:speaker:fr",
-                    "coqui:speaker:de",
-                    "coqui:speaker:pt",
-                    "coqui:clone:" + os.path.expanduser(
-                        config.ui.get("coqui_clone_reference", "")
-                        or "~/voice_samples/me.wav"
-                    ),
-                ]
-                if saved_voice_name and voice.is_coqui_voice(saved_voice_name):
-                    if saved_voice_name not in coqui_candidates:
-                        coqui_candidates.insert(0, saved_voice_name)
-                elif (
-                    voice.is_omnivoice_voice(saved_voice_name)
-                    and coqui_default_speaker not in coqui_candidates
-                ):
-                    coqui_candidates.insert(0, coqui_default_speaker)
-                filtered_voices = coqui_candidates
+            elif selected_tts_server == "edge-tts":
+                filtered_voices = voice.get_all_edge_voices(filter_locals=None)
 
             def _friendly(v):
                 if voice.is_no_voice(v):
@@ -7418,28 +7338,34 @@ def _render_generation_controls(
 
         if uploaded_files:
             local_videos_dir = utils.storage_dir("local_videos", create=True)
-            # A fresh upload defines the material list for this task;
-            # previously persisted entries are replaced, not merged.
+            # Each time you re-upload, the material selected this time will be used as the standard to avoid the repeated addition of old materials.
             params.video_materials = []
             persisted_local_materials = []
             for file in uploaded_files:
                 try:
-                    file_path = _persist_local_material(file, local_videos_dir)
+                    file_path = _build_uploaded_file_path(
+                        file,
+                        local_videos_dir,
+                        LOCAL_MATERIAL_EXTENSIONS,
+                        "material",
+                    )
                 except ValueError:
                     _remove_active_generation_task(task_id)
                     st.error(tr("Unsupported Upload File Type"))
                     st.stop()
-                m = MaterialInfo()
-                m.provider = "local"
-                m.url = file_path
-                params.video_materials.append(m)
-                persisted_local_materials.append(
-                    {
-                        "provider": m.provider,
-                        "url": m.url,
-                        "duration": m.duration,
-                    }
-                )
+                with open(file_path, "wb") as f:
+                    f.write(file.getbuffer())
+                    m = MaterialInfo()
+                    m.provider = "local"
+                    m.url = file_path
+                    params.video_materials.append(m)
+                    persisted_local_materials.append(
+                        {
+                            "provider": m.provider,
+                            "url": m.url,
+                            "duration": m.duration,
+                        }
+                    )
             # Write the video material that has been uploaded and saved locally to the session for direct reuse when only the copy is modified later.
             st.session_state["local_video_materials"] = persisted_local_materials
         elif (

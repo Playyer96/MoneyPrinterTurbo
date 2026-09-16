@@ -43,9 +43,8 @@ from app.utils import utils
 # dispatcher reads on its next call.
 from app.services.voice.providers import (  # noqa: F401  - re-exported
     _openai_compatible_tts,
-    edge_tts_synthesize,
     chatterbox_tts,
-    create_edge_tts_communicate,
+    coqui_xtts_tts,
     elevenlabs_tts,
     fish_audio_tts,
     gemini_tts,
@@ -53,9 +52,6 @@ from app.services.voice.providers import (  # noqa: F401  - re-exported
     get_minimax_voice_catalog,
     get_minimax_tts_api_key,
     get_minimax_tts_endpoint,
-    get_edge_tts_timeout_seconds,
-    _stream_edge_tts_sync_with_timeout,
-    stream_edge_tts_chunks,
     kokoro_tts,
     mimo_tts,
     minimax_tts,
@@ -96,6 +92,8 @@ from app.services.voice._shared import (  # noqa: F401  - re-exported
     MINIMAX_TTS_MODELS,
     NO_VOICE_NAME,
     OMNIVOICE_DEFAULT_BASE_URL,
+    parse_coqui_voice_name,
+    coqui_clone_reference_path,
     _EDGE_VOICES_DATA_FILE,
     _GEMINI_TTS_MODEL_FALLBACK,
     _MINIMAX_TTS_MAX_AUDIO_HEX_CHARS,
@@ -132,6 +130,7 @@ from app.services.voice._shared import (  # noqa: F401  - re-exported
     has_real_word_timestamps,
     is_edge_tts_voice,
     is_chatterbox_voice,
+    is_coqui_voice,
     is_elevenlabs_voice,
     is_fish_audio_voice,
     is_gemini_voice,
@@ -329,13 +328,18 @@ def _soften_voice_file(voice_file: str) -> None:
     natural sentence gap in that (default) path never gets its click fixed,
     no matter how good ``soften_audio_transitions`` itself is.
 
-    In addition to the click fix, the cleanup pass strips leading and
-    trailing silence from the model output and runs a spectral-gate
-    denoiser (``afftdn``) to remove the broadband hiss left by diffusion
-    samplers like OmniVoice. Without these two steps every TTS chunk
-    ships with ~100 ms of dead air at both ends (which compounds into long
-    gaps once chunks are concatenated) and audible white noise during
-    voiced segments.
+    The previous version of this helper also stripped leading / trailing
+    silence (``silenceremove``) and ran a spectral-gate denoiser
+    (``afftdn``) to clean up the diffusion-sampler hiss from OmniVoice.
+    Both steps destroyed audio loudness on real input: a 0 dBFS-peak
+    sample came out at -14 dBFS, an RMS drop of 25 dB. The
+    ``silenceremove=stop_threshold=-50dB`` filter treats every pause
+    inside the narration as silence to strip and the ``afftdn=nf=-25``
+    filter pulls the entire waveform down towards its noise-floor
+    estimate, so loud output became inaudibly quiet. Loud and audible
+    audio is more important than a marginal hiss reduction, so both
+    destructive passes are gone. ``soften_audio_transitions`` alone keeps
+    the boundary clicks tame without reducing amplitude.
 
     Best-effort and silent: cleanup is cosmetic, so any decode/encode
     failure here must never turn a successful TTS call into a failed one.
@@ -356,41 +360,15 @@ def _soften_voice_file(voice_file: str) -> None:
             if res.returncode != 0 or not os.path.exists(pcm_wav):
                 return
 
-            # One FFmpeg pass does the silence trim + denoise. silenceremove
-            # drops anything below -50 dBFS that's longer than 50 ms at the
-            # start/end of the file (start_periods=1, stop_periods=-1) so the
-            # output starts and ends on a voiced sample. afftdn removes the
-            # broadband hiss that diffusion samplers carry in the voiced
-            # signal. nf=-25 is a moderate setting that cleans the noise
-            # floor without dulling sibilants.
-            cleaned_wav = os.path.join(tmp_dir, "cleaned.wav")
-            clean_cmd = [
-                ffmpeg_binary, "-y", "-i", pcm_wav,
-                "-vn", "-ac", "1", "-ar", "24000",
-                "-af",
-                "silenceremove=start_periods=1:start_silence=0.05:"
-                "start_threshold=-50dB:stop_periods=-1:stop_silence=0.05:"
-                "stop_threshold=-50dB,afftdn=nf=-25",
-                "-codec:a", "pcm_s16le",
-                cleaned_wav,
-            ]
-            res = subprocess.run(clean_cmd, capture_output=True, text=True, check=False)
-            if res.returncode != 0 or not os.path.exists(cleaned_wav):
-                logger.warning(
-                    "voice clean pass failed, keeping unsoftened audio: "
-                    f"{(res.stderr or '').strip()[-200:]}"
-                )
-                return
-
-            # soften_audio_transitions still handles the internal silence
-            # boundaries that silenceremove leaves intact (sentence gaps
-            # inside the file). Best-effort: a file with no internal
-            # silences returns False and that's fine — the cleaned file is
-            # still kept.
-            soften_audio_transitions(cleaned_wav)
+            # soften_audio_transitions handles the internal silence
+            # boundaries that the TTS chunk leaves raw. Best-effort: a
+            # file with no internal silences returns False and that's fine
+            # -- the PCM intermediate is still written back to ``voice_file``
+            # below so the rest of the pipeline has a clean WAV.
+            soften_audio_transitions(pcm_wav)
 
             re_encode_cmd = [
-                ffmpeg_binary, "-y", "-i", cleaned_wav,
+                ffmpeg_binary, "-y", "-i", pcm_wav,
                 "-vn", "-ac", "1", "-ar", "24000",
             ]
             if output_ext == ".mp3":
@@ -518,7 +496,21 @@ def _single_tts(
             )
         logger.error(f"Invalid omnivoice voice name format: {voice_name}")
         return None
-    return edge_tts_synthesize(text, voice_name, voice_rate, voice_file)
+    elif is_coqui_voice(voice_name):
+        return coqui_xtts_tts(
+            text, voice_name, voice_rate, voice_file, voice_volume,
+            voice_style=voice_style,
+        )
+    # No prefix: fall back to the omnivoice narrator. ``edge_tts_synthesize``
+    # used to be here; that provider was removed entirely.
+    return omnivoice_tts(
+        text=text,
+        voice_preset="narrator",
+        voice_file=voice_file,
+        voice_rate=voice_rate,
+        voice_volume=voice_volume,
+        voice_style=voice_style,
+    )
 
 
 def _tts_with_pauses(

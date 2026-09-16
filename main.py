@@ -5,10 +5,10 @@ from app.config import config
 from app.services import voice
 
 if __name__ == "__main__":
-    # Auto-launch the bundled VoiceStudio (OmniVoice) server when its port is
+    # Auto-launch the bundled OmniVoice server when its port is
     # unreachable, so API users get the same out-of-the-box experience as the
     # WebUI. The helper is idempotent: externally-managed servers stay untouched.
-    voice.ensure_voicestudio_server_running()
+    voice.ensure_omnivoice_server_running()
     logger.info(
         "start server, docs: http://127.0.0.1:" + str(config.listen_port) + "/docs"
     )

@@ -14,7 +14,7 @@
 # Note: whisper stays on the CPU here. faster-whisper runs on CTranslate2,
 # which has CUDA and CPU backends only -- no ROCm. TTS still gets the GPU.
 services:
-  voicestudio:
+  omnivoice:
     build:
       args:
         PYTORCH_INDEX_URL: https://download.pytorch.org/whl/rocm6.2

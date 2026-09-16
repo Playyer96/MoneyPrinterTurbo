@@ -41,7 +41,7 @@ def test_mac_compose_wires_host_acceleration_before_app_services():
     services = json.loads(result.stdout)["services"]
 
     assert services["host-accelerators"]["provider"]["type"] == str(PROVIDER)
-    assert "host-accelerators" in services["voicestudio-host"]["depends_on"]
+    assert "host-accelerators" in services["omnivoice-host"]["depends_on"]
     assert "host-accelerators" in services["ffmpeg-proxy-host"]["depends_on"]
-    assert services["webui"]["depends_on"]["voicestudio-host"]["condition"] == "service_healthy"
+    assert services["webui"]["depends_on"]["omnivoice-host"]["condition"] == "service_healthy"
     assert services["api"]["depends_on"]["ffmpeg-proxy-host"]["condition"] == "service_healthy"

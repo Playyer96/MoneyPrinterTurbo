@@ -5,9 +5,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-# vendor/voice_studio is not a package on sys.path; load server.py by file.
-_SERVER = Path(__file__).parent.parent.parent / "vendor" / "voice_studio" / "server.py"
-_spec = importlib.util.spec_from_file_location("voicestudio_server", _SERVER)
+# vendor/omnivoice is not a package on sys.path; load server.py by file.
+_SERVER = Path(__file__).parent.parent.parent / "vendor" / "omnivoice" / "server.py"
+_spec = importlib.util.spec_from_file_location("omnivoice_server", _SERVER)
 server = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(server)
 
@@ -34,7 +34,7 @@ class TestPickDevice(unittest.TestCase):
 
     def test_no_gpu_refuses_instead_of_silently_using_cpu(self):
         """The whole point: a containerised Mac must fail loudly, not crawl."""
-        with patch.dict(server.os.environ, {"VOICESTUDIO_ALLOW_CPU": "1"}):
+        with patch.dict(server.os.environ, {"OMNIVOICE_ALLOW_CPU": "1"}):
             with self.assertRaises(RuntimeError) as ctx:
                 server._pick_device(_fake_torch(cuda=False, mps=False))
         self.assertIn("docker-compose.mac.yml", str(ctx.exception))
@@ -49,21 +49,23 @@ class TestPickDevice(unittest.TestCase):
         load_model.return_value.generate.return_value = [array("f", [0.0] * 240)]
 
         response = server.generate_audio(
-            SimpleNamespace(text="Hello world", voice="narrator", speed=None)
+            SimpleNamespace(text="Hello world", voice="narrator", speed=None, style=None)
         )
 
         self.assertEqual(response.media_type, "audio/wav")
         self.assertTrue(response.body.startswith(b"RIFF"))
-        # 16 steps is the new default: noticeably better output than OmniVoice's
-        # 8-step greedy default at roughly 2x render time. Operators who need
+        # 32 steps is the new default: noticeably better output than OmniVoice's
+        # 8-step greedy default at roughly 4x render time. Operators who need
         # the fast path can still set OMNIVOICE_NUM_STEPS=8 in the env.
         self.assertEqual(
-            load_model.return_value.generate.call_args.kwargs["num_step"], 16
+            load_model.return_value.generate.call_args.kwargs["num_step"], 32
         )
-        # Position temperature > 0 keeps cloned voices from sounding flat.
+        # Position temperature 0.45 adds the natural pitch/energy variation
+        # that makes cloned voices sound expressive instead of monotone, while
+        # staying below the threshold where prosody starts to fragment.
         self.assertEqual(
             load_model.return_value.generate.call_args.kwargs["position_temperature"],
-            0.2,
+            0.45,
         )
 
 

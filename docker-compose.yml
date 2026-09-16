@@ -2,7 +2,7 @@ x-common-volumes: &common-volumes
   - ./:/MoneyPrinterTurbo
 
 # Everything runs in Docker. Five services on a private bridge network:
-# webui and api reach voicestudio (TTS), lightpanda (headless browser) and
+# webui and api reach omnivoice (TTS), lightpanda (headless browser) and
 # searxng (meta search) by service name, so this works identically on
 # Linux, macOS and Windows.
 #
@@ -46,12 +46,12 @@ networks:
 
 # Named volumes keep the downloaded models, voice profiles and generated
 # audio across container restarts and re-creates, and stop the bind-mounted
-# MoneyPrinterTurbo source dir from accumulating voice_studio state inside
+# MoneyPrinterTurbo source dir from accumulating OmniVoice state inside
 # the repo. Model weights live here rather than in the image or the repo.
 volumes:
-  voicestudio_models:
-  voicestudio_profiles:
-  voicestudio_output:
+  omnivoice_models:
+  omnivoice_profiles:
+  omnivoice_output:
 
 # Package sources for the app image. "auto" measures which side of the world
 # this build is on (docker/pick-mirror.py) instead of hardcoding the China
@@ -73,7 +73,7 @@ x-service-env: &service-env
   FFMPEG_BINARY: "${FFMPEG_BINARY:-/usr/bin/ffmpeg}"
   # Service name on the bridge network by default. docker-compose.mac.yml
   # repoints this at the host, where the GPU actually is on Apple Silicon.
-  VOICESTUDIO_BASE_URL: "${VOICESTUDIO_BASE_URL:-http://voicestudio:8780}"
+  OMNIVOICE_BASE_URL: "${OMNIVOICE_BASE_URL:-http://omnivoice:8780}"
   # Topic research talks to two more containers on the same bridge: a headless
   # browser that renders article pages, and a meta search engine that is not
   # rate-limited the way scraping DuckDuckGo directly is.
@@ -82,28 +82,28 @@ x-service-env: &service-env
   SEARXNG_URL: "${SEARXNG_URL:-http://searxng:8080}"
 
 services:
-  voicestudio:
+  omnivoice:
     # OmniVoice lives in its own image so the app image does not carry
     # torch/transformers. PYTORCH_INDEX_URL selects the CPU, CUDA or ROCm
     # wheels; the GPU override files set it.
     build:
-      context: ./vendor/voice_studio
+      context: ./vendor/omnivoice
       dockerfile: Dockerfile
       args:
         # Empty = default PyPI torch, which auto-uses an NVIDIA GPU when one
         # is attached and the CPU when none is. Only ROCm needs an override.
         PYTORCH_INDEX_URL: "${PYTORCH_INDEX_URL:-}"
-    image: voicestudio:latest
-    container_name: "moneyprinterturbo-voicestudio"
+    image: omnivoice:latest
+    container_name: "moneyprinterturbo-omnivoice"
     networks:
       - mpt-net
     environment:
       # server.py reads these; matches the defaults in the Dockerfile.
-      VOICESTUDIO_HOST: "0.0.0.0"
-      VOICESTUDIO_PORT: "8780"
+      OMNIVOICE_HOST: "0.0.0.0"
+      OMNIVOICE_PORT: "8780"
       # OmniVoice refuses to start without CUDA, ROCm, or MPS. CPU inference
       # is intentionally unavailable because it makes each video unacceptably slow.
-      HF_HOME: "/voicestudio/models"
+      HF_HOME: "/omnivoice/models"
       HF_HUB_DISABLE_XET: "1"
     ports:
       # Host-side port mapping is optional; mainly for ad-hoc curl from the
@@ -111,11 +111,11 @@ services:
       # touches this mapping.
       - "127.0.0.1:8780:8780"
     volumes:
-      - voicestudio_models:/voicestudio/models
-      - voicestudio_profiles:/voicestudio/voice_profiles
-      - voicestudio_output:/voicestudio/output
+      - omnivoice_models:/omnivoice/models
+      - omnivoice_profiles:/omnivoice/voice_profiles
+      - omnivoice_output:/omnivoice/output
     restart: unless-stopped
-    # VoiceStudio loads a ~5GB OmniVoice stack on first request. Give the
+    # OmniVoice loads a ~5GB stack on first request. Give the
     # container enough memory headroom; bump up if OOMs on a small host.
     deploy:
       resources:
@@ -184,6 +184,25 @@ services:
       - "127.0.0.1:8501:8501"
     command: [ "streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=127.0.0.1", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False" ]
     volumes: *common-volumes
+    # `docker compose watch webui` rebuilds + restarts the container when any
+    # Python file under the listed paths changes. ``app/services/voice``
+    # is the only voice-stable submodule that is not a Python package on
+    # its own; ``vendor/`` and ``.mpt-host/`` are excluded so OS-level
+    # dependencies do not invalidate the cache.
+    develop:
+      watch:
+        - action: sync+restart
+          path: app
+          target: /MoneyPrinterTurbo/app
+        - action: sync+restart
+          path: webui
+          target: /MoneyPrinterTurbo/webui
+        - action: sync+restart
+          path: main.py
+          target: /MoneyPrinterTurbo/main.py
+        - action: sync+restart
+          path: config.toml
+          target: /MoneyPrinterTurbo/config.toml
     restart: unless-stopped
 
   api:
@@ -200,4 +219,18 @@ services:
       - "127.0.0.1:8080:8080"
     command: [ "python3", "main.py" ]
     volumes: *common-volumes
+    develop:
+      watch:
+        - action: sync+restart
+          path: app
+          target: /MoneyPrinterTurbo/app
+        - action: sync+restart
+          path: webui
+          target: /MoneyPrinterTurbo/webui
+        - action: sync+restart
+          path: main.py
+          target: /MoneyPrinterTurbo/main.py
+        - action: sync+restart
+          path: config.toml
+          target: /MoneyPrinterTurbo/config.toml
     restart: unless-stopped

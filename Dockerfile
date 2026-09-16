@@ -82,6 +82,19 @@ RUN set -u; \
         echo "no configured Debian mirror could install git and ffmpeg" >&2; \
         exit 1; \
     fi; \
+    # Coqui XTTS builds a tiny C extension at install time; ``libc6-dev``
+    # pulls in ``stdlib.h`` and the rest of the C headers the build
+    # expects. Keep the dev headers in the image so the wheel builds
+    # during ``pip install -r requirements.txt``; without them the
+    # install aborts inside the slim Python image.
+    if ! apt-get -o Acquire::Check-Valid-Until=false \
+              -o Acquire::ForceIPv4=true \
+              -o Acquire::http::Timeout=15 \
+              -o Acquire::https::Timeout=15 \
+              -o Acquire::Retries=1 update >/dev/null 2>&1 \
+         || ! apt-get install -y --no-install-recommends libc6-dev >/dev/null 2>&1; then \
+        echo "WARNING: could not install libc6-dev; Coqui XTTS may not build" >&2; \
+    fi; \
     rm -rf /var/lib/apt/lists/*
 
 # Copy only the requirements.txt first to leverage Docker cache

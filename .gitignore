@@ -51,3 +51,4 @@ htmlcov/
 # User-supplied voice cloning samples (per-user, not source)
 vendor/voice_studio/voice_inputs/*
 vendor/voice_studio/voice_profiles/boy_voice.*
+.env.bak

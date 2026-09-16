@@ -144,7 +144,14 @@ class VideoParams(BaseModel):
     video_fit_mode: VideoFitMode = VideoFitMode.cover
     video_concat_mode: Optional[VideoConcatMode] = VideoConcatMode.random.value
     video_transition_mode: Optional[VideoTransitionMode] = None
+    # ``video_clip_duration`` is the max seconds per material slice. When
+    # ``video_clip_duration_auto`` is true, the pipeline derives a value from
+    # the audio length (around audio/10s, clamped to [2, 10]) instead of
+    # honouring ``video_clip_duration``. Both kept on the model so the API
+    # surface stays stable while the WebUI's "Auto" option only flips the
+    # boolean.
     video_clip_duration: int = Field(default=5, ge=1)
+    video_clip_duration_auto: bool = False
     video_clip_speed: Optional[float] = 1.0
     match_materials_to_script: bool = False
     video_count: int = Field(default=1, ge=1)
@@ -249,20 +256,25 @@ class VideoParams(BaseModel):
     # final video. Both are optional and disabled by default to preserve the
     # legacy behaviour. ``intro_text`` / ``outro_text`` accept multi-line text
     # via ``\n``; each non-empty line becomes its own line on the overlay.
-    intro_enabled: bool = False
+    # Intro / outro overlay defaults to ON. The previous opt-in default let
+    # users forget to enable them, so the overlay was missing in real
+    # renders even though the UI panel was exposed. Now ON with default text
+    # that uses the video_subject (and the first series_outline entry, if
+    # series is on); users can still disable or override the text per task.
+    intro_enabled: bool = True
     intro_text: Optional[str] = ""
-    intro_duration: float = Field(default=3.0, ge=0.5, le=15.0)
+    intro_duration: float = Field(default=5.0, ge=0.5, le=15.0)
     intro_blur_strength: int = Field(default=35, ge=5, le=120)
     intro_text_color: Optional[str] = "#FFFFFF"
     intro_animation: Optional[str] = "fade"
-    intro_tts_enabled: bool = False
-    outro_enabled: bool = False
+    intro_tts_enabled: bool = True
+    outro_enabled: bool = True
     outro_text: Optional[str] = ""
-    outro_duration: float = Field(default=4.0, ge=0.5, le=15.0)
+    outro_duration: float = Field(default=6.0, ge=0.5, le=15.0)
     outro_blur_strength: int = Field(default=35, ge=5, le=120)
     outro_text_color: Optional[str] = "#FFFFFF"
     outro_animation: Optional[str] = "fade"
-    outro_tts_enabled: bool = False
+    outro_tts_enabled: bool = True
 
     # Series mode: turn one subject into an ordered set of chapter videos.
     # ``series_parts`` is the single count input: 0 lets the model decide how

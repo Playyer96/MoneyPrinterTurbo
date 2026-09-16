@@ -18,6 +18,7 @@ from typing import List, Optional, Set, Tuple
 from loguru import logger
 import numpy as np
 from moviepy import (
+    AudioArrayClip,
     AudioFileClip,
     ColorClip,
     CompositeAudioClip,
@@ -26,6 +27,7 @@ from moviepy import (
     TextClip,
     VideoFileClip,
     afx,
+    concatenate_audioclips,
     concatenate_videoclips,
 )
 from moviepy.video.io import ffmpeg_writer as moviepy_ffmpeg_writer
@@ -43,6 +45,7 @@ from app.models.schema import (
     VideoTransitionMode,
 )
 from app.services import guardrails, subtitle, subtitle_styles
+from app.services.render import audio_mix, subtitles_ass
 from app.services import bgm as bgm_service
 from app.services.utils import video_effects
 from app.utils import file_security, utils
@@ -2126,149 +2129,29 @@ def _build_ass_subtitles(
     video_height: int,
     max_duration: float | None = None,
 ) -> str:
-    """Build styled ASS events so FFmpeg can render animated karaoke natively."""
+    """Build styled ASS events so FFmpeg can render animated karaoke natively.
+
+    Thin wrapper over :func:`app.services.render.subtitles_ass.build_ass_document`
+    kept for callers and tests that import it from here.
+    """
     timed_cues: list[tuple[tuple[float, float], str]] = []
     for _index, timing_line, text in subtitle.file_to_subtitles(srt_path):
         timing = _parse_subtitle_timing(timing_line)
         if timing is None or timing[1] <= timing[0] or not text:
             continue
-        if max_duration is not None and timing[0] >= max_duration:
-            continue
         timed_cues.append((timing, text))
     if not timed_cues:
         return ""
-
-    normal_color = _ass_color(getattr(params, "text_fore_color", ""), "#FFFFFF")
-    stroke_color = _ass_color(getattr(params, "stroke_color", ""), "#000000")
-    preset = subtitle_styles.get_subtitle_preset(
-        getattr(params, "subtitle_style_preset", "custom")
-    ) or {}
-    highlight_color = _ass_color(preset.get("highlight_color", ""), "#FFE600")
-    font_name = os.path.splitext(os.path.basename(font_path))[0]
-    font_size = int(getattr(params, "font_size", 60) or 60)
-    ass_font_size = max(1, int(round(font_size * 1.15)))
-    stroke_width = max(0, int(round(float(getattr(params, "stroke_width", 0) or 0))))
-    margin_x = max(10, int(video_width * 0.05))
-
-    background_color = (
-        getattr(params, "subtitle_ass_background_color", "") or ""
-    ) or (
-        "#000000"
-        if bool(getattr(params, "subtitle_background_enabled", False))
-        or bool(getattr(params, "rounded_subtitle_background", False))
-        else ""
+    words_json_path = os.path.splitext(srt_path)[0] + ".words.json"
+    return subtitles_ass.build_ass_document(
+        timed_cues=timed_cues,
+        params=params,
+        font_path=font_path,
+        width=video_width,
+        height=video_height,
+        max_duration=max_duration,
+        words_json_path=words_json_path,
     )
-    back_color = (
-        _ass_color(background_color, "#000000") if background_color else "&H00000000"
-    )
-
-    custom_style_block = (
-        (getattr(params, "subtitle_ass_style_override", "") or "").strip()
-    )
-    if custom_style_block:
-        style_block = custom_style_block
-        if style_block.lower().startswith("[v4+ styles]"):
-            style_block = style_block[len("[v4+ Styles]"):].lstrip("\r\n")
-        styles_section = f"[V4+ Styles]\n{style_block}"
-    else:
-        styles_section = (
-            "[V4+ Styles]\n"
-            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
-            "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
-            "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
-            "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-            f"Style: Default,{font_name},{ass_font_size},{normal_color},"
-            f"{normal_color},{stroke_color},{back_color},-1,0,0,0,100,100,"
-            f"0,0,1,{stroke_width},0,5,{margin_x},{margin_x},0,1"
-        )
-
-    header = f"""[Script Info]
-ScriptType: v4.00+
-PlayResX: {video_width}
-PlayResY: {video_height}
-WrapStyle: 0
-ScaledBorderAndShadow: yes
-
-{styles_section}
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
-
-    position = getattr(params, "subtitle_position", "bottom")
-    if position == "bottom":
-        alignment, x, y = 2, video_width / 2, video_height * 0.95
-    elif position == "top":
-        alignment, x, y = 8, video_width / 2, video_height * 0.05
-    elif position in ("two_thirds_bottom", "two_thirds", "2/3_bottom"):
-        alignment, x, y = 8, video_width / 2, video_height * 0.30
-    elif position == "custom":
-        percent = max(0.0, min(100.0, float(getattr(params, "custom_position", 50))))
-        alignment, x, y = 8, video_width / 2, video_height * percent / 100
-    else:
-        alignment, x, y = 5, video_width / 2, video_height / 2
-
-    animation = getattr(params, "subtitle_animation", "none")
-    if animation in ("scale_up", "zoom_in", "punch"):
-        animation_tag = r"\fscx65\fscy65\t(0,180,0.5,\fscx100\fscy100)"
-    elif animation in ("pop_spring", "spring", "pop"):
-        animation_tag = r"\fscx5\fscy5\t(0,100,0.5,\fscx135\fscy135)\t(100,180,0.5,\fscx100\fscy100)"
-    elif animation in ("fade", "fade_in"):
-        animation_tag = r"\fad(180,0)"
-    else:
-        animation_tag = ""
-
-    display_cues = subtitle_styles.build_display_cues(
-        timed_cues,
-        getattr(params, "subtitle_display_mode", "sentence"),
-    )
-    raw_event_overrides = (
-        getattr(params, "subtitle_ass_event_overrides", "") or ""
-    ).strip()
-
-    shadow_tag = ""
-    if float(getattr(params, "subtitle_ass_shadow", 0) or 0) > 0:
-        shadow_tag = f"\\shad{int(float(getattr(params, 'subtitle_ass_shadow')))}"
-    blur_tag = ""
-    if float(getattr(params, "subtitle_ass_blur", 0) or 0) > 0:
-        blur_tag = f"\\blur{int(float(getattr(params, 'subtitle_ass_blur')))}"
-    rotation_tag = ""
-    if float(getattr(params, "subtitle_ass_rotation", 0) or 0) % 360 != 0:
-        rotation_tag = (
-            f"\\frz{int(float(getattr(params, 'subtitle_ass_rotation')) % 360)}"
-        )
-    static_event_overrides = "".join(
-        tag for tag in (shadow_tag, blur_tag, rotation_tag) if tag
-    )
-
-    events: list[str] = []
-    for timing, raw_phrase in display_cues:
-        start, end = timing
-        if max_duration is not None:
-            end = min(end, max_duration)
-        if end <= start:
-            continue
-        phrase = subtitle_styles.apply_text_casing(
-            str(raw_phrase), getattr(params, "subtitle_casing", "as_is")
-        )
-        if animation in ("slide_up", "rise"):
-            shift = max(15, int(round(font_size * 0.3)))
-            position_tag = (
-                f"\\an{alignment}\\move({x:.0f},{y + shift:.0f},{x:.0f},{y:.0f},0,180)"
-            )
-        else:
-            position_tag = f"\\an{alignment}\\pos({x:.0f},{y:.0f})"
-        text = _ass_dialogue_text(phrase, normal_color, highlight_color)
-        body_overrides = "".join(
-            tag
-            for tag in (animation_tag, static_event_overrides, raw_event_overrides)
-            if tag
-        )
-        events.append(
-            f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,,"
-            f"{{{position_tag}{body_overrides}}}{text}"
-        )
-    return header + "\n".join(events) + "\n" if events else ""
 
 
 def _escape_ffmpeg_filter_path(path: str) -> str:
@@ -2369,6 +2252,224 @@ def _render_subtitle_pngs(
             continue
 
     return rendered
+
+
+def _concat_video_segments_with_ffmpeg(
+    segment_paths: list[str],
+    *,
+    output_file: str,
+    width: int,
+    height: int,
+    output_fps: int,
+    codec: str,
+    codec_params: list[str],
+    threads: int,
+) -> bool:
+    """Join full video segments end to end with a single re-encoding ffmpeg call.
+
+    Used to attach intro/outro overlays (rendered separately, at their own
+    short duration) around the fast-rendered main segment. Segments come
+    from two different encoders (MoviePy's writer for the short overlays,
+    the raw ffmpeg subtitle burn-in for the main segment), so their SPS/PPS
+    and profile are not guaranteed to match -- a stream-copy concat demuxer
+    would be fragile here. The ``concat`` filter re-encodes instead, which
+    is slower but always joins correctly regardless of each input's exact
+    encoder parameters.
+    """
+    if len(segment_paths) == 1:
+        try:
+            shutil.copyfile(segment_paths[0], output_file)
+            return True
+        except OSError as exc:
+            logger.warning(f"failed to copy single video segment: {exc}")
+            return False
+
+    command = [utils.get_ffmpeg_binary(), "-y"]
+    for path in segment_paths:
+        command += ["-i", path]
+
+    filter_parts = []
+    concat_inputs = ""
+    for index in range(len(segment_paths)):
+        filter_parts.append(
+            f"[{index}:v]scale={width}:{height},setsar=1,fps={output_fps}[v{index}]"
+        )
+        filter_parts.append(
+            f"[{index}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a{index}]"
+        )
+        concat_inputs += f"[v{index}][a{index}]"
+    filter_parts.append(
+        f"{concat_inputs}concat=n={len(segment_paths)}:v=1:a=1[outv][outa]"
+    )
+    if codec == "h264_vaapi":
+        filter_parts.append("[outv]format=nv12,hwupload[outv2]")
+        video_map = "[outv2]"
+    else:
+        video_map = "[outv]"
+
+    command += [
+        "-filter_complex", ";".join(filter_parts),
+        "-map", video_map,
+        "-map", "[outa]",
+        "-c:v", codec,
+    ]
+    command += codec_params
+    command += ["-threads", str(threads or 2)]
+    if codec != "h264_vaapi":
+        command += ["-pix_fmt", "yuv420p"]
+    command += [
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-movflags", "+faststart",
+        output_file,
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        logger.warning(
+            f"segment concat failed (rc={result.returncode}); "
+            f"last stderr: {' | '.join((result.stderr or '').strip().splitlines()[-5:])}"
+        )
+        return False
+    return True
+
+
+def _attach_intro_outro_via_concat(
+    *,
+    main_segment_path: str,
+    output_file: str,
+    params: VideoParams,
+    video_width: int,
+    video_height: int,
+    source_video_path: str,
+) -> bool:
+    """Render intro/outro overlays as short clips and ffmpeg-concat them
+    around an already fast-rendered (subtitled, loudness-normalized) main
+    segment.
+
+    Keeps intro/outro on the same MoviePy overlay code (pixellated
+    background, blurred text, fades) but limits MoviePy's frame-by-frame
+    rendering to a few seconds of overlay instead of the whole video, and
+    keeps the main segment on the fast ffmpeg burn-in/mix path regardless
+    of whether intro/outro are enabled.
+    """
+    main_duration = audio_mix.probe_duration(main_segment_path)
+    if main_duration <= 0:
+        logger.warning(f"could not probe duration of {main_segment_path}")
+        return False
+
+    intro_clip, outro_clip, intro_audio_clip, outro_audio_clip = (
+        _build_intro_outro_clips(
+            params=params,
+            video_width=video_width,
+            video_height=video_height,
+            video_duration=main_duration,
+            material_paths=[source_video_path] if source_video_path else None,
+        )
+    )
+    if intro_clip is None and outro_clip is None:
+        # Nothing to attach after all (e.g. both overlays failed to build);
+        # the main segment alone is a complete, correct render.
+        try:
+            shutil.copyfile(main_segment_path, output_file)
+            return True
+        except OSError as exc:
+            logger.warning(f"failed to promote main segment to output: {exc}")
+            return False
+
+    sample_rate = int(
+        getattr(intro_audio_clip, "fps", 0)
+        or getattr(outro_audio_clip, "fps", 0)
+        or 44100
+    )
+    segment_paths: list[str] = []
+    temp_paths: list[str] = []
+    codec = _get_effective_video_codec()
+    codec_params = _get_codec_ffmpeg_params(codec, filtered=True)
+
+    def write_overlay(clip, audio_clip, tag: str) -> str | None:
+        segment_audio = audio_clip if audio_clip is not None else AudioArrayClip(
+            # Stereo, not mono: MoviePy's AudioArrayClip writer doubles the
+            # written duration for a single-channel (n, 1) array in this
+            # version (reproduced directly against write_audiofile) -- a
+            # silent "5s" overlay came out as a real 10s file, throwing the
+            # whole concatenated timeline out of sync.
+            np.zeros((max(0, int(round(clip.duration * sample_rate))), 2), dtype=np.float32),
+            fps=sample_rate,
+        )
+        temp_path = f"{output_file}.{tag}-segment.mp4"
+        try:
+            muxed = clip.with_audio(segment_audio)
+            try:
+                _write_videofile_with_codec_fallback(
+                    muxed,
+                    output_file=temp_path,
+                    codec=_get_configured_video_codec(),
+                    audio_codec=audio_codec,
+                    audio_fps=sample_rate,
+                    audio_bitrate=audio_bitrate,
+                    threads=int(getattr(params, "n_threads", 2) or 2),
+                    logger=None,
+                    fps=fps,
+                )
+            finally:
+                close_clip(muxed)
+        except Exception as exc:
+            logger.warning(f"failed to render {tag} overlay segment: {exc}")
+            return None
+        return temp_path if os.path.exists(temp_path) else None
+
+    try:
+        if intro_clip is not None:
+            intro_path = write_overlay(intro_clip, intro_audio_clip, "intro")
+            if intro_path is None:
+                return False
+            segment_paths.append(intro_path)
+            temp_paths.append(intro_path)
+            logger.info(
+                f"intro segment: claimed duration={intro_clip.duration:.3f}s, "
+                f"probed={audio_mix.probe_duration(intro_path):.3f}s"
+            )
+
+        segment_paths.append(main_segment_path)
+        logger.info(
+            f"main segment: probed={audio_mix.probe_duration(main_segment_path):.3f}s "
+            f"(narration was {main_duration:.3f}s)"
+        )
+
+        if outro_clip is not None:
+            outro_path = write_overlay(outro_clip, outro_audio_clip, "outro")
+            if outro_path is None:
+                return False
+            segment_paths.append(outro_path)
+            temp_paths.append(outro_path)
+            logger.info(
+                f"outro segment: claimed duration={outro_clip.duration:.3f}s, "
+                f"probed={audio_mix.probe_duration(outro_path):.3f}s"
+            )
+
+        concat_ok = _concat_video_segments_with_ffmpeg(
+            segment_paths,
+            output_file=output_file,
+            width=video_width,
+            height=video_height,
+            output_fps=fps,
+            codec=codec,
+            codec_params=codec_params,
+            threads=int(getattr(params, "n_threads", 2) or 2),
+        )
+        if concat_ok:
+            logger.info(
+                f"intro/outro concat produced {output_file}, "
+                f"probed={audio_mix.probe_duration(output_file):.3f}s"
+            )
+        return concat_ok
+    finally:
+        for path in intro_audio_clip, outro_audio_clip:
+            if path is not None:
+                close_clip(path)
+        for path in intro_clip, outro_clip:
+            if path is not None:
+                close_clip(path)
+        delete_files(temp_paths)
 
 
 def _final_mux_with_ffmpeg(
@@ -2903,15 +3004,20 @@ def _create_blurred_text_clip(
     text_color: str,
     blur_strength: int,
     font_name: Optional[str] = None,
+    material_paths: Optional[List[str]] = None,
 ):
     """
     Render a fully-blurred full-screen overlay with centered multi-line text.
 
-    The background is a procedurally generated blurred gradient — no source
-    clip or external image is required, so the overlay stays self-contained
-    and never reveals the underlying video. ``text`` may contain ``\\n``
-    separators, one per line; empty lines collapse to a small vertical
-    spacer so the overlay breathes.
+    The background pixellates one frame of the actual source video
+    material (heavily downscaled then NEAREST-upscaled back to the canvas,
+    plus a light Gaussian blur to dissolve the pixel grid). When no
+    material is available the helper falls back to a procedural gradient
+    so text-only renders still get a backdrop.
+
+    ``text`` may contain ``\\n`` separators, one per line. Lines beyond the
+    4-line cap are dropped -- longer copy made the lines overlap in
+    previous builds.
     """
     text = (text or "").strip()
     if not text or duration <= 0:
@@ -2923,7 +3029,12 @@ def _create_blurred_text_clip(
     width = max(64, int(video_width))
     height = max(64, int(video_height))
 
-    background = _build_blurred_background(width, height, blur_strength)
+    background = _build_pixellated_material_background(
+        material_paths=material_paths,
+        width=width,
+        height=height,
+        blur_strength=blur_strength,
+    )
 
     text_clips = _build_overlay_text_clips(
         text=text,
@@ -2975,6 +3086,74 @@ def _build_blurred_background(width: int, height: int, blur_strength: int):
     )
 
 
+def _build_pixellated_material_background(
+    material_paths: Optional[List[str]],
+    width: int,
+    height: int,
+    blur_strength: int,
+):
+    """
+    Pull one frame from the actual video material and heavily pixelate it,
+    so the intro/outro overlay reads as "the same video, just blurred"
+    instead of "a different blue screen". Falls back to the procedural
+    gradient when no material is available, so the same ``_build_intro_
+    outro_clips`` flow keeps working on text-only renders.
+
+    The pixelation pipeline is: probe a frame near the middle of the
+    source clip -> resize down to ~64x64 (which is what hides every
+    recognisable object) -> upscale back to the canvas size with NEAREST
+    so the square pixels stay visible -> light Gaussian blur on top so
+    the pixel grid melts into a soft backdrop. MoviePy caches the still
+    image so all overlay frames reuse the same RGBA.
+    """
+    source_path = None
+    if material_paths:
+        for path in material_paths:
+            if path and os.path.isfile(path):
+                source_path = path
+                break
+    if not source_path:
+        return _build_blurred_background(width, height, blur_strength)
+
+    pixel_grid = 64  # small enough to hide any recognisable object
+    try:
+        with _open_video_clip_quietly(source_path) as source_clip:
+            if not source_clip or source_clip.duration <= 0:
+                raise RuntimeError("empty source clip")
+            sample_t = min(0.5, max(0.0, source_clip.duration / 2.0))
+            frame = source_clip.get_frame(sample_t)
+            close_clip(source_clip)
+        img = Image.fromarray(frame).convert("RGB")
+        img_aspect = img.width / max(1, img.height)
+        target_aspect = width / max(1, height)
+        if img_aspect > target_aspect:
+            crop_w = int(round(img.height * target_aspect))
+            x0 = (img.width - crop_w) // 2
+            img = img.crop((x0, 0, x0 + crop_w, img.height))
+        else:
+            crop_h = int(round(img.width / target_aspect))
+            y0 = (img.height - crop_h) // 2
+            img = img.crop((0, y0, img.width, y0 + crop_h))
+        # Downscale to a tiny pixel grid then upscale with NEAREST so each
+        # "pixel" becomes a chunky block of canvas pixels.
+        small_w = max(8, min(pixel_grid, width // 8))
+        small_h = max(8, int(round(small_w * height / width)))
+        small = img.resize((small_w, small_h), Image.Resampling.LANCZOS)
+        big = small.resize((width, height), Image.Resampling.NEAREST)
+        blur_radius = max(8, int(blur_strength) // 4)
+        big = big.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+        # Darken so the white text reads with high contrast on top.
+        enhancer = Image.new("RGB", big.size, (0, 0, 0))
+        big = Image.blend(big, enhancer, alpha=0.25)
+        return np.asarray(big, dtype=np.uint8)
+    except Exception as exc:
+        logger.warning(
+            f"could not pixellate material for intro/outro background, "
+            f"falling back to gradient: {type(exc).__name__}: {exc}"
+        )
+        return _build_blurred_background(width, height, blur_strength)
+
+
 def _build_overlay_text_clips(
     *,
     text: str,
@@ -2983,7 +3162,16 @@ def _build_overlay_text_clips(
     text_color: str,
     font_name: Optional[str],
 ):
-    """Build centered, multi-line TextClips for the overlay. Pure helper."""
+    """Build centered, multi-line TextClips for the overlay. Pure helper.
+
+    Auto-shrinks the font so up to ``MAX_LINES`` lines fit the canvas with
+    breathing room between them. The previous version allocated a fixed
+    slot per logical line (``font_size * 1.3``) but the wrapped text
+    inside that slot could grow past it -- two consecutive logical lines
+    ended up overlapping on screen. This version measures the actual
+    rendered height of every line and packs them top-to-bottom from a
+    centred origin so nothing collides.
+    """
     available_fonts = [
         f for f in os.listdir(utils.font_dir()) if f.endswith((".ttf", ".ttc"))
     ]
@@ -3000,30 +3188,62 @@ def _build_overlay_text_clips(
     if font_path and os.name == "nt":
         font_path = font_path.replace("\\", "/")
 
-    font_size = max(28, int(height * 0.075))
-    line_max_width = int(width * 0.85)
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     if not lines:
         return []
 
-    clips = []
-    n_lines = len(lines)
-    line_height = int(font_size * 1.3)
-    total_height = n_lines * line_height
-    y_start = (height - total_height) // 2
+    MAX_LINES = 4
+    if len(lines) > MAX_LINES:
+        # Drop excess lines rather than let them bleed off the bottom.
+        lines = lines[:MAX_LINES]
 
-    for index, line in enumerate(lines):
-        wrapped, _ = wrap_text(
+    line_max_width = int(width * 0.85)
+    # Largest font that always fits the longest line in one visual row.
+    # The auto-shrink keeps the layout from looking cramped on taller
+    # canvases and from clipping the descenders on shorter ones.
+    def _shrink_to_fit(line: str, candidate_size: int) -> tuple[str, int]:
+        wrapped, h = wrap_text(
             line,
             max_width=line_max_width,
             font=font_path or "Arial",
-            fontsize=font_size,
+            fontsize=candidate_size,
         )
+        # Keep shrinking until the text fits on one row. Without this,
+        # a Spanish line at 160px+ font wraps to two visual rows and
+        # double-sized the layout.
+        size = candidate_size
+        while wrapped.count("\n") > 0 and size > 32:
+            size -= 8
+            wrapped, h = wrap_text(
+                line,
+                max_width=line_max_width,
+                font=font_path or "Arial",
+                fontsize=size,
+            )
+        return wrapped, h
+
+    # Cap the starting size so even the longest Spanish sentence wraps
+    # to at most 2-3 lines, keeping the block inside the canvas.
+    font_size = min(int(height * 0.085), 70)
+    measured: list[tuple[str, int, int]] = []  # (wrapped_text, font_size, height)
+    for line in lines:
+        wrapped, h = _shrink_to_fit(line, font_size)
+        measured.append((wrapped, font_size, h))
+
+    # Total height of the text block, then centred vertically with a
+    # 1.5x line gap so wrapped lines never touch the next logical line.
+    total_text_height = sum(size for _, _, size in measured)
+    line_gap = int(max(m for _, _, m in measured) * 0.45)
+    block_height = total_text_height + line_gap * (len(measured) - 1)
+    y_cursor = (height - block_height) // 2
+
+    clips = []
+    for wrapped, used_size, h in measured:
         if font_path:
             text_clip = TextClip(
                 text=wrapped,
                 font=font_path,
-                font_size=font_size,
+                font_size=used_size,
                 color=text_color,
                 stroke_color="#000000",
                 stroke_width=2,
@@ -3035,14 +3255,16 @@ def _build_overlay_text_clips(
             text_clip = TextClip(
                 text=wrapped,
                 font="Arial",
-                font_size=font_size,
+                font_size=used_size,
                 color=text_color,
                 method="caption",
                 size=(line_max_width, None),
                 text_align="center",
             )
-        clip_y = y_start + index * line_height + (line_height - text_clip.h) // 2
-        clips.append(text_clip.with_position(("center", clip_y)))
+        clips.append(
+            text_clip.with_position(("center", y_cursor + (h - text_clip.h) // 2))
+        )
+        y_cursor += h + line_gap
     return clips
 
 
@@ -3094,11 +3316,116 @@ def _apply_overlay_fade(clip, duration: float, animation: str = "fade"):
     return clip.transform(fade_transform, apply_to=["mask"])
 
 
+def _resolve_intro_text(params) -> str:
+    """Pick the intro overlay body text. Public so a focused test can lock
+    in the resolution without spinning up MoviePy."""
+    intro_text = (getattr(params, "intro_text", "") or "").strip()
+    if intro_text:
+        return intro_text
+    series_outline = getattr(params, "series_outline", None) or []
+    subject = getattr(params, "video_subject", "") or ""
+    if series_outline:
+        return series_outline[0]
+    return subject or "Lo que viene en este video"
+
+
+def _resolve_outro_text(params) -> str:
+    """Pick the outro overlay body text. Public so a focused test can lock
+    in the resolution without spinning up MoviePy. Single-video default
+    thanks the viewer; multi-part default forward-declares the next part.
+    The user can override either side in the WebUI."""
+    outro_text = (getattr(params, "outro_text", "") or "").strip()
+    if outro_text:
+        return outro_text
+    series_total = int(getattr(params, "series_parts", 0) or 0)
+    if series_total > 1:
+        return (
+            "Gracias por ver.\n"
+            "Continúa con la siguiente parte."
+        )
+    return (
+        "Gracias por ver.\n"
+        "Síguenos para más contenido como este."
+    )
+
+
+def _pad_or_trim_audio_to_duration(clip, target_duration: float):
+    """Return an audio clip exactly ``target_duration`` seconds long.
+
+    ``AudioFileClip.with_duration`` only rewrites the clip's reported
+    duration; it cannot make a shorter file decodable past its real end.
+    Growing an overlay's TTS audio that way left a claimed duration nothing
+    could actually read, and a downstream compositing pass reading near
+    that boundary crashed with an ffmpeg OSError ("Accessing time
+    t=3.16-3.20 seconds, with clip duration=3.12 seconds"). Trim when the
+    narration ran long; pad with real silence when it finished early.
+    """
+    if clip is None or not target_duration or target_duration <= 0:
+        return clip
+    if clip.duration > target_duration:
+        return clip.subclipped(0, target_duration)
+    if clip.duration < target_duration - 1e-3:
+        sample_rate = int(getattr(clip, "fps", 0) or 44100)
+        silence_samples = max(
+            0, int(round((target_duration - clip.duration) * sample_rate))
+        )
+        # Stereo, not mono -- see the note in ``_attach_intro_outro_via_concat``
+        # about MoviePy doubling a mono AudioArrayClip's written duration.
+        silence = AudioArrayClip(
+            np.zeros((silence_samples, 2), dtype=np.float32), fps=sample_rate
+        )
+        return concatenate_audioclips([clip, silence])
+    return clip
+
+
+def _build_segment_audio_sequence(
+    *,
+    intro_clip,
+    intro_audio_clip,
+    main_audio_clip,
+    outro_clip,
+    outro_audio_clip,
+    sample_rate: int,
+) -> list:
+    """Return the audio clips in playback order: [intro?, main, outro?].
+
+    Each present video segment gets exactly its own duration of audio:
+    its narration when TTS produced one, otherwise real digital silence.
+    Never another segment's audio, and never reordered -- that bug shipped
+    intro narration immediately followed by outro narration, both ahead of
+    the main voice track, with a scrambled audio/video timeline as a
+    result. Pure and side-effect free so it can be tested without a real
+    MoviePy render.
+    """
+
+    def segment_audio(narration_clip, segment_duration):
+        if narration_clip is not None:
+            return narration_clip
+        # Stereo, not mono -- see the note in ``_attach_intro_outro_via_concat``
+        # about MoviePy doubling a mono AudioArrayClip's written duration.
+        return AudioArrayClip(
+            np.zeros(
+                (max(0, int(round(segment_duration * sample_rate))), 2),
+                dtype=np.float32,
+            ),
+            fps=sample_rate,
+        )
+
+    streams = []
+    if intro_clip is not None:
+        streams.append(segment_audio(intro_audio_clip, intro_clip.duration))
+    streams.append(main_audio_clip)
+    if outro_clip is not None:
+        streams.append(segment_audio(outro_audio_clip, outro_clip.duration))
+    return streams
+
+
 def _build_intro_outro_clips(
     params: VideoParams,
     video_width: int,
     video_height: int,
     video_duration: float,
+    material_paths: Optional[List[str]] = None,
 ):
     """
     Build (intro_clip, outro_clip, intro_audio_clip, outro_audio_clip) for
@@ -3116,58 +3443,42 @@ def _build_intro_outro_clips(
     intro_clip = None
     intro_audio_clip = None
     if getattr(params, "intro_enabled", False):
-        intro_text = getattr(params, "intro_text", "") or params.video_subject or ""
+        intro_text = _resolve_intro_text(params)
         intro_clip = _create_blurred_text_clip(
             params=params,
-            text=(
-                "Lo que viene en este video\n\n"
-                + (intro_text or "").strip()
-                if (intro_text or "").strip()
-                else "Lo que viene en este video"
-            ),
-            duration=float(getattr(params, "intro_duration", 3.0) or 3.0),
+            text=intro_text,
+            duration=float(getattr(params, "intro_duration", 5.0) or 5.0),
             video_width=video_width,
             video_height=video_height,
             text_color=getattr(params, "intro_text_color", "#FFFFFF") or "#FFFFFF",
             blur_strength=int(getattr(params, "intro_blur_strength", 35) or 35),
+            material_paths=material_paths,
         )
         if intro_clip is not None and getattr(params, "intro_tts_enabled", False):
             intro_audio_clip = _render_overlay_tts(
                 params=params,
-                text=(
-                    "Lo que viene en este video. "
-                    + (intro_text or "").strip().replace("\n", ". ")
-                    if (intro_text or "").strip()
-                    else "Lo que viene en este video"
-                ),
+                text=intro_text.replace("\n", ". "),
                 duration=intro_clip.duration,
             )
 
     outro_clip = None
     outro_audio_clip = None
     if getattr(params, "outro_enabled", False):
-        outro_text = getattr(params, "outro_text", "") or ""
-        if not outro_text.strip():
-            outro_text = (
-                "Gracias por ver. "
-                "Lo que vamos a llenar a continuación. "
-                "Continúa en la siguiente parte."
-            )
-        else:
-            outro_text = outro_text.replace("\n", ". ")
+        outro_text = _resolve_outro_text(params)
         outro_clip = _create_blurred_text_clip(
             params=params,
             text=outro_text,
-            duration=float(getattr(params, "outro_duration", 4.0) or 4.0),
+            duration=float(getattr(params, "outro_duration", 6.0) or 6.0),
             video_width=video_width,
             video_height=video_height,
             text_color=getattr(params, "outro_text_color", "#FFFFFF") or "#FFFFFF",
             blur_strength=int(getattr(params, "outro_blur_strength", 35) or 35),
+            material_paths=material_paths,
         )
         if outro_clip is not None and getattr(params, "outro_tts_enabled", False):
             outro_audio_clip = _render_overlay_tts(
                 params=params,
-                text=outro_text,
+                text=outro_text.replace("\n", ". "),
                 duration=outro_clip.duration,
             )
 
@@ -3192,9 +3503,13 @@ def _build_intro_outro_clips(
             getattr(params, "outro_animation", "fade") or "fade",
         )
     if intro_audio_clip is not None and intro_clip is not None:
-        intro_audio_clip = intro_audio_clip.with_duration(intro_clip.duration)
+        intro_audio_clip = _pad_or_trim_audio_to_duration(
+            intro_audio_clip, intro_clip.duration
+        )
     if outro_audio_clip is not None and outro_clip is not None:
-        outro_audio_clip = outro_audio_clip.with_duration(outro_clip.duration)
+        outro_audio_clip = _pad_or_trim_audio_to_duration(
+            outro_audio_clip, outro_clip.duration
+        )
     return intro_clip, outro_clip, intro_audio_clip, outro_audio_clip
 
 
@@ -3447,13 +3762,15 @@ def _try_fast_subtitle_render(
         "slide_up",
         "rise",
     }
+    # Intro/outro overlays are rendered and concatenated separately by the
+    # caller (see ``_render_with_intro_outro`` in ``generate_video``), so
+    # this function only ever burns subtitles onto the main segment -- it
+    # no longer needs to bail when intro/outro are enabled.
     if not (
         params.subtitle_enabled
         and subtitle_path
         and os.path.exists(subtitle_path)
         and not params.title_enabled
-        and not getattr(params, "intro_enabled", False)
-        and not getattr(params, "outro_enabled", False)
         and not bgm_file_override
         and not _resolve_subtitle_background_color_locally(
             getattr(params, "text_background_color", False)
@@ -3639,6 +3956,103 @@ def generate_video(
             font_path = font_path.replace("\\", "/")
 
         logger.info(f"  ⑤ font: {font_path}")
+
+    # Resolve BGM once, the same way the MoviePy slow path resolves it below,
+    # so a "random"/"custom" BGM request is not silently dropped when the
+    # fast path is taken (its bail-out only checks bgm_file_override, which
+    # is None for those types -- previously that meant BGM never played
+    # unless title/intro/outro forced the slow MoviePy path).
+    bgm_enabled = bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
+    resolved_bgm_file = ""
+    if bgm_enabled:
+        resolved_bgm_file = (
+            bgm_file_override
+            if bgm_file_override is not None
+            else get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file)
+        )
+
+    # Fast path: pre-mix narration (+ ducked BGM) into one loudness-normalized
+    # track, so a fast-rendered video hits the platform loudness target and
+    # actually carries the requested BGM. Only skipped when the slow MoviePy
+    # path is required anyway (title overlays are frame-composited by
+    # MoviePy today, and keep_original_audio mixes the source clip's own
+    # audio track, neither of which this path handles yet). Intro/outro are
+    # handled by this path too now: they are rendered as short separate
+    # segments and ffmpeg-concatenated around the fast-rendered main
+    # segment, so the same subtitle/loudness quality applies whether or not
+    # they are enabled -- previously enabling either forced the entire
+    # video through the older, lower-quality MoviePy subtitle renderer.
+    can_use_fast_audio = not (
+        getattr(params, "keep_original_audio", False) or params.title_enabled
+    )
+    if can_use_fast_audio:
+        mixed_audio_path = os.path.join(
+            output_dir, f"{os.path.basename(output_file)}.mixed.wav"
+        )
+        if audio_mix.render_mixed_audio(
+            voice_path=audio_path,
+            bgm_path=resolved_bgm_file or None,
+            voice_volume=float(params.voice_volume or 1.0),
+            bgm_volume=float(params.bgm_volume or 0.0),
+            output_path=mixed_audio_path,
+        ):
+            needs_intro_outro = bool(
+                getattr(params, "intro_enabled", False)
+                or getattr(params, "outro_enabled", False)
+            )
+            main_output = (
+                f"{output_file}.main-segment.mp4" if needs_intro_outro else output_file
+            )
+            original_voice_volume = params.voice_volume
+            params.voice_volume = 1.0  # already applied by the pre-mix
+            main_rendered = False
+            try:
+                main_rendered = _try_fast_subtitle_render(
+                    video_path=video_path,
+                    audio_path=mixed_audio_path,
+                    subtitle_path=subtitle_path,
+                    output_file=main_output,
+                    font_path=font_path,
+                    params=params,
+                    video_width=video_width,
+                    video_height=video_height,
+                    bgm_file_override=None,
+                ) or _try_fast_final_mux(
+                    video_path=video_path,
+                    audio_path=mixed_audio_path,
+                    output_file=main_output,
+                    params=params,
+                    bgm_file_override=None,
+                )
+            finally:
+                params.voice_volume = original_voice_volume
+                delete_files(mixed_audio_path)
+
+            if main_rendered and not needs_intro_outro:
+                return True
+            if main_rendered and needs_intro_outro:
+                try:
+                    if _attach_intro_outro_via_concat(
+                        main_segment_path=main_output,
+                        output_file=output_file,
+                        params=params,
+                        video_width=video_width,
+                        video_height=video_height,
+                        source_video_path=video_path,
+                    ):
+                        return True
+                finally:
+                    delete_files(main_output)
+                logger.warning(
+                    "fast intro/outro concat failed; falling back to the "
+                    "MoviePy render for the whole video"
+                )
+            elif main_rendered:
+                delete_files(main_output)
+        else:
+            logger.warning(
+                "audio pre-mix failed; falling back to per-path narration/BGM handling"
+            )
 
     if _try_fast_subtitle_render(
         video_path=video_path,
@@ -4011,29 +4425,54 @@ def generate_video(
                 video_width=video_width,
                 video_height=video_height,
                 video_duration=final_video_clip.duration,
+                material_paths=[video_path] if video_path else None,
             )
         )
-        if intro_audio_clip is not None or outro_audio_clip is not None:
-            # Build a silent AudioClip sized to the intro / outro durations
-            # so the narration has a slot at the right offset even if the
-            # TTS returned a slightly shorter clip.
-            narration_streams = []
-            if intro_audio_clip is not None:
-                narration_streams.append(intro_audio_clip)
-            if outro_audio_clip is not None:
-                narration_streams.append(outro_audio_clip)
-            audio_streams = narration_streams + audio_streams
         if intro_clip is not None or outro_clip is not None:
             # Intro / outro share the main clip's fps and resolution so
             # concatenate_videoclips does not re-encode.
             target_fps = int(getattr(final_video_clip, "fps", 0) or fps or 30)
-            seq = []
+
+            # Build the full audio track as three SEQUENTIAL segments that
+            # match the three video segments exactly: intro, main, outro.
+            # Earlier builds instead prepended both intro AND outro
+            # narration ahead of the main voice track (with BGM tacked on
+            # as its own trailing block), so the audio timeline played
+            # "intro speech, outro speech, main speech, music" while the
+            # video played "intro, main, outro" -- completely scrambled
+            # and drifting further out of sync as each segment's duration
+            # differed from what the audio assumed. Each segment here gets
+            # exactly its own video clip's duration of audio: real TTS
+            # narration when present (already padded/trimmed to that
+            # length by ``_pad_or_trim_audio_to_duration``), otherwise
+            # real digital silence -- never another segment's audio.
+            sample_rate = int(
+                getattr(audio_clip, "fps", 0) or 44100
+            )
+            composed_streams = _build_segment_audio_sequence(
+                intro_clip=intro_clip,
+                intro_audio_clip=intro_audio_clip,
+                main_audio_clip=audio_clip,
+                outro_clip=outro_clip,
+                outro_audio_clip=outro_audio_clip,
+                sample_rate=sample_rate,
+            )
+            final_audio_for_concat = (
+                composed_streams[0]
+                if len(composed_streams) == 1
+                else concatenate_audioclips(composed_streams)
+            )
+
+            silent_seq = []
             if intro_clip is not None:
-                seq.append(intro_clip.with_fps(target_fps))
-            seq.append(final_video_clip)
+                silent_seq.append(intro_clip.without_audio().with_fps(target_fps))
+            silent_seq.append(
+                final_video_clip.without_audio().with_fps(target_fps)
+            )
             if outro_clip is not None:
-                seq.append(outro_clip.with_fps(target_fps))
-            final_video_clip = concatenate_videoclips(seq, method="compose")
+                silent_seq.append(outro_clip.without_audio().with_fps(target_fps))
+            final_video_clip = concatenate_videoclips(silent_seq, method="compose")
+            final_video_clip = final_video_clip.with_audio(final_audio_for_concat)
             clip_stack.callback(final_video_clip.close)
 
         # reuse the input audio's sample rate explicitly, falling back to
@@ -4118,16 +4557,29 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 local_videos_dir, material.url
             )
         except ValueError as exc:
-            # a local video_source path comes from an API parameter and must
-            # stay inside the dedicated material directory. a bare filename is
+            # A local video_source path comes from an API parameter and must
+            # stay inside the dedicated material directory. A bare filename is
             # allowed, as is a legacy absolute path, but nothing may escape
             # elsewhere on the system -- that would be arbitrary file read, or
             # probing sensitive local files through MoviePy.
-            logger.warning(
-                f"skip unsafe local material: {material.url}, "
-                f"local_videos_dir: {local_videos_dir}, error: {str(exc)}"
-            )
-            continue
+            #
+            # Absolute paths recorded under a different root (e.g. the
+            # container's /MoneyPrinterTurbo prefix replayed by a host-run
+            # pipeline, or a moved storage directory) name the same material
+            # when the file still sits in the local material directory. Retry
+            # by basename: it cannot widen file access -- the basename alone
+            # still has to resolve inside the allowlist -- but it keeps
+            # cross-root material reuse working instead of failing the task.
+            try:
+                material_source_path = file_security.resolve_path_within_directory(
+                    local_videos_dir, os.path.basename(material.url.replace("\\", "/"))
+                )
+            except ValueError:
+                logger.warning(
+                    f"skip unsafe local material: {material.url}, "
+                    f"local_videos_dir: {local_videos_dir}, error: {str(exc)}"
+                )
+                continue
 
         ext = utils.parse_extension(material_source_path)
         try:

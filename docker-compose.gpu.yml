@@ -7,7 +7,7 @@
 #
 # Only needed because Docker cannot probe for a device driver: asking for the
 # nvidia driver on a host without it is a hard startup failure, so it cannot
-# live in the base file. voicestudio needs no NVIDIA-specific build -- torch's
+# live in the base file. OmniVoice needs no NVIDIA-specific build -- torch's
 # default wheel already carries CUDA and activates it when a GPU is visible.
 #
 # Prerequisites:
@@ -50,7 +50,7 @@ x-app-gpu: &app-gpu
 
 services:
   # OmniVoice: torch picks up the GPU through torch.cuda.
-  voicestudio: *nvidia
+  omnivoice: *nvidia
 
   # The base file points MoviePy at /usr/bin/ffmpeg, but this image only
   # ships the BtbN static build under /usr/local/bin/ffmpeg (see

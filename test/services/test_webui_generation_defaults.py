@@ -42,7 +42,7 @@ def test_reusable_generation_settings_survive_a_new_webui_session():
         config.ui,
         language="en",
         voice_mode="tts",
-        tts_server="azure-tts-v1",
+            tts_server="edge-tts",
         voice_name="en-US-JennyNeural-Female",
     )
 
@@ -52,7 +52,7 @@ def test_reusable_generation_settings_survive_a_new_webui_session():
         patch.object(config, "try_save_config", return_value=True),
         patch.object(
             voice,
-            "get_all_azure_voices",
+                "get_all_edge_voices",
             return_value=["en-US-JennyNeural-Female"],
         ),
     ):
@@ -279,7 +279,7 @@ def test_invalid_saved_generation_settings_fall_back_without_breaking_webui():
         config.ui,
         language="en",
         voice_mode="tts",
-        tts_server="azure-tts-v1",
+            tts_server="edge-tts",
         voice_name="en-US-JennyNeural-Female",
         video_language="not-a-language",
         paragraph_number=999,
@@ -308,7 +308,7 @@ def test_invalid_saved_generation_settings_fall_back_without_breaking_webui():
         patch.object(config, "try_save_config", return_value=True),
         patch.object(
             voice,
-            "get_all_azure_voices",
+                "get_all_edge_voices",
             return_value=["en-US-JennyNeural-Female"],
         ),
     ):
@@ -322,7 +322,7 @@ def test_invalid_saved_generation_settings_fall_back_without_breaking_webui():
     )
     assert _widget_by_key(app.selectbox, "video_aspect_for_pexels").value == "9:16"
     assert _widget_by_key(app.selectbox, "video_fit_mode_select").value == "cover"
-    assert _widget_by_key(app.selectbox, "video_clip_duration_select").value == 3
+    assert _widget_by_key(app.selectbox, "video_clip_duration_select").value == "auto"
     assert _widget_by_key(app.slider, "video_clip_speed_slider").value == 1.0
     assert _widget_by_key(app.selectbox, "video_count_select").value == 1
     assert isinstance(test_ui_config["video_count"], int)
@@ -400,7 +400,7 @@ def test_loomloom_tuning_survives_restart_without_persisting_payment_state():
         config.ui,
         language="en",
         voice_mode="tts",
-        tts_server="azure-tts-v1",
+            tts_server="edge-tts",
         voice_name="en-US-JennyNeural-Female",
     )
 
@@ -410,7 +410,7 @@ def test_loomloom_tuning_survives_restart_without_persisting_payment_state():
         patch.object(config, "try_save_config", return_value=True),
         patch.object(
             voice,
-            "get_all_azure_voices",
+                "get_all_edge_voices",
             return_value=["en-US-JennyNeural-Female"],
         ),
     ):
@@ -466,7 +466,7 @@ def test_script_order_constraint_does_not_replace_saved_concat_preference():
         language="en",
         video_concat_mode="random",
         voice_mode="tts",
-        tts_server="azure-tts-v1",
+            tts_server="edge-tts",
         voice_name="en-US-JennyNeural-Female",
     )
 
@@ -476,7 +476,7 @@ def test_script_order_constraint_does_not_replace_saved_concat_preference():
         patch.object(config, "try_save_config", return_value=True),
         patch.object(
             voice,
-            "get_all_azure_voices",
+                "get_all_edge_voices",
             return_value=["en-US-JennyNeural-Female"],
         ),
     ):

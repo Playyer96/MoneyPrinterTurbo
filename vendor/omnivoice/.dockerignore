@@ -1,4 +1,4 @@
-# VoiceStudio local state and dev artifacts. The image only needs the
+# OmniVoice local state and dev artifacts. The image only needs the
 # Python source; voice profiles and generated audio are produced at runtime
 # and persisted via the named volumes declared in docker-compose.yml.
 

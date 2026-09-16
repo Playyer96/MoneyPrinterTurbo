@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VoiceStudio host-side runner. The LaunchAgent launches this, not python
+# OmniVoice host-side runner. The LaunchAgent launches this, not python
 # directly, so a stale venv (e.g. transformers bumped and tokenizers left
 # behind) is repaired before omnivoice imports and crashes again.
 #
@@ -14,7 +14,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="$REPO/.venv/bin/python"
 
 if [[ ! -x "$VENV" ]]; then
-    echo "voicestudio-runner: $VENV missing -- run \`make mac-setup\` first" >&2
+    echo "omnivoice-runner: $VENV missing -- run \`make mac-setup\` first" >&2
     exit 1
 fi
 
@@ -24,8 +24,8 @@ fi
 if ! "$VENV" -c "import transformers, tokenizers; \
         v = tuple(int(x) for x in tokenizers.__version__.split('.')[:2]); \
         assert (0, 23) <= v < (0, 24)" 2>/dev/null; then
-    echo "voicestudio-runner: tokenizers out of range, repairing..." >&2
+    echo "omnivoice-runner: tokenizers out of range, repairing..." >&2
     uv pip install --python "$VENV" --quiet 'tokenizers>=0.23.1,<0.24.0' >&2
 fi
 
-exec "$VENV" "$REPO/vendor/voice_studio/server.py"
+exec "$VENV" "$REPO/vendor/omnivoice/server.py"
